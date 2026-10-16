@@ -54,12 +54,19 @@ export interface SessionTreeNode {
   readonly key: string;
   /** Undefined for a run root and the group. */
   readonly parentKey: string | undefined;
-  /** The /workflow tree depth (a run's phases share its root's depth 0); the group is at 0, its subagents at 1. */
+  /** 0 for a run root and the group; a run's other nodes one level below their /workflow tree depth (where the phases share the root's 0); the subagents at 1. */
   readonly depth: number;
   readonly kind: "run" | "phase" | "operation" | "shell" | "agent" | "group";
-  /** The expansion a node takes when it first appears: workflowPhaseTreeInitialExpanded of its run; the group is expanded. */
+  /**
+   * The expansion a node takes the first time a list contains it: a run root while its run is not in a hard terminal state, its
+   * other nodes workflowPhaseTreeInitialExpanded of the run; the group while one of its subagents runs.
+   */
   readonly initiallyExpanded: boolean;
-  /** The node's /workflow tree row: selection arrow, depth indent, ▾/▸/•/◇ icon, label, " · ", state glyph. */
+  /**
+   * The node's row, its ▾/▸ icon (when it has children) at display column 2 + 2 * depth. A run root and the group are headers:
+   * selection arrow, icon, bold label, two spaces, a summary (the run's state glyph, done/total agents, cost and runtime; the
+   * group's counts and cost). Every other node is its /workflow tree row at `depth`: arrow, indent, ▾/▸/•/◇ icon, label, " · ", state glyph.
+   */
   line(styles: WorkflowProgressStyles, selected: boolean, expanded: boolean): string;
   /** What the right pane shows for a node that is not an agent, as /workflow details it without its enter hints; empty for an agent, which shows its transcript. */
   details(styles: WorkflowProgressStyles, now: number): readonly string[];

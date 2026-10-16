@@ -305,6 +305,8 @@ async function advance(t: TestContext, times = 1): Promise<void> {
 }
 function title(harness: Harness): string { return harness.screen()[0] ?? ""; }
 function rowOf(harness: Harness, text: string): number { return harness.screen().findIndex((line) => line.includes(text)); }
+/** A left click (SGR press and release) on the 0-based screen `column` and `row`. */
+function click(harness: Harness, column: number, row: number): void { harness.send(`${ESC}[<0;${String(column + 1)};${String(row + 1)}M`, `${ESC}[<0;${String(column + 1)};${String(row + 1)}m`); }
 /** The first body row without the transient scrollbar ("auto") drawn in its last column. */
 function topRow(harness: Harness): string { return (harness.screen()[1] ?? "").replace(/[\s┃█│]+$/, ""); }
 
@@ -342,10 +344,9 @@ void test("the layout shows the title, the sidebar tree and the transcript at 12
   assert.equal(lines.length, 20);
   assert.ok(lines.every((line) => visibleWidth(line) <= 120));
   assert.match(lines[0] ?? "", /^#1\/3 alpha running gpt-5 1\.2k tok/);
-  const sidebar = lines.slice(1, 6).map((line) => line.slice(0, line.indexOf("│")).trimEnd());
-  assert.deepEqual(sidebar, ["  ▾ build a1b2 · ⠦", "→   ▾ alpha · ⠦", "      • beta · ✓", "  ▾ Subagents · ⠦", "    • scout · ✗"], "the first agent selected, every row in the /workflow format");
+  assert.deepEqual(sidebarColumn(wide).slice(0, 6), ["  ▾ build a1b2 · ⠦", "→   ▾ alpha · ⠦", "      • beta · ✓", rule(42), "  ▾ Subagents · ⠦", "    • scout · ✗"], "the first agent selected, every row in the /workflow format, a rule above the group");
   assert.match(lines[1] ?? "", /│ alpha record 0/);
-  assert.ok(lines.at(-1)?.includes("esc"), "hint row");
+  assert.equal((lines.at(-1) ?? "").trimEnd(), "←→/space fold · [ ] agent · tab transcript · pgup/pgdn · ctrl+shift+f search · s sidebar · ctrl+o tools · esc back", "the whole hint fits 120 columns");
   await leave(wide);
 
   const narrow = await open(AGENTS(), { columns: 70, setup: (source) => { source.polls.push(polled(entries(0, 5))); } });
@@ -607,7 +608,8 @@ void test("enter loads the last large record not loaded yet", async (t) => {
   const harness = await open([agent("alpha", { running: false })], { setup: (source) => { source.polls.push(polled([entry(0), large(10), entry(20), large(30)])); } });
   const hint = harness.screen().at(-1) ?? "";
   assert.ok(hint.includes("enter load"), "the hint names enter while a record is pending");
-  assert.match(hint.trimEnd(), /^↑↓←→ \[ \] tree · .*esc back$/, "the whole hint, tree keys included, fits 120 columns");
+  assert.match(hint, /^←→\/space fold · \[ \] agent · tab transcript · enter load · /, "the sidebar keys come first while the sidebar has the focus");
+  assert.ok(visibleWidth(hint) <= 120);
   harness.send(KEY.enter);
   await settle();
   assert.ok(harness.source("alpha").calls.includes("loadRecord:30"));
@@ -969,9 +971,15 @@ void test("an agent whose view cannot be created stays selected with the error, 
   assert.deepEqual(escaped, []);
 });
 
-/** The sidebar column of the body rows, without the separator. */
+/** The sidebar column of every body row, without the vertical separator: rows, rules, and the empty rows below them. */
+function sidebarColumn(harness: Harness): string[] {
+  return harness.screen().slice(1, -1).map((line) => line.includes("│") ? line.slice(0, line.indexOf("│")).trimEnd() : "");
+}
+/** The rule the sidebar draws above a top-level node, `cell` columns wide. */
+function rule(cell: number): string { return "─".repeat(cell); }
+/** The node rows of the sidebar column: no rules, no empty rows. */
 function sidebarRows(harness: Harness): string[] {
-  return harness.screen().slice(1, -1).map((line) => line.includes("│") ? line.slice(0, line.indexOf("│")).trimEnd() : "").filter(Boolean);
+  return sidebarColumn(harness).filter((line) => line && !/^─+$/.test(line));
 }
 
 void test("left and right collapse, expand and move to the parent or the first child as in /workflow", async (t) => {
@@ -1125,6 +1133,169 @@ void test("the initial key selects its agent and expands its ancestors; without 
   await leave(first);
 });
 
+/** Two runs and the Subagents group: "build a1b2" with alpha over beta, "deploy c3d4" with gamma, then scout. */
+const GROUPS = (): Listed[] => [agent("alpha"), agent("beta", { depth: 1 }), agent("gamma", { group: "deploy c3d4" }), agent("scout", { group: "Subagents" })];
+
+void test("a rule above every top-level node but the first row; up, down and clicks never land on it; every line fits at 120 and 70 columns", async (t) => {
+  timers(t);
+  const rows = (cell: number): string[] => ["  ▾ build a1b2 · ⠦", "→   ▾ alpha · ⠦", "      • beta · ⠦", rule(cell), "  ▾ deploy c3d4 · ⠦", "    • gamma · ⠦", rule(cell), "  ▾ Subagents · ⠦", "    • scout · ⠦"];
+  const harness = await open(GROUPS());
+  const column = sidebarColumn(harness);
+  assert.deepEqual(column.slice(0, 9), rows(42), "the rule fills the sidebar cell");
+  assert.deepEqual(column.slice(9), column.slice(9).map(() => ""), "no rule elsewhere");
+  assert.ok(harness.screen().every((line) => visibleWidth(line) <= 120));
+  const steps: string[] = [];
+  for (const key of [KEY.down, KEY.down, KEY.down, KEY.down, KEY.up, KEY.up, KEY.up]) {
+    harness.send(key);
+    await settle();
+    steps.push(title(harness).split(" ").slice(0, 2).join(" "));
+  }
+  assert.deepEqual(steps, ["#2/4 beta", "deploy c3d4", "#3/4 gamma", "Subagents running", "#3/4 gamma", "deploy c3d4", "#2/4 beta"], "up and down go from node to node over the rules");
+  // A click on a rule, in the icon column or further right, changes nothing: not the selection, not the expansion, not the focus.
+  harness.send(KEY.tab);
+  const before = harness.screen();
+  const opened = [...harness.opened];
+  assert.match(before.at(-1) ?? "", /^↑↓ scroll/);
+  const ruleRow = before.findIndex((line) => line.startsWith("─"));
+  assert.ok(ruleRow > 0);
+  for (const column of [2, 4, 10]) {
+    click(harness, column, ruleRow);
+    await settle();
+  }
+  assert.deepEqual(harness.screen(), before);
+  assert.deepEqual(harness.opened, opened);
+  await leave(harness);
+
+  const narrow = await open(GROUPS(), { columns: 70 });
+  narrow.send("s");
+  assert.deepEqual(sidebarColumn(narrow).slice(0, 9), rows(25), "the rule fills the narrower cell");
+  for (const step of ["", KEY.down, KEY.down, KEY.down, KEY.down]) {
+    if (step) narrow.send(step);
+    await settle();
+    const frame = narrow.screen();
+    assert.ok(frame.every((line) => visibleWidth(line) <= 70), frame.join("\n"));
+  }
+  await leave(narrow);
+});
+
+void test("a click on a row's ▾/▸ icon toggles and selects its node, a click elsewhere on the row only selects; space toggles a node with children and nothing else", async (t) => {
+  timers(t);
+  const harness = await open(GROUPS());
+  // The screen row in the sidebar column: the title and the details pane name a selected node that is not an agent too.
+  const row = (text: string): number => sidebarColumn(harness).findIndex((line) => line.includes(text)) + 1;
+  // A header's icon is in column 2, as on every depth-0 row.
+  click(harness, 2, row("deploy c3d4"));
+  await settle();
+  assert.equal(title(harness).trimEnd(), "deploy c3d4 running", "the click selected the header");
+  assert.deepEqual(sidebarRows(harness).slice(3), ["→ ▸ deploy c3d4 · ⠦", "  ▾ Subagents · ⠦", "    • scout · ⠦"], "and collapsed it");
+  click(harness, 2, row("deploy c3d4"));
+  await settle();
+  assert.deepEqual(sidebarRows(harness).slice(3, 5), ["→ ▾ deploy c3d4 · ⠦", "    • gamma · ⠦"], "a second click expands it again");
+  // alpha is at depth 1: its icon is in column 4, its label after it.
+  click(harness, 8, row("alpha"));
+  await settle();
+  assert.match(title(harness), /^#1\/4 alpha/, "a click on the label selects");
+  assert.ok(sidebarRows(harness).includes("      • beta · ⠦"), "and toggles nothing");
+  click(harness, 3, row("deploy c3d4"));
+  await settle();
+  assert.equal(title(harness).trimEnd(), "deploy c3d4 running", "a click beside the icon selects");
+  assert.ok(sidebarRows(harness).includes("    • gamma · ⠦"), "and toggles nothing");
+  click(harness, 4, row("alpha"));
+  await settle();
+  assert.match(title(harness), /^#1\/4 alpha/, "a click on the icon selects");
+  assert.ok(!sidebarRows(harness).some((line) => line.includes("beta")), "and collapses");
+  harness.send(" ");
+  await settle();
+  assert.ok(sidebarRows(harness).includes("      • beta · ⠦"), "space expands the selected node");
+  harness.send(" ");
+  await settle();
+  assert.ok(!sidebarRows(harness).some((line) => line.includes("beta")), "space collapses it");
+  assert.match(title(harness), /^#1\/4 alpha/, "and keeps it selected");
+  harness.send(" ", KEY.down);
+  await settle();
+  assert.match(title(harness), /^#2\/4 beta/);
+  const leaf = harness.screen();
+  harness.send(" ");
+  await settle();
+  assert.deepEqual(harness.screen(), leaf, "space on a leaf does nothing");
+  // The • of a leaf sits in the icon column: a click there only selects.
+  click(harness, 4, row("gamma"));
+  await settle();
+  assert.match(title(harness), /^#3\/4 gamma/);
+  assert.ok(sidebarRows(harness).includes("→   • gamma · ⠦"));
+  harness.send(KEY.up, KEY.tab, " ");
+  await settle();
+  assert.equal(title(harness).trimEnd(), "deploy c3d4 running");
+  assert.ok(sidebarRows(harness).includes("    • gamma · ⠦"), "space toggles only while the sidebar has the focus");
+  await leave(harness);
+});
+
+void test("a node's initial expansion counts the first time a list contains it: a run that finishes stays expanded, a new finished run comes collapsed, a new running one expanded", async (t) => {
+  timers(t);
+  const run = (key: string, state: RunState, expanded: boolean): Spec[] => [
+    { key: `run:${key}`, kind: "run", label: key, state, expanded },
+    { key: key.toLowerCase(), parent: `run:${key}`, agent: agent(key.toLowerCase(), state === "running" ? {} : { state: "completed", running: false }) },
+  ];
+  // S holds the agent selected on open, so its expansion is the reveal's; A's is its own.
+  const harness = await open([], { nodes: tree([...run("S", "running", true), ...run("A", "running", true)]) });
+  assert.deepEqual(sidebarRows(harness), ["  ▾ S · ⠦", "→   • s · ⠦", "  ▾ A · ⠦", "    • a · ⠦"]);
+  harness.nodes = tree([...run("S", "running", true), ...run("A", "completed", false), ...run("B", "completed", false), ...run("C", "running", true)]);
+  await advance(t);
+  assert.deepEqual(sidebarRows(harness), ["  ▾ S · ⠦", "→   • s · ⠦", "  ▾ A · ✓", "    • a · ✓", "  ▸ B · ✓", "  ▾ C · ⠦", "    • c · ⠦"], "A finished while shown and stays expanded");
+  harness.nodes = tree([...run("S", "running", true), ...run("A", "completed", false), ...run("B", "running", true), ...run("C", "completed", false)]);
+  await advance(t);
+  assert.deepEqual(sidebarRows(harness), ["  ▾ S · ⠦", "→   • s · ⠦", "  ▾ A · ✓", "    • a · ✓", "  ▸ B · ⠦", "  ▾ C · ✓", "    • c · ✓"], "a later list changes the expansion of no node already seen");
+  await leave(harness);
+});
+
+void test("the initial key on an agent of a finished, collapsed run expands its ancestors; the other finished runs stay collapsed", async (t) => {
+  timers(t);
+  const done = { state: "completed", running: false } as const;
+  const harness = await open([], { initialKey: "b", nodes: tree([
+    { key: "run:A", kind: "run", label: "A" },
+    { key: "a", parent: "run:A", agent: agent("a") },
+    { key: "run:B", kind: "run", label: "B", state: "completed", expanded: false },
+    { key: "P", parent: "run:B", label: "plan", state: "completed", expanded: false },
+    { key: "b", parent: "P", agent: agent("b", done) },
+    { key: "run:C", kind: "run", label: "C", state: "completed", expanded: false },
+    { key: "c", parent: "run:C", agent: agent("c", done) },
+  ]) });
+  assert.match(title(harness), /^#2\/3 b completed/);
+  assert.deepEqual(harness.opened, ["b"]);
+  assert.deepEqual(sidebarRows(harness), ["  ▾ A · ⠦", "    • a · ⠦", "  ▾ B · ✓", "    ▾ plan · ✓", "→     • b · ✓", "  ▸ C · ✓"]);
+  await leave(harness);
+});
+
+void test("on a short terminal the sidebar keeps the selected row in view, rules counted", async (t) => {
+  timers(t);
+  const harness = await open(Array.from({ length: 6 }, (_, index) => agent(`a${String(index)}`, { group: `g${String(index)}` })), { rows: 7 });
+  const selected = (): string | undefined => sidebarColumn(harness).find((line) => line.startsWith("→"));
+  assert.deepEqual(sidebarColumn(harness), ["  ▾ g0 · ⠦", "→   • a0 · ⠦", rule(42), "  ▾ g1 · ⠦", "    • a1 · ⠦"]);
+  const seen: string[][] = [];
+  // Every node down to the last and round to the first, then back up, then ] and [ across the runs.
+  for (const key of [...Array.from({ length: 12 }, () => KEY.down), ...Array.from({ length: 12 }, () => KEY.up), "]", "]", "]", "[", "[", "[", "[", "["]) {
+    harness.send(key);
+    await settle();
+    const column = sidebarColumn(harness);
+    seen.push(column);
+    assert.ok(selected(), `the selected row is in view after ${String(seen.length)} keys:\n${column.join("\n")}`);
+  }
+  assert.ok(seen.some((column) => column.some((line) => /^─+$/.test(line))), "with rules in view");
+  assert.equal(seen[9]?.at(-1), "→   • a5 · ⠦", "the last node at the bottom");
+  assert.deepEqual(seen[10]?.slice(0, 2), ["→ ▾ g0 · ⠦", "    • a0 · ⠦"], "down went round to the first run, at the top without a rule");
+  await leave(harness);
+});
+
+void test("with the sidebar focused the hint names the fold and agent keys; with the transcript focused it is as before", async (t) => {
+  timers(t);
+  const harness = await open(AGENTS(), { columns: 200 });
+  const hint = (): string => (harness.screen().at(-1) ?? "").trimEnd();
+  assert.equal(hint(), "←→/space fold · [ ] agent · tab transcript · pgup/pgdn · ctrl+shift+f search · s sidebar · ctrl+o tools · esc back");
+  harness.send(KEY.tab);
+  assert.equal(hint(), "↑↓ scroll · [ ] agent · tab agents · pgup/pgdn · ctrl+shift+f search · s sidebar · ctrl+o tools · esc back");
+  await leave(harness);
+});
+
 /** Waits (bounded) for the first agent's view: a real source reads the disk, which takes more than a few turns of the event loop. */
 async function opened(harness: Harness): Promise<void> {
   for (let wait = 0; wait < 400 && harness.views.length === 0; wait += 1) await new Promise((resolve) => { setTimeout(resolve, 5); });
@@ -1159,9 +1330,9 @@ void test("a run's sidebar rows are its /workflow tree rows, its nodes show the 
   const harness = await open([], { source, rows: 24 });
   await opened(harness);
   assert.match(title(harness), /^#1\/4 Planner completed/);
-  // The /workflow rows, the first agent selected; the root names the run, as the sidebar can hold several.
+  // The /workflow rows one level deeper, the first agent selected; the root is a header that names the run, as the sidebar can hold several.
   assert.deepEqual(rows.slice(0, 3), ["  ▾ Workflow · ⠦", "  ▾ plan · ✓", "→   • Planner · ✓"]);
-  assert.deepEqual(sidebarRows(harness), ["  ▾ review flow run · ⠦", ...rows.slice(1)]);
+  assert.deepEqual(sidebarRows(harness), ["  ▾ review flow run  ⠦ 2/4 agents", ...rows.slice(1).map((row) => `${row.slice(0, 2)}  ${row.slice(2)}`)]);
   harness.send(KEY.down);
   await settle();
   const lines = harness.screen();

@@ -85,7 +85,11 @@ class Workspace {
   private byKey: ReadonlyMap<string, SessionTreeNode> = new Map();
   private tree: WorkflowPhaseTree = navigationTree([]);
   private selectedKey: string | undefined;
-  /** Expansion set by left/right, or by [, ] and the initial key for the ancestors of the agent they selected; every other node has its initiallyExpanded. */
+  /**
+   * The expansion of every key a list contained: its initiallyExpanded the first time a list contains it, so a later list never
+   * changes it (a run that finishes while shown does not collapse); then left/right, space, an icon click, and [, ] and the initial
+   * key for the ancestors of the agent they selected.
+   */
   private readonly expansion = new Map<string, boolean>();
   private listed = false;
   /** options.initialKey until a node was selected. */
@@ -101,8 +105,8 @@ class Workspace {
   private sidebarVisible: boolean;
   private expanded = false;
   private sidebarTop = 0;
-  /** The node key of each sidebar row of the last frame, for clicks. */
-  private sidebarKeys: string[] = [];
+  /** The node key of each sidebar row of the last frame, for clicks; undefined for a rule. */
+  private sidebarKeys: (string | undefined)[] = [];
   private finished = false;
   private readonly styles: WorkflowProgressStyles;
   /** The refresh and poll ticks; started once the first list settled. */
@@ -159,6 +163,7 @@ class Workspace {
       if (this.focus === "sidebar") this.navigate(up ? "up" : "down");
       else this.alt.scrollBy(up ? -1 : 1);
     } else if (this.focus === "sidebar" && (is("tui.editor.cursorLeft") || is("tui.editor.cursorRight"))) this.navigate(is("tui.editor.cursorLeft") ? "left" : "right");
+    else if (this.focus === "sidebar" && matchesKey(data, "space")) { const node = this.selectedNode(); if (node) this.toggle(node); }
     else if (matchesKey(data, "[") || matchesKey(data, "]")) this.jump(matchesKey(data, "[") ? -1 : 1);
     // The alt screen binds its top/bottom actions to home/end only; ctrl+home/ctrl+end reach the transcript here.
     else if (matchesKey(data, "ctrl+home")) this.alt.scrollToTop();
@@ -219,6 +224,10 @@ class Workspace {
       this.expansion.set(key, true);
     }
   }
+  /** Space and a click on the ▾/▸ icon: a node with children collapses or expands; any other node stays as it is. */
+  private toggle(node: SessionTreeNode): void {
+    if ((this.tree.byId.get(node.key)?.children.length ?? 0) > 0) this.expansion.set(node.key, !this.isExpanded(node));
+  }
 
   private refresh(): void {
     if (this.listing || this.finished) return;
@@ -246,7 +255,8 @@ class Workspace {
   }
   /**
    * A new list keeps the selection and the expansion by key; a removed node gives the selection to the node now at its row.
-   * Until a node is selected, the initial key or else the first agent node is selected, with its ancestors expanded.
+   * A key listed for the first time takes its initiallyExpanded. Until a node is selected, the initial key or else the first
+   * agent node is selected, with its ancestors expanded.
    */
   private apply(nodes: readonly SessionTreeNode[]): void {
     const row = this.visible().findIndex((node) => node.key === this.selectedKey);
@@ -254,6 +264,7 @@ class Workspace {
     this.nodes = nodes;
     this.byKey = new Map(nodes.map((node) => [node.key, node]));
     this.tree = navigationTree(nodes);
+    for (const node of nodes) if (!this.expansion.has(node.key)) this.expansion.set(node.key, node.initiallyExpanded);
     let wanted = this.selectedNode();
     if (!wanted && this.selectedKey !== undefined) {
       const visible = this.visible();
@@ -451,7 +462,7 @@ class Workspace {
     const key = (keybinding: Keybinding, fallback: string): string => this.keybindings.getKeys(keybinding)[0] ?? fallback;
     const pending = (this.shown?.view?.pendingLarge().length ?? 0) > 0;
     return [
-      ...(this.focus === "sidebar" ? ["↑↓←→ [ ] tree"] : ["↑↓ scroll", "[ ] agent"]),
+      ...(this.focus === "sidebar" ? ["←→/space fold · [ ] agent"] : ["↑↓ scroll", "[ ] agent"]),
       ...(this.sidebarVisible ? [`${key("tui.input.tab", "tab")} ${this.focus === "sidebar" ? "transcript" : "agents"}`] : []),
       ...(pending ? [`${key("tui.select.confirm", "enter")} load`] : []),
       "pgup/pgdn",
@@ -471,25 +482,30 @@ class Workspace {
     return shown.agent.running && shown.agent.activity ? this.styles.dim(clean(shown.agent.activity)) : "";
   }
 
-  /** The visible nodes as their /workflow rows, as wide as sidebarWidth of the terminal, scrolled to keep the selection in view. */
+  /**
+   * The visible nodes as their rows, as wide as sidebarWidth of the terminal, scrolled to keep the selection in view; a dim rule
+   * above every top-level node but the first row shows where one run (or the group) ends and the next begins.
+   */
   private renderSidebar(width: number): string[] {
     const total = Math.min(Math.max(1, width), sidebarWidth(Math.max(1, this.alt.terminal.columns)));
     const cell = Math.max(0, total - SEPARATOR.length);
     const height = Math.max(1, this.alt.terminal.rows - FIXED_ROWS);
-    const rows = this.visible();
-    const selectedRow = rows.findIndex((node) => node.key === this.selectedKey);
+    // A rule is a row without a node: nothing selects it, and the scroll counts it.
+    const rows = this.visible().flatMap((node, index): { readonly node: SessionTreeNode | undefined }[] => index > 0 && node.parentKey === undefined ? [{ node: undefined }, { node }] : [{ node }]);
+    const selectedRow = rows.findIndex(({ node }) => node !== undefined && node.key === this.selectedKey);
     if (selectedRow >= 0 && selectedRow < this.sidebarTop) this.sidebarTop = selectedRow;
     else if (selectedRow >= this.sidebarTop + height) this.sidebarTop = selectedRow - height + 1;
     this.sidebarTop = Math.max(0, Math.min(this.sidebarTop, rows.length - height));
     const visible = rows.slice(this.sidebarTop, this.sidebarTop + height);
-    this.sidebarKeys = visible.map(({ key }) => key);
+    this.sidebarKeys = visible.map(({ node }) => node?.key);
     return Array.from({ length: height }, (_, index) => {
-      const node = visible[index];
-      const text = node ? node.line(this.styles, node.key === this.selectedKey, this.isExpanded(node)) : "";
+      const shown = visible[index];
+      const node = shown?.node;
+      const text = node ? node.line(this.styles, node.key === this.selectedKey, this.isExpanded(node)) : shown ? this.styles.dim("─".repeat(cell)) : "";
       return truncateToWidth(`${truncateToWidth(text, cell, "…", true)}${this.styles.dim(SEPARATOR)}`, total, "", true);
     });
   }
-  /** A click on a row selects its node; the wheel is left to the transcript. */
+  /** A click on a row selects its node, and on its ▾/▸ icon also toggles it; a click on a rule does nothing; the wheel is left to the transcript. */
   private sidebarMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
     if (event.button !== "left" || (event.type !== "press" && event.type !== "release" && event.type !== "click")) return undefined;
     if (event.type === "click") {
@@ -498,7 +514,11 @@ class Workspace {
       if (node) {
         this.focus = "sidebar";
         // Runs from pi-tui's mouse dispatch, outside input()'s try/catch: a throw here would escape uncaught.
-        if (node.key !== this.selectedKey) { try { this.select(node); } catch (error) { this.report(error); } }
+        try {
+          // Every row, a header too, draws its icon at column 2 + 2 * depth (SessionTreeNode.line).
+          if (event.x === 2 + 2 * node.depth) this.toggle(node);
+          if (node.key !== this.selectedKey) this.select(node);
+        } catch (error) { this.report(error); }
       }
     }
     // A handled press makes the release a click on this component.

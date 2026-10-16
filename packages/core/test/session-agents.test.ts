@@ -5,6 +5,8 @@ import { join } from "node:path";
 import test, { after } from "node:test";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { SessionAgent, SessionTreeNode } from "../src/agents-workspace-contract.js";
+import { buildWorkflowPhaseModel, buildWorkflowPhaseTree, workflowPhaseTreeInitialExpanded, workflowPhaseTreeVisibleNodes } from "../src/host-phases.js";
+import { formatWorkflowTreeLine, type WorkflowProgressStyles } from "../src/host-view.js";
 import { createLaunchSnapshot, DEFAULT_SETTINGS, formatWorkflowPhaseDashboard, PLAIN_WORKFLOW_PROGRESS_STYLES, RunStore, type AgentAttemptSummary, type AgentRecord, type LaunchSnapshot, type PersistedRun, type RunState, type WorkflowAgentSession } from "../src/index.js";
 import { createSessionAgentsSource, type SessionAgentsDependencies } from "../src/session-agents.js";
 import type { SubagentManager, SubagentManagerContext } from "../subagents/src/contracts.js";
@@ -14,6 +16,10 @@ const snapshot = createLaunchSnapshot({ script: "return true", args: null, metad
 const MODEL = { provider: "openai", model: "gpt" } as const;
 const ZERO = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
 const PLAIN = PLAIN_WORKFLOW_PROGRESS_STYLES;
+/** Each style names itself around the text, so a row shows which style drew which part. */
+const TAGGED: WorkflowProgressStyles = Object.fromEntries((["accent", "success", "error", "warning", "muted", "dim", "bold"] as const).map((name) => [name, (text: string) => `<${name}>${text}</${name}>`])) as unknown as WorkflowProgressStyles;
+/** A row of the /workflow tree with its depth, as the sidebar draws a run's node below its root. */
+function shifted(row: string, levels = 1): string { return `${row.slice(0, 2)}${"  ".repeat(levels)}${row.slice(2)}`; }
 /** The agents of the tree, in sidebar order. */
 function agentsOf(nodes: readonly SessionTreeNode[]): SessionAgent[] { return nodes.flatMap(({ agent }) => agent ? [agent] : []); }
 
@@ -103,20 +109,20 @@ void test("lists this session's workflow runs in attention order, each as its /w
   // Without declared phases or a phase history every agent sits in the /workflow tree's "Unassigned" phase.
   assert.deepEqual(nodes.map(({ key, parentKey, depth, kind }) => [key, parentKey, depth, kind]), [
     [`run:${active}`, undefined, 0, "run"],
-    [`run:${active}:node:phase/unassigned`, `run:${active}`, 0, "phase"],
-    [`run:${active}:root`, `run:${active}:node:phase/unassigned`, 1, "agent"],
-    [`run:${active}:child`, `run:${active}:root`, 2, "agent"],
-    [`run:${active}:grandchild`, `run:${active}:child`, 3, "agent"],
+    [`run:${active}:node:phase/unassigned`, `run:${active}`, 1, "phase"],
+    [`run:${active}:root`, `run:${active}:node:phase/unassigned`, 2, "agent"],
+    [`run:${active}:child`, `run:${active}:root`, 3, "agent"],
+    [`run:${active}:grandchild`, `run:${active}:child`, 4, "agent"],
     [`run:${newer}`, undefined, 0, "run"],
-    [`run:${newer}:node:phase/unassigned`, `run:${newer}`, 0, "phase"],
-    [`run:${newer}:solo`, `run:${newer}:node:phase/unassigned`, 1, "agent"],
+    [`run:${newer}:node:phase/unassigned`, `run:${newer}`, 1, "phase"],
+    [`run:${newer}:solo`, `run:${newer}:node:phase/unassigned`, 2, "agent"],
     [`run:${older}`, undefined, 0, "run"],
-    [`run:${older}:node:phase/unassigned`, `run:${older}`, 0, "phase"],
-    [`run:${older}:only`, `run:${older}:node:phase/unassigned`, 1, "agent"],
+    [`run:${older}:node:phase/unassigned`, `run:${older}`, 1, "phase"],
+    [`run:${older}:only`, `run:${older}:node:phase/unassigned`, 2, "agent"],
   ]);
   assert.deepEqual(overlaid.sort(), [older, newer, active].sort(), "every run goes through overlayRun");
   assert.ok(nodes.every((node) => (node.kind === "agent") === (node.agent?.key === node.key)), "an agent node carries its agent, under the same key; no other node has one");
-  assert.equal(nodes.find(({ key }) => key === `run:${active}:grandchild`)?.line(PLAIN, false, false), "        • helper · ○", "the label is display text");
+  assert.equal(nodes.find(({ key }) => key === `run:${active}:grandchild`)?.line(PLAIN, false, false), "          • helper · ○", "the label is display text");
   const agents = agentsOf(nodes);
   assert.deepEqual(agents.map(({ name }) => name), ["Planner", "worker", "helper", "solo", "only"]);
   assert.deepEqual(agents.map(({ state }) => state), ["running", "completed", "queued", "completed", "completed"]);
@@ -154,28 +160,28 @@ void test("a run with phases, a shell and parallel scopes gives the /workflow tr
   const review = "run:run:node:phase/review%231";
   assert.deepEqual(nodes.map(({ key, parentKey, depth, kind, initiallyExpanded }) => [key, parentKey, depth, kind, initiallyExpanded]), [
     ["run:run", undefined, 0, "run", true],
-    ["run:run:node:phase/plan%231", "run:run", 0, "phase", true],
-    ["run:run:planner", "run:run:node:phase/plan%231", 1, "agent", false],
-    [review, "run:run", 0, "phase", true],
-    [`${review}/shell`, review, 1, "shell", false],
-    [`${review}/operation/p`, review, 1, "operation", true],
-    [`${review}/operation/p/a`, `${review}/operation/p`, 2, "operation", true],
-    ["run:run:api", `${review}/operation/p/a`, 3, "agent", true],
-    ["run:run:helper", "run:run:api", 4, "agent", false],
-    [`${review}/operation/p/b`, `${review}/operation/p`, 2, "operation", true],
-    ["run:run:ui", `${review}/operation/p/b`, 3, "agent", false],
-    ["run:run:node:phase/ship%231", "run:run", 0, "phase", false],
+    ["run:run:node:phase/plan%231", "run:run", 1, "phase", true],
+    ["run:run:planner", "run:run:node:phase/plan%231", 2, "agent", false],
+    [review, "run:run", 1, "phase", true],
+    [`${review}/shell`, review, 2, "shell", false],
+    [`${review}/operation/p`, review, 2, "operation", true],
+    [`${review}/operation/p/a`, `${review}/operation/p`, 3, "operation", true],
+    ["run:run:api", `${review}/operation/p/a`, 4, "agent", true],
+    ["run:run:helper", "run:run:api", 5, "agent", false],
+    [`${review}/operation/p/b`, `${review}/operation/p`, 3, "operation", true],
+    ["run:run:ui", `${review}/operation/p/b`, 4, "agent", false],
+    ["run:run:node:phase/ship%231", "run:run", 1, "phase", false],
   ]);
-  // The rows /workflow draws for the same run, its root selected and every node expanded; the root names the run, since the
-  // sidebar holds several runs and /workflow's "Workflow" would not tell them apart.
+  // The rows /workflow draws for the same run, its root selected and every node expanded: below the root each one a level
+  // deeper; the root is a header that names the run, since the sidebar holds several runs and /workflow's "Workflow" would not tell them apart.
   const store = new RunStore(cwd, "session", "run", home);
   const loaded = await store.load();
   const dashboard = formatWorkflowPhaseDashboard(overlayRun(loaded.run), loaded.snapshot, 70, { treeOnly: true }, PLAIN, now);
   const rows = dashboard.slice(dashboard.indexOf("Tree") + 1);
   assert.equal(rows[0], "→ ▾ Workflow · ⠦");
-  assert.deepEqual(nodes.map((node) => node.line(PLAIN, node.key === "run:run", node.initiallyExpanded)), ["→ ▾ review flow run · ⠦", ...rows.slice(1)]);
+  assert.deepEqual(nodes.map((node) => node.line(PLAIN, node.key === "run:run", node.initiallyExpanded)), ["→ ▾ review flow run  ⠦ 2/4 agents $0.88", ...rows.slice(1).map((row) => shifted(row))]);
   assert.equal(rows[1], "  ▾ plan · ✓");
-  assert.equal(nodes[1]?.line(PLAIN, false, false), "  ▸ plan · ✓", "a collapsed node");
+  assert.equal(nodes[1]?.line(PLAIN, false, false), "    ▸ plan · ✓", "a collapsed node");
   // The details /workflow shows beside the tree, without its enter hints.
   const details = (key: string): readonly string[] => nodes.find((node) => node.key === key)?.details(PLAIN, now) ?? [];
   assert.deepEqual(details("run:run"), ["Selected workflow: review flow", "Run ID: run", "Status: running", "agents completed=2 running=1 failed=0 cancelled=0 pending=1", "Agents: 4"]);
@@ -189,13 +195,81 @@ void test("a run with phases, a shell and parallel scopes gives the /workflow tr
   assert.equal(title("run:run:node:phase/ship%231"), "ship not started");
 });
 
+void test("a run's root row is a header: name, short id, styled state glyph, done/total agents, cost, and the runtime once the run has usage", async () => {
+  const { home, cwd } = fixture();
+  const running = "aaaaaaaa-1111-4111-8111-111111111111";
+  const completed = "bbbbbbbb-2222-4222-8222-222222222222";
+  const interrupted = "cccccccc-3333-4333-8333-333333333333";
+  const cost = (value: number): Partial<AgentRecord> => ({ accounting: { ...ZERO, cost: value } });
+  await createRun(home, cwd, "session", running, "alpha", "running", [
+    agent("a", "a", "completed", [attempt(1, "a-1")], cost(0.5)),
+    agent("b", "b", "running", [attempt(1, "b-1")], cost(0.25)),
+    agent("c", "c", "failed", [attempt(1, "c-1")]),
+    agent("d", "d", "queued", []),
+  ]);
+  setTerminalAt(await createRun(home, cwd, "session", completed, "beta\u001b[31m", "completed", [agent("e", "e", "completed", [attempt(1, "e-1")])], { usage: { tokens: 0, costUsd: 0, durationMs: 65_000, agentLaunches: 1 } }), "2026-06-01T00:00:00.000Z");
+  await createRun(home, cwd, "session", interrupted, "gamma", "interrupted", [agent("f", "f", "cancelled", [attempt(1, "f-1")], cost(0.004))], { usage: { tokens: 0, costUsd: 0, durationMs: 3000, agentLaunches: 1 } });
+  const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home)).list();
+  const root = (runId: string): SessionTreeNode => {
+    const node = nodes.find(({ key }) => key === `run:${runId}`);
+    assert.ok(node, runId);
+    return node;
+  };
+  // The ▾/▸ icon in the column of a depth-0 row; the label bold, the glyph in the run state's style.
+  assert.equal(root(running).line(TAGGED, true, true), "→ ▾ <bold>alpha aaaaaaaa</bold>  <accent>⠦</accent> 2/4 agents $0.75");
+  assert.equal(root(running).line(PLAIN, false, false), "  ▸ alpha aaaaaaaa  ⠦ 2/4 agents $0.75");
+  assert.equal(root(completed).line(TAGGED, false, false), "  ▸ <bold>beta bbbbbbbb</bold>  <success>✓</success> 1/1 agents 1m 5s", "no cost without one; the runtime of the run's usage; the name as display text");
+  assert.equal(root(interrupted).line(TAGGED, false, true), "  ▾ <bold>gamma cccccccc</bold>  <warning>↯</warning> 1/1 agents $0.004 3s");
+  // A run that is not in a hard terminal state starts expanded; a finished one collapsed.
+  assert.deepEqual([running, completed, interrupted].map((runId) => root(runId).initiallyExpanded), [true, false, true]);
+  // The root keeps its key, details and title.
+  assert.equal(root(running).title(PLAIN), "alpha aaaaaaaa running");
+  assert.equal(root(completed).details(PLAIN, Date.now())[0], "Selected workflow: beta");
+});
+
+void test("below its root every node of a run is its /workflow tree node one level deeper, with that node's row and initial expansion", async () => {
+  const { home, cwd } = fixture();
+  const launch = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "agents" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, phases: ["plan", "review"], schemas: [] });
+  const agents = (state: AgentRecord["state"]): AgentRecord[] => [
+    agent("planner", "planner", "completed", [attempt(1, "planner-1")]),
+    agent("api", "api", state, [attempt(1, "api-1")], { structuralPath: ["p", "a"] }),
+    agent("helper", "helper", state === "running" ? "queued" : state, [], { parentId: "api", structuralPath: ["p", "a"] }),
+    agent("ui", "ui", "completed", [attempt(1, "ui-1")], { structuralPath: ["p", "b"] }),
+  ];
+  const history = { phase: "review", phaseHistory: [{ phase: "plan", afterAgent: 0 }, { phase: "review", afterAgent: 1 }] };
+  await createRun(home, cwd, "session", "run-live", "live", "running", agents("running"), history, launch);
+  setTerminalAt(await createRun(home, cwd, "session", "run-done", "done", "completed", agents("completed"), history, launch), "2026-06-01T00:00:00.000Z");
+  const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home)).list();
+  for (const runId of ["run-live", "run-done"]) {
+    const { run, snapshot: loaded } = await new RunStore(cwd, "session", runId, home).load();
+    const tree = buildWorkflowPhaseTree(buildWorkflowPhaseModel(run, loaded));
+    const expanded = workflowPhaseTreeInitialExpanded(tree);
+    const ordered = workflowPhaseTreeVisibleNodes(tree, new Set(tree.nodes.map(({ id }) => id)));
+    const mine = nodes.filter(({ key }) => key === `run:${runId}` || key.startsWith(`run:${runId}:`));
+    assert.equal(mine.length, ordered.length, runId);
+    assert.ok(ordered.length > 5, "phases, operation scopes and agents");
+    ordered.forEach((treeNode, index) => {
+      const node = mine[index];
+      assert.ok(node);
+      if (treeNode.kind === "workflow") {
+        assert.deepEqual([node.depth, node.initiallyExpanded], [0, runId === "run-live"], runId);
+        return;
+      }
+      const depth = treeNode.depth + 1;
+      assert.equal(node.depth, depth, node.key);
+      assert.equal(node.initiallyExpanded, expanded.has(treeNode.id), node.key);
+      for (const [selected, open] of [[false, false], [true, true], [false, true]] as const) assert.equal(node.line(TAGGED, selected, open), formatWorkflowTreeLine({ ...treeNode, depth }, selected, open, TAGGED), node.key);
+    });
+  }
+});
+
 void test("labels, phase names and operation scopes are display text", async () => {
   const { home, cwd } = fixture();
   const launch = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "agents" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, phases: ["re\u001b[31mview"], schemas: [] });
   await createRun(home, cwd, "session", "run", "flow\u0007", "running", [agent("api", "api", "running", [attempt(1, "api-1")], { structuralPath: ["p\u001b]0;title\u0007"] })], { phaseHistory: [{ phase: "re\u001b[31mview", afterAgent: 0 }] }, launch);
   const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home)).list();
   const lines = nodes.map((node) => node.line(PLAIN, false, true));
-  assert.deepEqual(lines, ["  ▾ flow  run · ⠦", "  ▾ review · ⠦", "    ▾ p · ⠦", "      • api · ⠦"]);
+  assert.deepEqual(lines, ["  ▾ flow  run  ⠦ 0/1 agents", "    ▾ review · ⠦", "      ▾ p · ⠦", "        • api · ⠦"]);
   const text = nodes.flatMap((node) => [node.line(PLAIN, false, true), node.title(PLAIN), ...node.details(PLAIN, Date.now())]).join("\n");
   // Every control character but the line breaks joining the lines above, built as utils.ts builds its own.
   const control = new RegExp(`[${String.fromCharCode(0)}-${String.fromCharCode(9)}${String.fromCharCode(11)}-${String.fromCharCode(31)}${String.fromCharCode(127)}]`);
@@ -244,8 +318,8 @@ void test("a parentId cycle ends as the /workflow tree ends it", async () => {
   ]);
   const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home)).list();
   assert.deepEqual(nodes.filter(({ kind }) => kind === "agent").map(({ key, parentKey, depth }) => ({ key, parentKey, depth })), [
-    { key: "run:run:b", parentKey: "run:run:node:phase/unassigned", depth: 1 },
-    { key: "run:run:a", parentKey: "run:run:b", depth: 2 },
+    { key: "run:run:b", parentKey: "run:run:node:phase/unassigned", depth: 2 },
+    { key: "run:run:a", parentKey: "run:run:b", depth: 3 },
   ]);
 });
 
@@ -303,16 +377,17 @@ void test("lists the subagents of this session after the runs and owns only thos
   const keys = ["subagent:run-owned", "subagent:run-nosession", "subagent:run-elsewhere", "subagent:run-other", "subagent:bad/id", "subagent:run-here"];
   assert.deepEqual(nodes.map(({ key, parentKey, depth, kind, initiallyExpanded }) => [key, parentKey, depth, kind, initiallyExpanded]), [
     ["run:run", undefined, 0, "run", true],
-    ["run:run:node:phase/unassigned", "run:run", 0, "phase", true],
-    ["run:run:a", "run:run:node:phase/unassigned", 1, "agent", false],
+    ["run:run:node:phase/unassigned", "run:run", 1, "phase", true],
+    ["run:run:a", "run:run:node:phase/unassigned", 2, "agent", false],
     ["subagents", undefined, 0, "group", true],
     ...keys.map((key) => [key, "subagents", 1, "agent", false]),
   ]);
   const [group, ...children] = nodes.slice(3);
   assert.ok(group);
-  // The group takes the state the /subagents order puts first; its details are the /subagents header.
-  assert.equal(group.line(PLAIN, true, true), "→ ▾ Subagents · ⠦");
-  assert.equal(group.line(PLAIN, false, false), "  ▸ Subagents · ⠦");
+  // The group's row is a header with the counts and cost of its details; its details are the /subagents header and it takes
+  // the state the /subagents order puts first.
+  assert.equal(group.line(PLAIN, true, true), "→ ▾ Subagents  2 running · 1 failed · 1 stopped · 2 completed · $1.50");
+  assert.equal(group.line(PLAIN, false, false), "  ▸ Subagents  2 running · 1 failed · 1 stopped · 2 completed · $1.50");
   assert.deepEqual(group.details(PLAIN, Date.now()), ["Subagents", "2 running · 1 failed · 1 stopped · 2 completed · $1.50"]);
   assert.equal(group.title(PLAIN), "Subagents running");
   assert.equal(group.agent, undefined);
@@ -407,4 +482,23 @@ void test("without a subagent manager, or without subagents of this session, the
   const foreign = fakeManager([{ id: "run-foreign", sessionId: "other-session", state: "running", startedAt: 1, attempts: 1, progress: { accounting: ZERO, toolCalls: [] } }]);
   const others = await createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => foreign })).list();
   assert.deepEqual(others.map(({ key }) => key), keys);
+});
+
+void test("the Subagents group's row is a header with its counts and cost, and the group starts expanded only while one of its subagents runs", async () => {
+  const { home, cwd } = fixture();
+  const row = (id: string, state: string, cost: number, extra: Record<string, unknown> = {}): Record<string, unknown> => ({ id, sessionId: "session", state, startedAt: 1, attempts: 1, progress: { accounting: { ...ZERO, cost }, toolCalls: [] }, ...extra });
+  const group = async (listed: readonly Record<string, unknown>[]): Promise<SessionTreeNode> => {
+    const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => fakeManager(listed) })).list();
+    const found = nodes.find(({ key }) => key === "subagents");
+    assert.ok(found);
+    return found;
+  };
+  const idle = await group([row("sub-done", "completed", 0.25, { finishedAt: 2 }), row("sub-failed", "failed", 0, { finishedAt: 3 })]);
+  assert.equal(idle.initiallyExpanded, false, "no subagent runs");
+  assert.equal(idle.line(TAGGED, false, false), "  ▸ <bold>Subagents</bold>  1 failed · 1 completed · $0.25");
+  assert.equal(idle.line(PLAIN, true, true), "→ ▾ Subagents  1 failed · 1 completed · $0.25");
+  assert.equal(idle.details(PLAIN, Date.now())[1], "1 failed · 1 completed · $0.25", "the counts and cost of its details");
+  const busy = await group([row("sub-done", "completed", 0, { finishedAt: 2 }), row("sub-running", "running", 0)]);
+  assert.equal(busy.initiallyExpanded, true, "a subagent runs");
+  assert.equal(busy.line(PLAIN, false, true), "  ▾ Subagents  1 running · 1 completed");
 });

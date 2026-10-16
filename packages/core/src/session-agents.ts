@@ -4,10 +4,10 @@ import { attemptValue, statusValue } from "../subagents/src/decode.js";
 import type { SessionAgent, SessionAgentsSource, SessionTreeNode } from "./agents-workspace-contract.js";
 import { formatCost, formatTokens } from "./background-widget.js";
 import { buildWorkflowPhaseModel, buildWorkflowPhaseTree, workflowPhaseTreeInitialExpanded, workflowPhaseTreeVisibleNodes, type WorkflowPhaseTreeNode } from "./host-phases.js";
-import { agentActivityLabel, formatWorkflowNodeDetails, formatWorkflowTreeLine, navigatorAttentionSort, navigatorAttentionSortByState, progressStyleForState, type WorkflowProgressStyles } from "./host-view.js";
+import { agentActivityLabel, formatWorkflowNodeDetails, formatWorkflowRuntime, formatWorkflowTreeLine, navigatorAttentionSort, navigatorAttentionSortByState, progressStyleForState, runStateGlyph, type WorkflowProgressStyles } from "./host-view.js";
 import { sameFilesystemPath } from "./paths.js";
 import { listRunIds, RunStore, type PersistedRun } from "./persistence.js";
-import { SETTLED_AGENT_STATES, type AgentAccounting, type AgentAttemptSummary, type AgentRecord, type LaunchSnapshot, type ModelSpec, type WorkflowAgentSession } from "./types.js";
+import { isHardTerminalRunState, SETTLED_AGENT_STATES, type AgentAccounting, type AgentAttemptSummary, type AgentRecord, type LaunchSnapshot, type ModelSpec, type WorkflowAgentSession } from "./types.js";
 import { isObject, sanitizeDisplayText } from "./utils.js";
 
 export interface SessionAgentsDependencies {
@@ -57,14 +57,24 @@ function nodeTitle(label: string, state: string, styles: WorkflowProgressStyles)
 function displayNode(node: WorkflowPhaseTreeNode): WorkflowPhaseTreeNode {
   return { ...node, label: sanitizeDisplayText(node.label), phaseId: sanitizeDisplayText(node.phaseId), operationPath: node.operationPath.map(sanitizeDisplayText), ...(node.phase ? { phase: { ...node.phase, name: sanitizeDisplayText(node.phase.name) } } : {}) };
 }
-/** The /subagents dashboard's header (headerRows in subagents/src/navigator.ts): the count of each state and the total cost. */
-function subagentsHeader(statuses: readonly SubagentStatus[], styles: WorkflowProgressStyles): string[] {
+/** The /subagents dashboard's header counts (headerRows in subagents/src/navigator.ts): the count of each state and the total cost. */
+function subagentsCounts(statuses: readonly SubagentStatus[]): string {
   const counts = (["running", "failed", "stopped", "completed"] as const).flatMap((state) => {
     const count = statuses.filter((status) => status.state === state).length;
     return count ? [`${String(count)} ${state}`] : [];
   });
   const cost = formatCost(statuses.reduce((sum, status) => sum + (status.progress?.accounting.cost ?? 0), 0));
-  return [styles.bold(styles.accent("Subagents")), [...counts, ...(cost ? [cost] : [])].join(" · ")];
+  return [...counts, ...(cost ? [cost] : [])].join(" · ");
+}
+/** A run's styled state glyph, its done/total agents, their cost and its runtime: the pieces of the /workflow picker's run label (navigatorRunLabels). */
+function runSummary(run: PersistedRun, styles: WorkflowProgressStyles): string {
+  const done = run.agents.filter((agent) => SETTLED_AGENT_STATES.has(agent.state)).length;
+  const cost = formatCost(run.agents.reduce((sum, agent) => sum + (agent.accounting?.cost ?? 0), 0));
+  return [progressStyleForState(run.state, styles)(runStateGlyph(run.state, "⠦")), `${String(done)}/${String(run.agents.length)} agents`, cost, run.usage ? formatWorkflowRuntime(run.usage.durationMs) : ""].filter(Boolean).join(" ");
+}
+/** The row of a run root or the group: arrow and ▾/▸ in the columns of a depth-0 /workflow row, the bold label, two spaces, the summary. */
+function headerLine(label: string, summary: string, selected: boolean, expanded: boolean, expandable: boolean, styles: WorkflowProgressStyles): string {
+  return `${selected ? "→" : " "} ${expandable ? expanded ? "▾" : "▸" : " "} ${styles.bold(label)}  ${summary}`;
 }
 
 export function createSessionAgentsSource(context: ExtensionCommandContext, deps: SessionAgentsDependencies): SessionAgentsSource {
@@ -86,7 +96,7 @@ export function createSessionAgentsSource(context: ExtensionCommandContext, deps
       running,
     };
   };
-  /** The run's /workflow tree, every node in the order /workflow draws them. */
+  /** The run's /workflow tree, every node in the order /workflow draws them, under a header row for the run. */
   const runNodes = (run: PersistedRun, snapshot: Readonly<LaunchSnapshot>): SessionTreeNode[] => {
     const tree = buildWorkflowPhaseTree(buildWorkflowPhaseModel(run, snapshot));
     const expanded = workflowPhaseTreeInitialExpanded(tree);
@@ -95,16 +105,20 @@ export function createSessionAgentsSource(context: ExtensionCommandContext, deps
     // Every node expanded: the sidebar order, a parent before its children.
     return workflowPhaseTreeVisibleNodes(tree, new Set(tree.nodes.map(({ id }) => id))).map((node) => {
       const parent = node.parentId === undefined ? undefined : tree.byId.get(node.parentId);
+      const root = node.kind === "workflow";
+      // Below its header a run's nodes sit one level deeper than in /workflow, where the phases share the root's depth 0.
+      const depth = root ? 0 : node.depth + 1;
       // The run root names its run: the sidebar holds several runs, and /workflow's "Workflow" would not tell them apart.
-      const shown = node.kind === "workflow" ? { ...displayNode(node), label: `${shownRun.workflowName} ${shownRun.id.slice(0, 8)}` } : displayNode(node);
+      const shown = root ? { ...displayNode(node), label: `${shownRun.workflowName} ${shownRun.id.slice(0, 8)}` } : { ...displayNode(node), depth };
       const agent = node.kind === "agent" ? node.agent : undefined;
       return {
         key: key(node),
         parentKey: parent && key(parent),
-        depth: node.depth,
+        depth,
         kind: RUN_NODE_KIND[node.kind],
-        initiallyExpanded: expanded.has(node.id),
-        line: (styles, selected, open) => formatWorkflowTreeLine(shown, selected, open, styles),
+        // A finished run starts collapsed; inside a run the nodes start as in /workflow.
+        initiallyExpanded: root ? !isHardTerminalRunState(run.state) : expanded.has(node.id),
+        line: (styles, selected, open) => root ? headerLine(shown.label, runSummary(run, styles), selected, open, node.children.length > 0, styles) : formatWorkflowTreeLine(shown, selected, open, styles),
         details: (styles, now) => agent ? [] : formatWorkflowNodeDetails(shownRun, tree, shown, styles, now, false),
         title: (styles) => nodeTitle(shown.label, node.state, styles),
         agent: agent && runAgent(run, agent),
@@ -180,14 +194,16 @@ export function createSessionAgentsSource(context: ExtensionCommandContext, deps
     const children = sorted.map(({ status, owned }) => subagent(manager, status, owned));
     // The group takes the state of its first subagent: the one the /subagents order puts first.
     const state = first.status.state;
+    const counts = subagentsCounts(sorted.map(({ status }) => status));
     const group: SessionTreeNode = {
       key: "subagents",
       parentKey: undefined,
       depth: 0,
       kind: "group",
-      initiallyExpanded: true,
-      line: (styles, selected, expanded) => formatWorkflowTreeLine({ kind: "group", label: "Subagents", depth: 0, state, children: children.map(({ key }) => key) }, selected, expanded, styles),
-      details: (styles) => subagentsHeader(sorted.map(({ status }) => status), styles),
+      // An idle group starts collapsed.
+      initiallyExpanded: sorted.some(({ status }) => status.state === "running"),
+      line: (styles, selected, expanded) => headerLine("Subagents", counts, selected, expanded, true, styles),
+      details: (styles) => [styles.bold(styles.accent("Subagents")), counts],
       title: (styles) => nodeTitle("Subagents", state, styles),
       agent: undefined,
     };
