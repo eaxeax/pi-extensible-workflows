@@ -1374,7 +1374,8 @@ test("opens bounded prompt and result artifacts while terminal runs hide system 
   const editorPath = join(cwd, "fake-editor.sh");
   const editedPath = join(cwd, "edited-content");
   const openedPath = join(cwd, "opened-path");
-  await writeFile(editorPath, "#!/bin/sh\ncat \"$3\" > \"$1\"\nprintf '%s' \"$3\" > \"$2\"\n", { mode: 0o755 });
+  // opened-path first: the test waits for the edited content and then reads opened-path at once.
+  await writeFile(editorPath, "#!/bin/sh\nprintf '%s' \"$3\" > \"$2\"\ncat \"$3\" > \"$1\"\n", { mode: 0o755 });
   const previous = { VISUAL: process.env.VISUAL, EDITOR: process.env.EDITOR, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR };
   process.env.VISUAL = `${editorPath} ${editedPath} ${openedPath}`;
   process.env.EDITOR = process.env.VISUAL;
