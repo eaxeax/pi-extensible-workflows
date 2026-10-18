@@ -196,13 +196,13 @@ function send(client: Client, value: unknown, maxBytes: number): void {
 /** Grows the receive buffer geometrically, so assembling a frame from many chunks copies each byte a bounded number of times. */
 function reserve(client: Client, bytes: number, maxBytes: number): void {
   if (bytes <= client.buffer.length) return;
-  const grown = Buffer.allocUnsafe(Math.min(maxBytes + 14, Math.max(bytes, client.buffer.length * 2)));
+  const grown = Buffer.allocUnsafe(Math.max(bytes, Math.min(maxBytes + 14, client.buffer.length * 2)));
   client.buffer.copy(grown, 0, 0, client.buffered);
   client.buffer = grown;
 }
 
 function parseFrames(client: Client, chunk: Buffer, maxBytes: number): readonly string[] {
-  if (client.buffered + chunk.length > maxBytes + 14) throw new Error("Trajectory WebSocket buffer is too large");
+  // A chunk may carry several complete frames; only the unfinished frame left after parsing is bounded.
   reserve(client, client.buffered + chunk.length, maxBytes);
   client.buffered += chunk.copy(client.buffer, client.buffered);
   const messages: string[] = [];
@@ -235,6 +235,8 @@ function parseFrames(client: Client, chunk: Buffer, maxBytes: number): readonly 
   }
   // Only the unfinished frame moves to the front, and the buffer is sized for it once its header is known.
   if (start > 0) { client.buffer.copy(client.buffer, 0, start, client.buffered); client.buffered -= start; }
+  if (client.buffered > maxBytes + 14) throw new Error("Trajectory WebSocket buffer is too large");
+  if (client.buffer.length > maxBytes + 14) { const trimmed = Buffer.allocUnsafe(maxBytes + 14); client.buffer.copy(trimmed, 0, 0, client.buffered); client.buffer = trimmed; }
   reserve(client, needed, maxBytes);
   return messages;
 }

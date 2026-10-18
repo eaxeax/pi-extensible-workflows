@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdir, readdir, readFile, rm } from "node:fs/promises";
@@ -14,7 +15,21 @@ type StartupHolder = ProcessIdentity & { token: string; server?: ProcessIdentity
 let bootId: string | undefined;
 // The boot id and the start time in clock ticks never change for a process and differ for any later process reusing its pid.
 // The /proc/<pid> ctime does not qualify: it records when that entry was looked up, and the kernel can recreate the entry.
+// Without /proc, macOS reports a process's start time (to the second) through ps; a pid reused by another process within that second is not distinguished.
+// The start time is printed in the caller's time zone, so the environment is fixed to make it identical in every process.
+let ownDarwinStart: string | undefined;
+function darwinProcessStart(pid: number): string | undefined {
+  if (pid === process.pid && ownDarwinStart !== undefined) return ownDarwinStart;
+  try {
+    const started = execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 2000, env: { ...process.env, TZ: "UTC", LC_ALL: "C" }, stdio: ["ignore", "pipe", "ignore"] }).trim();
+    if (started === "") return undefined;
+    const start = `darwin:${started}`;
+    if (pid === process.pid) ownDarwinStart = start;
+    return start;
+  } catch { return undefined; }
+}
 export function processStart(pid: number): string | undefined {
+  if (process.platform === "darwin") return darwinProcessStart(pid);
   if (process.platform !== "linux") return undefined;
   try {
     bootId ??= readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
@@ -25,7 +40,7 @@ export function processStart(pid: number): string | undefined {
   } catch { return undefined; }
 }
 // Unverified is not dead: an existing pid whose start was never recorded or cannot be read counts as alive.
-//NOTE: without /proc (macOS, Windows) only the pid is checked, so a pid reused by an unrelated process keeps blocking until that process exits.
+//NOTE: without a readable start time (Windows) only the pid is checked, so a pid reused by an unrelated process keeps blocking until that process exits.
 export function processLive(identity: ProcessIdentity): boolean {
   try { process.kill(identity.pid, 0); } catch (error) { if (isNodeError(error, "ESRCH")) return false; }
   if (identity.start === undefined) return true;

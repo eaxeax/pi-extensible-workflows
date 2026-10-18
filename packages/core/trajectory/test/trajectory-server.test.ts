@@ -920,6 +920,38 @@ function stateTitle(value: unknown): string | undefined {
   return typeof title === "string" ? title : undefined;
 }
 
+void test("Trajectory parses several complete frames delivered in one chunk larger than the frame limit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-coalesced-"));
+  const port = await availablePort();
+  const maxFrameBytes = 1000;
+  const server = createTrajectoryServer(port, join(root, "trajectory.lock"), { maxFrameBytes });
+  const sides = serverSockets(server);
+  await listen(server, port);
+  const origin = `http://127.0.0.1:${String(port)}`;
+  const publisher = await handshake(port, origin);
+  const browser = await handshake(port, origin);
+  try {
+    const publisherSide = sides[0];
+    assert.ok(publisherSide);
+    browser.socket.write(maskedFrame(JSON.stringify({ type: "ui:attach" })));
+    await readJsonFrame(browser.socket);
+    const frames = [maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "pub", padding: "p".repeat(150) })), maskedFrame(JSON.stringify({ type: "publisher:state", publisher: { id: "pub", title: "t".repeat(820) }, runs: [], subagents: [] }))];
+    const chunk = Buffer.concat(frames);
+    assert.ok(chunk.length > maxFrameBytes + 14);
+    for (const part of frames) assert.ok(part.length < maxFrameBytes);
+    publisherSide.emit("data", chunk);
+    const state = await readJsonFrame(browser.socket, (value) => stateTitle(value) !== undefined);
+    assert.equal(stateTitle(state), "t".repeat(820));
+  } finally {
+    publisher.socket.destroy();
+    browser.socket.destroy();
+    server.closeAllConnections();
+    server.close();
+    server.unref();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 void test("Trajectory assembles WebSocket frames split across arbitrary chunk boundaries", async () => {
   const root = await mkdtemp(join(tmpdir(), "trajectory-server-chunks-"));
   const port = await availablePort();
@@ -938,10 +970,12 @@ void test("Trajectory assembles WebSocket frames split across arbitrary chunk bo
     const title = "t".repeat(70_000);
     const stream = Buffer.concat([maskedFrame(attach), maskedControlFrame(0x9, JSON.stringify({ ping: "one" })), maskedControlFrame(0xA, "ignored"), maskedFrame(publisherState("pub", "", [], title)), maskedControlFrame(0x9, JSON.stringify({ ping: "two" }))]);
     assert.ok(Buffer.byteLength(attach) > 125 && Buffer.byteLength(attach) <= 0xffff);
+    // A socket drops data while no reader is attached, so the browser listens before the publisher's frames are emitted.
+    const browserState = readJsonFrame(browser.socket, (value) => stateTitle(value) !== undefined);
     for (const chunk of splitIrregularly(stream)) publisherSide.emit("data", chunk);
     assert.deepEqual(await readJsonFrame(publisher.socket), { ping: "one" });
     assert.deepEqual(await readJsonFrame(publisher.socket), { ping: "two" });
-    assert.equal(stateTitle(await readJsonFrame(browser.socket, (value) => stateTitle(value) !== undefined)), title);
+    assert.equal(stateTitle(await browserState), title);
   } finally {
     publisher.socket.destroy();
     browser.socket.destroy();

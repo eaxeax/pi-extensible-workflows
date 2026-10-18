@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -19,7 +19,7 @@ const model: ModelSpec = { provider: "test", model: "model", thinking: "off" };
 const options = (agentOptions: Record<string, JsonValue>) => ({ label: "test", workflowName: "test", agentOptions });
 const transport: AgentTransport = { id: "test", async createSession() { throw new Error("inspection must not spawn"); } };
 function fixture(t: TestContext): AgentExecutionRoot {
-  const cwd = mkdtempSync(join(tmpdir(), "workflow-preparation-"));
+  const cwd = mkdtempSync(join(realpathSync(tmpdir()), "workflow-preparation-"));
   const agentDir = join(cwd, "agent");
   mkdirSync(agentDir);
   t.after(() => { rmSync(cwd, { recursive: true, force: true }); });

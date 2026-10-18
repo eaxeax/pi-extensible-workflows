@@ -131,6 +131,17 @@ void test("retention deletes runs with valid evidence and runs without an eviden
   assert.equal(existsSync(sibling.directory), false);
 });
 
+void test("retention accepts only the exact in-flight summary write beside a run", async () => {
+  const { paths, old, sibling } = await evidenceFixture();
+  writeFileSync(join(old.directory, "summary.json.4242.0b2f6c1e-5d7a-4c3b-9e8f-1a2b3c4d5e6f.tmp"), "{}");
+  writeFileSync(join(sibling.directory, "summary.json.4242.not-a-uuid.tmp"), "{}");
+  await assert.rejects(retain(paths), /unrecognized artifact/);
+  assert.equal(existsSync(old.directory), true);
+  assert.equal(existsSync(sibling.directory), true);
+  rmSync(join(sibling.directory, "summary.json.4242.not-a-uuid.tmp"));
+  assert.deepEqual([...(await retain(paths)).deleted].sort(), ["old", "sibling"]);
+});
+
 for (const [name, tamper, message] of [
   ["invalid file name", (dir: string) => { writeFileSync(join(dir, "notes.txt"), "user content"); }, /Evidence file name is invalid/],
   ["symlink", (dir: string) => { symlinkSync("/etc/hostname", join(dir, `${"a".repeat(64)}.txt`)); }, /not a regular file/],

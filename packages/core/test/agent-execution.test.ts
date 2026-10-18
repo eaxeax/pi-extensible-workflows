@@ -2167,7 +2167,7 @@ void test("setup hooks may narrow the prepared resource policy", async () => {
   }
 });
 void test("setup hooks canonicalize relative extension narrowing", async () => {
-  const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-hook-extension-policy-"));
+  const rootDir = mkdtempSync(join(realpathSync(tmpdir()), "pi-extensible-workflows-hook-extension-policy-"));
   const agentDir = join(rootDir, "agent");
   const cwd = join(rootDir, "project");
   const extensionsDir = join(cwd, "extensions");

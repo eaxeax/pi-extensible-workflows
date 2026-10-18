@@ -10,7 +10,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { createTrajectoryController, trajectoryServerPath, type TrajectoryController } from "../src/index.js";
-import { tryAcquireStartupMutex } from "../src/startup-mutex.js";
+import { identityOf, tryAcquireStartupMutex } from "../src/startup-mutex.js";
 import { isNodeError } from "../../src/utils.js";
 
 type TrajectoryLock = { pid: number; port: number; fingerprint?: string };
@@ -924,4 +924,21 @@ void test("Trajectory resolves the runnable server in a source checkout", async 
   } finally {
     await rm(home, { recursive: true, force: true });
   }
+});
+
+void test("a process identity is stable across calls and time zones, and a dead pid has none", async () => {
+  const first = identityOf(process.pid);
+  assert.deepEqual(identityOf(process.pid), first);
+  const mutexModule = new URL("../src/startup-mutex.js", import.meta.url).href;
+  const script = `import(${JSON.stringify(mutexModule)}).then((m) => { process.stdout.write(JSON.stringify(m.identityOf(${String(process.pid)}))); });`;
+  for (const zone of ["Asia/Tokyo", "America/New_York"]) {
+    const child = spawn(process.execPath, ["-e", script], { env: { ...process.env, TZ: zone }, stdio: ["ignore", "pipe", "inherit"] });
+    let output = "";
+    child.stdout.on("data", (chunk: Buffer) => { output += chunk.toString(); });
+    await new Promise<void>((resolve, reject) => { child.once("error", reject); child.once("close", () => { resolve(); }); });
+    assert.deepEqual(JSON.parse(output), first);
+  }
+  const dead = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  await new Promise<void>((resolve) => { dead.once("close", () => { resolve(); }); });
+  assert.deepEqual(identityOf(dead.pid ?? 0), { pid: dead.pid });
 });

@@ -145,6 +145,11 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
     }).catch(async (error: unknown) => {
       await scheduler.flush(run.store.runId);
       const typed = error instanceof WorkflowError ? error : new WorkflowError(errorCode(error) ?? "INTERNAL_ERROR", errorText(error));
+      if (!isExternallyEndedRunState(run.lifecycle.state) && typed.code !== "BUDGET_EXHAUSTED") {
+        // Release before the failed state becomes visible so a retry issued on observing it is not rejected.
+        const lineage = loaded.run.retry?.lineageRootRunId ?? run.store.runId;
+        retryReservations.delete(lineage);
+      }
       if (!isExternallyEndedRunState(run.lifecycle.state)) await run.lifecycle.terminal(typed.code === "BUDGET_EXHAUSTED" ? "budget_exhausted" : "failed", typed.code);
       const persisted = await persistRunState(run.store, run.metadata, (current) => persistedFailure({ ...current, ...run.budget.snapshot() }, typed));
       const ended = run.lifecycle.state;
