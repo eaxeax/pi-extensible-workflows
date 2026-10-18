@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after } from "node:test";
@@ -192,7 +192,7 @@ void test("a run with phases, a shell and parallel scopes gives the /workflow tr
   const dashboard = formatWorkflowPhaseDashboard(overlayRun(loaded.run), loaded.snapshot, 70, { treeOnly: true }, PLAIN, now);
   const rows = dashboard.slice(dashboard.indexOf("Tree") + 1);
   assert.equal(rows[0], "→ ▾ Workflow · ⠦");
-  assert.deepEqual(nodes.map((node) => node.line(PLAIN, node.key === "run:run", node.initiallyExpanded)), ["→ ▾ review flow run  ⠦ 2/4 agents $0.88", ...rows.slice(1).map((row) => shifted(row))]);
+  assert.deepEqual(nodes.map((node) => node.line(PLAIN, node.key === "run:run", node.initiallyExpanded)), ["→ ▾ review flow run  ⠦ 2/4 $0.88", ...rows.slice(1).map((row) => shifted(row))]);
   assert.equal(rows[1], "  ▾ plan · ✓");
   assert.equal(nodes[1]?.line(PLAIN, false, false), "    ▸ plan · ✓", "a collapsed node");
   // The details /workflow shows beside the tree, without its enter hints.
@@ -229,10 +229,10 @@ void test("a run's root row is a header: name, short id, styled state glyph, don
     return node;
   };
   // The ▾/▸ icon in the column of a depth-0 row; the label bold, the glyph in the run state's style.
-  assert.equal(root(running).line(TAGGED, true, true), "→ ▾ <bold>alpha aaaaaaaa</bold>  <accent>⠦</accent> 2/4 agents $0.75");
-  assert.equal(root(running).line(PLAIN, false, false), "  ▸ alpha aaaaaaaa  ⠦ 2/4 agents $0.75");
-  assert.equal(root(completed).line(TAGGED, false, false), "  ▸ <bold>beta bbbbbbbb</bold>  <success>✓</success> 1/1 agents 1m 5s", "no cost without one; the runtime of the run's usage; the name as display text");
-  assert.equal(root(interrupted).line(TAGGED, false, true), "  ▾ <bold>gamma cccccccc</bold>  <warning>↯</warning> 1/1 agents $0.004 3s");
+  assert.equal(root(running).line(TAGGED, true, true), "→ ▾ <bold>alpha aaaaaaaa</bold>  <accent>⠦</accent> 2/4 $0.75");
+  assert.equal(root(running).line(PLAIN, false, false), "  ▸ alpha aaaaaaaa  ⠦ 2/4 $0.75");
+  assert.equal(root(completed).line(TAGGED, false, false), "  ▸ <bold>beta bbbbbbbb</bold>  <success>✓</success> 1/1 1m 5s", "no cost without one; the runtime of the run's usage; the name as display text");
+  assert.equal(root(interrupted).line(TAGGED, false, true), "  ▾ <bold>gamma cccccccc</bold>  <warning>↯</warning> 1/1 $0.004 3s");
   // A run that is not in a hard terminal state starts expanded; a finished one collapsed.
   assert.deepEqual([running, completed, interrupted].map((runId) => root(runId).initiallyExpanded), [true, false, true]);
   // The root keeps its key, details and title.
@@ -282,7 +282,7 @@ void test("labels, phase names and operation scopes are display text", async () 
   await createRun(home, cwd, "session", "run", "flow\u0007", "running", [agent("api", "api", "running", [attempt(1, "api-1")], { structuralPath: ["p\u001b]0;title\u0007"] })], { phaseHistory: [{ phase: "re\u001b[31mview", afterAgent: 0 }] }, launch);
   const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home)).list();
   const lines = nodes.map((node) => node.line(PLAIN, false, true));
-  assert.deepEqual(lines, ["  ▾ flow  run  ⠦ 0/1 agents", "    ▾ review · ⠦", "      ▾ p · ⠦", "        • api · ⠦"]);
+  assert.deepEqual(lines, ["  ▾ flow  run  ⠦ 0/1", "    ▾ review · ⠦", "      ▾ p · ⠦", "        • api · ⠦"]);
   const text = nodes.flatMap((node) => [node.line(PLAIN, false, true), node.title(PLAIN), ...node.details(PLAIN, Date.now())]).join("\n");
   // Every control character but the line breaks joining the lines above, built as utils.ts builds its own.
   const control = new RegExp(`[${String.fromCharCode(0)}-${String.fromCharCode(9)}${String.fromCharCode(11)}-${String.fromCharCode(31)}${String.fromCharCode(127)}]`);
@@ -712,4 +712,86 @@ void test("when no subagent this Pi session lists has a safe id, the presenter i
   const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => manager, subagentPresenter: () => fakePresenter({ "bad/id": "named bad", "..": "named dots" }, described) })).list();
   assert.deepEqual(described, [], "describe() is not called");
   assert.deepEqual(nodes.map(({ key, agent: shown }) => [key, shown?.name]), [["subagents", undefined], ["subagent:bad/id", "bad/id"], ["subagent:..", ".."]]);
+});
+
+void test("workflow agents and subagents carry tokens, cost and their newest activity: the later of the last event and the transcript's last write", async () => {
+  const { home, cwd } = fixture();
+  const transcript = join(home, "b.jsonl");
+  writeFileSync(transcript, "");
+  utimesSync(transcript, new Date(9_000_000), new Date(9_000_000));
+  const withFile = { ...attempt(1, "b-1"), session: { transport: "local", sessionId: "b-1", locator: { sessionFile: transcript } } };
+  await createRun(home, cwd, "session", "run", "flow", "completed", [
+    agent("a", "a", "completed", [attempt(1, "a-1")], { accounting: { ...ZERO, input: 100, output: 50, cost: 0.2 }, lastEventAt: 5_000_000 }),
+    agent("b", "b", "completed", [withFile], { lastEventAt: 5_000_000 }),
+    agent("c", "c", "queued", []),
+  ]);
+  const manager = fakeManager([{ id: "s1", sessionId: "session", state: "running", progress: { accounting: { ...ZERO, input: 7, output: 3, cost: 0.5 }, toolCalls: [], lastEventAt: 123 } }, { id: "s2", sessionId: "session", state: "completed" }]);
+  const agents = agentsOf(await createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => manager })).list());
+  const by = (key: string): SessionAgent | undefined => agents.find((candidate) => candidate.key === key);
+  assert.deepEqual([by("run:run:a")?.tokens, by("run:run:a")?.cost, by("run:run:a")?.lastActivityAt], [150, 0.2, 5_000_000]);
+  assert.equal(by("run:run:b")?.lastActivityAt, 9_000_000, "the transcript is newer than the event");
+  assert.deepEqual([by("run:run:c")?.tokens, by("run:run:c")?.cost, by("run:run:c")?.lastActivityAt], [undefined, undefined, undefined]);
+  assert.deepEqual([by("subagent:s1")?.tokens, by("subagent:s1")?.cost, by("subagent:s1")?.lastActivityAt], [10, 0.5, 123]);
+  assert.deepEqual([by("subagent:s2")?.tokens, by("subagent:s2")?.lastActivityAt], [undefined, undefined]);
+});
+
+void test("the transcript stat cache lives for one list(): a later list sees a newer write", async () => {
+  const { home, cwd } = fixture();
+  const transcript = join(home, "a.jsonl");
+  writeFileSync(transcript, "");
+  utimesSync(transcript, new Date(1_000_000), new Date(1_000_000));
+  await createRun(home, cwd, "session", "run", "flow", "running", [agent("a", "a", "running", [{ ...attempt(1, "a-1"), session: { transport: "local", sessionId: "a-1", locator: { sessionFile: transcript } } }])]);
+  const source = createSessionAgentsSource(commandContext(cwd), dependencies(home));
+  assert.equal(agentsOf(await source.list())[0]?.lastActivityAt, 1_000_000);
+  utimesSync(transcript, new Date(2_000_000), new Date(2_000_000));
+  assert.equal(agentsOf(await source.list())[0]?.lastActivityAt, 2_000_000);
+});
+
+void test("needsPerson and the marks at the end of the rows: quiet and stalled agents, failed agents and subagents, runs awaiting input or out of budget", async () => {
+  const { home, cwd } = fixture();
+  const now = Date.now();
+  await createRun(home, cwd, "session", "wait", "waiting", "awaiting_input", []);
+  await createRun(home, cwd, "session", "named", "named", "awaiting_input", []);
+  const named = new RunStore(cwd, "session", "named", home);
+  const journalPath = join(named.directory, "journal.json");
+  const journal: unknown = JSON.parse(readFileSync(journalPath, "utf8"));
+  assert.ok(typeof journal === "object" && journal !== null);
+  writeFileSync(journalPath, JSON.stringify({ ...journal, awaiting: { p: { path: "p", name: "ship it?\u001b[31m", prompt: "ok", context: null } } }));
+  await createRun(home, cwd, "session", "budget", "budgeted", "budget_exhausted", []);
+  await createRun(home, cwd, "session", "busy", "busy", "running", [
+    agent("fresh", "fresh", "running", [attempt(1, "f")], { lastEventAt: now - 1_000 }),
+    agent("quiet", "quiet", "running", [attempt(1, "q")], { lastEventAt: now - 4 * 60_000 - 5_000 }),
+    agent("stalled", "stalled", "running", [attempt(1, "s")], { lastEventAt: now - 12 * 60_000 - 5_000 }),
+    agent("failed", "failed", "failed", [attempt(1, "x")]),
+    agent("done", "done", "completed", [attempt(1, "d")], { lastEventAt: now - 60 * 60_000 }),
+  ]);
+  const manager = fakeManager([{ id: "s1", sessionId: "session", state: "failed" }, { id: "s2", sessionId: "session", state: "completed" }]);
+  const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => manager })).list();
+  const node = (key: string): SessionTreeNode => { const found = nodes.find((candidate) => candidate.key === key); assert.ok(found, key); return found; };
+  assert.deepEqual(["run:wait", "run:named", "run:budget", "run:busy", "run:busy:fresh", "run:busy:quiet", "run:busy:stalled", "run:busy:failed", "run:busy:done", "subagent:s1", "subagent:s2"].map((key) => node(key).needsPerson),
+    ["awaiting_input", "awaiting_input", "budget_exhausted", undefined, undefined, "quiet", "stalled", "failed", undefined, "failed", undefined]);
+  assert.match(node("run:wait").line(PLAIN, false, true), / {2}◆ waiting$/);
+  assert.match(node("run:named").line(PLAIN, false, true), / {2}◆ waiting: ship it\?$/);
+  assert.equal(node("run:named").line(TAGGED, false, true).endsWith("<warning>  ◆ waiting: ship it?</warning>"), true);
+  assert.doesNotMatch(node("run:budget").line(PLAIN, false, true), /waiting/);
+  assert.match(node("run:busy:quiet").line(PLAIN, false, true), / {2}⚠ quiet 4m$/);
+  assert.match(node("run:busy:stalled").line(PLAIN, false, true), / {2}⚠ stalled 12m$/);
+  assert.match(node("run:busy:quiet").line(TAGGED, false, true), /<warning> {2}⚠ quiet 4m<\/warning>$/);
+  assert.match(node("run:busy:stalled").line(TAGGED, false, true), /<error> {2}⚠ stalled 12m<\/error>$/);
+  assert.doesNotMatch(node("run:busy:fresh").line(PLAIN, false, true), /⚠/);
+  assert.doesNotMatch(node("run:busy:failed").line(PLAIN, false, true), /⚠/);
+});
+
+void test("a subagent storage failure keeps the run nodes and lists the Subagents group, unavailable, without children", async () => {
+  const { home, cwd } = fixture();
+  await createRun(home, cwd, "session", "run", "flow", "completed", [agent("a", "a", "completed", [attempt(1, "a-1")])]);
+  const manager = fakeManager([], {}, { async inspect() { throw new Error("storage \u001b[31mbroken"); } });
+  const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => manager })).list();
+  assert.deepEqual(nodes.map(({ key }) => key), ["run:run", "run:run:node:phase/unassigned", "run:run:a", "subagents"]);
+  const group = nodes[3];
+  assert.ok(group);
+  assert.equal(group.kind, "group");
+  assert.deepEqual(group.details(PLAIN, 0), ["Subagents", "subagents unavailable: storage broken"]);
+  assert.equal(group.line(PLAIN, false, false).includes("unavailable"), true);
+  assert.deepEqual(nodes.filter(({ parentKey }) => parentKey === "subagents"), []);
 });

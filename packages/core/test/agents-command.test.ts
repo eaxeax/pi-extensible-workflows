@@ -9,6 +9,7 @@ import workflowExtension from "../src/host.js";
 import { acquireSessionLease, createLaunchSnapshot, DEFAULT_SETTINGS, RunStore, type AgentRecord } from "../src/index.js";
 import { hasLiveSessionLease } from "../src/persistence.js";
 import { clearSubagentManager, setSubagentManager } from "../src/subagent-manager-handle.js";
+import { PLAIN_WORKFLOW_PROGRESS_STYLES } from "../src/host-view.js";
 import { createTranscriptView } from "../src/transcript-components.js";
 import type { SubagentManager } from "../subagents/src/contracts.js";
 import { executeCommand, testExtensionApi } from "./support.js";
@@ -100,7 +101,7 @@ void test("/agents needs the TUI, says when the session has no agents, and opens
   } finally { await source.close(); }
 });
 
-void test("/agents opens the workspace when listing the agents fails, so its title can say why", async () => {
+void test("/agents opens the workspace when the subagents cannot be listed, and the Subagents group says why", async () => {
   const { home, cwd } = fixture();
   const { agents, opened } = host(home);
   assert.ok(agents);
@@ -111,7 +112,11 @@ void test("/agents opens the workspace when listing the agents fails, so its tit
     await executeCommand(agents, "", context(cwd, "tui", notices));
     assert.deepEqual(notices, []);
     assert.equal(opened.length, 1);
-    await assert.rejects(opened[0]?.options.agents.list() ?? Promise.resolve(), /inspect failed/);
+    const listed = await opened[0]?.options.agents.list();
+    const group = listed?.find((node) => node.key === "subagents");
+    assert.ok(group, "the Subagents group is still listed");
+    assert.deepEqual(listed?.filter((node) => node.parentKey === "subagents"), [], "with no subagent under it");
+    assert.match(group.details(PLAIN_WORKFLOW_PROGRESS_STYLES, Date.now()).join("\n"), /subagents unavailable: inspect failed/);
   } finally { clearSubagentManager(manager); }
 });
 
