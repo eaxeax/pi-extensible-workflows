@@ -15,6 +15,8 @@ const SEPARATOR = " │ ";
 const SIDEBAR_MIN_COLUMNS = 80;
 /** Title and hint: one row each above and below the body. */
 const FIXED_ROWS = 2;
+/** The sidebar filter's input row, under the title while it is open. */
+const FILTER_ROWS = 1;
 /** The action menu: half the width, 32 columns at least, centred a row and a column clear of the edges, so it never covers the title or the hint. */
 const MENU_OVERLAY: OverlayOptions = { width: "50%", minWidth: 32, margin: 1 };
 const MENU_TITLES: Readonly<Record<AgentsActionTarget["kind"], string>> = { run: "Run actions", "workflow-agent": "Agent actions", subagent: "Subagent actions", subagents: "Subagents" };
@@ -40,6 +42,14 @@ function isText(data: string): boolean {
   if (data.length === 0) return false;
   for (const char of data) if (char < " " || char === "\x7f") return false;
   return true;
+}
+/** The text of a bracketed paste, or `data` itself when it is not one. */
+function unpasted(data: string): string {
+  const start = "\x1b[200~";
+  const end = "\x1b[201~";
+  if (!data.startsWith(start)) return data;
+  const text = data.slice(start.length);
+  return text.endsWith(end) ? text.slice(0, -end.length) : text;
 }
 /** What makes a fresh transcript: another attempt, another session reference or another owner verdict. */
 function identity(agent: SessionAgent): string { return JSON.stringify([agent.attempt ?? null, agent.owned, agent.session ?? null]); }
@@ -161,6 +171,14 @@ class Workspace {
   private expanded: boolean;
   /** d: an agent with details shows them instead of its transcript, for every agent selected until d again. */
   private detailsShown: boolean;
+  /** f: the selection moves to the running agent with the newest activity on every refresh. */
+  private following: boolean;
+  /** Follow mode as the menu opened: opening a menu stops it, but a step-aside action hands it back through the state. */
+  private followingBeforeMenu = false;
+  /** The sidebar filter text; the one-line input under the title is open while `filtering`. */
+  private filter: string;
+  private filtering = false;
+  private matchCache: { readonly nodes: readonly SessionTreeNode[]; readonly filter: string; readonly result: { readonly direct: ReadonlySet<string>; readonly shown: ReadonlySet<string> } } | undefined;
   private menu: Menu | undefined;
   /** The status row's notices (options.notices, an in-place action's), until the next key. */
   private notices: Notice[];
@@ -178,6 +196,7 @@ class Workspace {
   /** The refresh and poll ticks; started once the first list settled. */
   private timer: ReturnType<typeof setInterval> | undefined;
   private readonly title: Component = { render: (width) => [this.titleRow(Math.max(1, width))], invalidate() {} };
+  private readonly filterRow = row(() => this.filtering ? `/ ${this.filter}▏` : "");
   private readonly hint = row(() => this.styles.dim(this.hintText()));
   private readonly status = row(() => this.statusText());
   private readonly sidebar: Component = { render: (width) => this.renderSidebar(width), handleMouse: (event) => this.sidebarMouse(event), invalidate() {} };
@@ -199,6 +218,8 @@ class Workspace {
     this.focus = this.sidebarVisible ? state?.focus ?? "sidebar" : "transcript";
     this.expanded = state?.toolsExpanded ?? false;
     this.detailsShown = state?.detailsShown ?? false;
+    this.following = state?.following ?? false;
+    this.filter = state?.filter ?? "";
     this.notices = (options.notices ?? []).map((text) => ({ text: clean(text), level: undefined }));
     // Runs after the alt screen's viewport listener (pgup/pgdn, search, the wheel): start() puts gate() before both.
     alt.addInputListener((data) => this.input(data));
@@ -273,23 +294,31 @@ class Workspace {
     if (menu) { this.menuKey(menu, data); this.alt.requestRender(); return { consume: true }; }
     // While an overlay (the search box) is open, every other key is its input.
     if (this.alt.hasOverlay()) return undefined;
+    if (this.filtering) { this.filterKey(data); this.alt.requestRender(); return { consume: true }; }
     const is = (keybinding: Keybinding): boolean => this.keybindings.matches(data, keybinding);
     // In the sidebar j, k, h and l move as the arrows do, as in /workflow.
     const sidebar = this.focus === "sidebar";
     const moves = (keybinding: Keybinding): boolean => sidebar ? workflowKeyMatches(this.keybindings, data, keybinding) : is(keybinding);
-    if (is("tui.select.cancel")) { this.leave(); return { consume: true }; }
+    if (is("tui.select.cancel")) {
+      if (this.filter) this.setFilter("");
+      else this.leave();
+      this.alt.requestRender();
+      return { consume: true };
+    }
     if (is("tui.input.tab")) { if (this.sidebarVisible) this.focus = sidebar ? "transcript" : "sidebar"; }
     else if (moves("tui.select.up") || moves("tui.select.down")) {
       const up = moves("tui.select.up");
       if (sidebar) this.navigate(up ? "up" : "down");
-      else this.alt.scrollBy(up ? -1 : 1);
+      else { this.following = false; this.alt.scrollBy(up ? -1 : 1); }
     } else if (sidebar && (moves("tui.editor.cursorLeft") || moves("tui.editor.cursorRight"))) this.navigate(moves("tui.editor.cursorLeft") ? "left" : "right");
     else if (sidebar && matchesKey(data, "space")) { const node = this.selectedNode(); if (node) this.toggle(node); }
     else if (matchesKey(data, "[") || matchesKey(data, "]")) this.jump(matchesKey(data, "[") ? -1 : 1);
     else if (matchesKey(data, "n") || matchesKey(data, "shift+n")) this.jump(matchesKey(data, "n") ? 1 : -1, (node) => node.needsPerson !== undefined);
     // The alt screen binds its top/bottom actions to home/end only; ctrl+home/ctrl+end reach the transcript here.
-    else if (matchesKey(data, "ctrl+home")) this.alt.scrollToTop();
-    else if (matchesKey(data, "ctrl+end")) this.alt.scrollToBottom();
+    else if (matchesKey(data, "ctrl+home")) { this.following = false; this.alt.scrollToTop(); }
+    else if (matchesKey(data, "ctrl+end")) { this.following = false; this.alt.scrollToBottom(); }
+    else if (sidebar && matchesKey(data, "/")) this.filtering = true;
+    else if (matchesKey(data, "f")) this.toggleFollow();
     else if (matchesKey(data, "s")) {
       this.sidebarVisible = !this.sidebarVisible;
       this.sidebarHidden = !this.sidebarVisible && this.wide;
@@ -329,7 +358,7 @@ class Workspace {
     const transcript = new VStack([{ component: this.detailsScroll ?? this.shown?.scroll ?? this.placeholder, grow: 1, basis: 0 }, { component: this.status, shrink: 0 }]);
     // The sidebar sizes itself from the terminal width (basis auto); stack entries shrink by default, so fixed parts need shrink 0.
     const body = new HStack(this.sidebarVisible ? [{ component: this.sidebar, shrink: 0 }, { component: transcript, grow: 1, basis: 0 }] : [{ component: transcript, grow: 1, basis: 0 }]);
-    this.alt.setLayoutRoot(new VStack([{ component: this.title, shrink: 0 }, { component: body, grow: 1, basis: 0 }, { component: this.hint, shrink: 0 }]));
+    this.alt.setLayoutRoot(new VStack([{ component: this.title, shrink: 0 }, { component: this.filterRow, shrink: 0 }, { component: body, grow: 1, basis: 0 }, { component: this.hint, shrink: 0 }]));
     // Scroll keys and the wheel act on the primary view of the last frame: draw now, not on the next tick, so none reaches a stale layout.
     this.alt.renderNow();
   }
@@ -351,19 +380,109 @@ class Workspace {
       sidebarVisible: !this.sidebarHidden,
       toolsExpanded: this.expanded,
       detailsShown: this.detailsShown,
+      ...(this.following ? { following: true } : {}),
+      ...(this.filter ? { filter: this.filter } : {}),
     };
   }
-  private isExpanded(node: SessionTreeNode): boolean { return this.expansion.get(node.key) ?? node.initiallyExpanded; }
+  private rawExpanded(node: SessionTreeNode): boolean { return this.expansion.get(node.key) ?? node.initiallyExpanded; }
+  /** A filter shows every match under its ancestors, whatever the user collapsed. */
+  private isExpanded(node: SessionTreeNode): boolean { return this.filterActive() || this.rawExpanded(node); }
   private expandedKeys(): ReadonlySet<string> { return new Set(this.nodes.filter((node) => this.isExpanded(node)).map(({ key }) => key)); }
   /** The nodes whose ancestors are all expanded, in sidebar order. */
   private visible(): SessionTreeNode[] {
-    return workflowPhaseTreeVisibleNodes(this.tree, this.expandedKeys()).flatMap(({ id }) => this.byKey.get(id) ?? []);
+    return workflowPhaseTreeVisibleNodes(this.navTree(), this.expandedKeys()).flatMap(({ id }) => this.byKey.get(id) ?? []);
+  }
+  private fixedRows(): number { return FIXED_ROWS + (this.filtering ? FILTER_ROWS : 0); }
+  private filterActive(): boolean { return this.filter.trim() !== ""; }
+  /**
+   * The nodes the filter keeps: `direct` match (label, run name or short id containing the text, case-insensitive, or the state
+   * named by a "state:" prefix), `shown` adds their ancestors. Undefined without a filter.
+   */
+  private matches(): { readonly direct: ReadonlySet<string>; readonly shown: ReadonlySet<string> } | undefined {
+    if (!this.filterActive()) return undefined;
+    const cached = this.matchCache;
+    if (cached && cached.nodes === this.nodes && cached.filter === this.filter) return cached.result;
+    const result = this.computeMatches();
+    this.matchCache = { nodes: this.nodes, filter: this.filter, result };
+    return result;
+  }
+  private computeMatches(): { readonly direct: ReadonlySet<string>; readonly shown: ReadonlySet<string> } {
+    const text = this.filter.trim().replace(/\s+/g, " ").toLowerCase();
+    const wantedState = text.startsWith("state:") ? text.slice("state:".length).trim() : undefined;
+    const direct = new Set<string>();
+    for (const node of this.nodes) {
+      const title = clean(node.title(this.styles)).toLowerCase();
+      // A node that is not an agent has its state as the last word of its title; an agent matches by its name, its state by "state:".
+      const words = title.split(" ");
+      const state = (node.agent?.state ?? words.at(-1) ?? "").toLowerCase();
+      const label = node.agent ? clean(node.agent.name).toLowerCase() : words.slice(0, -1).join(" ");
+      const id = (node.key.split(":").at(-1) ?? "").toLowerCase();
+      if (wantedState === undefined ? label.includes(text) || id.includes(text) : state === wantedState) direct.add(node.key);
+    }
+    const shown = new Set(direct);
+    for (const key of direct) {
+      const seen = new Set<string>();
+      for (let parent = this.byKey.get(key)?.parentKey; parent !== undefined && !seen.has(parent); parent = this.byKey.get(parent)?.parentKey) { seen.add(parent); shown.add(parent); }
+    }
+    return { direct, shown };
+  }
+  /** The /workflow tree navigation runs on: the whole sidebar, or only the nodes a filter keeps. */
+  private navTree(): WorkflowPhaseTree {
+    const shown = this.matches()?.shown;
+    return shown === undefined ? this.tree : navigationTree(this.nodes.filter((node) => shown.has(node.key)));
+  }
+  /** The selection stays when its node still shows, else moves to the first match. */
+  private setFilter(text: string): void {
+    this.filter = text;
+    this.keepSelectionShown();
+  }
+  private keepSelectionShown(): void {
+    const matches = this.matches();
+    if (!matches || !this.nodes.length || (matches.shown.has(this.selectedKey ?? "") && this.selectedNode())) return;
+    const first = this.nodes.find((node) => matches.direct.has(node.key));
+    if (first) this.select(first);
+  }
+  private filterKey(data: string): void {
+    const is = (keybinding: Keybinding): boolean => this.keybindings.matches(data, keybinding);
+    if (is("tui.select.cancel")) { this.filtering = false; this.setFilter(""); }
+    else if (is("tui.select.confirm")) { this.filtering = false; this.setFilter(this.filter.trim()); }
+    else if (matchesKey(data, "backspace")) this.setFilter(this.filter.replace(/.$/su, ""));
+    else if (data.startsWith("\x1b[200~") || isText(data)) this.setFilter(this.filter + sanitizeDisplayText(unpasted(data)).replace(/\s/g, " "));
+  }
+  /** f: follow mode on or off; on, the selection moves at once. */
+  private toggleFollow(): void {
+    this.following = !this.following;
+    if (this.following) this.follow();
+  }
+  /** Moves the selection to the follow target and keeps its transcript at the tail. */
+  private follow(): void {
+    const target = this.followTarget();
+    if (target && target.key !== this.selectedKey) { this.reveal(target); this.select(target); }
+    this.shown?.scroll.scrollToEnd();
+  }
+  /** The running agent with the newest activity; a tie or none keeps the selection. */
+  private followTarget(): SessionTreeNode | undefined {
+    const shown = this.matches()?.shown;
+    const running = this.nodes.filter((node) => node.agent?.running && node.agent.lastActivityAt !== undefined && (shown === undefined || shown.has(node.key)));
+    const newest = Math.max(...running.map((node) => node.agent?.lastActivityAt ?? 0));
+    const best = running.filter((node) => node.agent?.lastActivityAt === newest);
+    return best.length === 1 ? best[0] : undefined;
+  }
+  /** Under a filter every shown node is open: left goes to the parent, right to the first shown child, and the expansion stays as it is. */
+  private navigateShown(direction: "left" | "right"): void {
+    this.following = false;
+    const key = this.selectedKey;
+    const next = key === undefined ? undefined : direction === "left" ? this.byKey.get(key)?.parentKey : this.navTree().byId.get(key)?.children[0];
+    const node = next === undefined ? undefined : this.byKey.get(next);
+    if (node) this.select(node);
   }
   /** Up, down, left and right exactly as in /workflow: navigateWorkflowPhaseTree over the sidebar and its expansion. */
   private navigate(direction: WorkflowPhaseTreeDirection): void {
     if (this.nodes.length === 0) return;
+    if (this.filterActive() && (direction === "left" || direction === "right")) { this.navigateShown(direction); return; }
     const expanded = this.expandedKeys();
-    const next = navigateWorkflowPhaseTree(this.tree, this.selectedKey, expanded, direction);
+    this.following = false;
+    const next = navigateWorkflowPhaseTree(this.navTree(), this.selectedKey, expanded, direction);
     for (const node of this.nodes) {
       if (next.expandedNodeIds.has(node.key) !== expanded.has(node.key)) this.expansion.set(node.key, next.expandedNodeIds.has(node.key));
     }
@@ -373,7 +492,9 @@ class Workspace {
   /** [ and ]: the agent (n and N: the node that needs a person) before or after the selected node in sidebar order, hidden ones included, round at both ends; its ancestors are expanded. */
   private jump(delta: number, wanted: (node: SessionTreeNode) => boolean = (node) => node.agent !== undefined): void {
     const index = this.nodes.findIndex((node) => node.key === this.selectedKey);
-    const others = [...this.nodes.slice(index + 1), ...this.nodes.slice(0, Math.max(0, index))].filter(wanted);
+    this.following = false;
+    const shown = this.matches()?.shown;
+    const others = [...this.nodes.slice(index + 1), ...this.nodes.slice(0, Math.max(0, index))].filter((node) => (shown === undefined || shown.has(node.key)) && wanted(node));
     const next = delta > 0 ? others[0] : others.at(-1);
     if (!next) return;
     this.reveal(next);
@@ -388,7 +509,7 @@ class Workspace {
   }
   /** Space and a click on the ▾/▸ icon: a node with children collapses or expands; any other node stays as it is. */
   private toggle(node: SessionTreeNode): void {
-    if (this.hasChildren(node)) this.expansion.set(node.key, !this.isExpanded(node));
+    if (this.hasChildren(node) && !this.filterActive()) this.expansion.set(node.key, !this.rawExpanded(node));
   }
   private hasChildren(node: SessionTreeNode): boolean { return (this.tree.byId.get(node.key)?.children.length ?? 0) > 0; }
 
@@ -435,11 +556,15 @@ class Workspace {
     this.tree = navigationTree(nodes);
     // A node without children yet (a phase before its first agent) is not recorded: it takes its initiallyExpanded once it has some.
     for (const node of nodes) if (!this.expansion.has(node.key) && this.hasChildren(node)) this.expansion.set(node.key, node.initiallyExpanded);
-    let wanted = this.selectedNode();
+    const followed = this.following ? this.followTarget() : undefined;
+    if (followed) this.reveal(followed);
+    let wanted = followed ?? this.selectedNode();
     if (!wanted && this.selectedKey !== undefined) {
       const visible = this.visible();
       wanted = visible[Math.min(Math.max(0, row), visible.length - 1)];
     } else if (!wanted) wanted = this.firstSelection(nodes);
+    const matches = this.matches();
+    if (matches && wanted && !matches.shown.has(wanted.key)) wanted = this.nodes.find((node) => matches.direct.has(node.key)) ?? wanted;
     //NOTE: a refresh that moves the selected node under a node the user collapsed leaves it selected but hidden.
     const shown = this.shown;
     const agent = wanted?.agent;
@@ -463,6 +588,11 @@ class Workspace {
     else if (menu && target) {
       menu.target = target;
       this.loadMenu(menu);
+    }
+    // A transcript scrolled away from the tail (page keys, home, the wheel) ends follow mode.
+    if (this.following && this.shown) {
+      if (this.shown.scroll.isFollowingEnd) this.shown.scroll.scrollToEnd();
+      else this.following = false;
     }
     this.alt.requestRender();
   }
@@ -507,6 +637,8 @@ class Workspace {
   private openMenu(node: SessionTreeNode): void {
     const target = node.target;
     if (!target || (this.options.actions ?? []).length === 0 || this.menu) return;
+    this.followingBeforeMenu = this.following;
+    this.following = false;
     const component: Component = { render: (width) => this.menuLines(width), invalidate() {} };
     const menu: Menu = { key: node.key, target, handle: this.alt.showOverlay(component, MENU_OVERLAY), entries: undefined, index: 0, label: undefined, top: 0, generation: 0, failures: [] };
     this.menu = menu;
@@ -557,7 +689,7 @@ class Workspace {
   private choose(menu: Menu, entry: MenuEntry): void {
     this.closeMenu();
     if (entry.action.inPlace) void this.runInPlace(menu.target, entry);
-    else this.leave({ target: menu.target, label: entry.action.label, state: this.state() });
+    else this.leave({ target: menu.target, label: entry.action.label, state: { ...this.state(), ...(this.followingBeforeMenu ? { following: true } : {}) } });
   }
   /** Keys and ticks wait until it settles; what it reports, a failure too, is the status row's notice. */
   private async runInPlace(target: AgentsActionTarget, entry: MenuEntry): Promise<void> {
@@ -765,6 +897,15 @@ class Workspace {
 
   /** "#<position>/<count>" among the agent nodes, the name, state and summary for an agent; the label and state for any other node. */
   private titleText(): string {
+    const matches = this.matches();
+    const parts = [
+      this.baseTitle(),
+      ...(this.following ? [this.styles.muted("following")] : []),
+      ...(matches ? [this.styles.muted(`${String(matches.direct.size)} ${matches.direct.size === 1 ? "match" : "matches"}`)] : []),
+    ];
+    return parts.join(" · ");
+  }
+  private baseTitle(): string {
     const agent = this.shown?.agent;
     const failure = this.failure ? ` ${this.styles.warning(clean(this.failure))}` : "";
     const node = this.selectedNode();
@@ -799,8 +940,11 @@ class Workspace {
     const key = (keybinding: Keybinding, fallback: string): string => this.keybindings.getKeys(keybinding)[0] ?? fallback;
     const pending = (this.shown?.view?.pendingLarge().length ?? 0) > 0;
     const node = this.selectedNode();
+    if (this.filtering) return "enter keep filter · esc clear";
     return [
+      ...(this.filterActive() ? [`/ filter: ${clean(this.filter)} · esc clear`] : []),
       this.focus === "sidebar" ? "←→/space fold" : "↑↓ scroll",
+      ...(this.following ? ["f stop following"] : []),
       "[ ] agent",
       ...(this.nodes.some((candidate) => candidate.needsPerson !== undefined) ? ["n next"] : []),
       ...((this.options.actions ?? []).length > 0 ? ["a menu"] : []),
@@ -832,7 +976,7 @@ class Workspace {
   private renderSidebar(width: number): string[] {
     const total = Math.min(Math.max(1, width), sidebarWidth(Math.max(1, this.alt.terminal.columns)));
     const cell = Math.max(0, total - SEPARATOR.length);
-    const height = Math.max(1, this.alt.terminal.rows - FIXED_ROWS);
+    const height = Math.max(1, this.alt.terminal.rows - this.fixedRows());
     // A rule is a row without a node: nothing selects it, and the scroll counts it.
     const rows = this.visible().flatMap((node, index): { readonly node: SessionTreeNode | undefined }[] => index > 0 && node.parentKey === undefined ? [{ node: undefined }, { node }] : [{ node }]);
     const selectedRow = rows.findIndex(({ node }) => node !== undefined && node.key === this.selectedKey);
@@ -863,7 +1007,7 @@ class Workspace {
       ...menu.failures.map((failure) => this.styles.warning(`actions unavailable: ${clean(failure)}`)),
     ];
     if (items.length === 0) items.push(this.styles.muted(menu.entries ? "no actions" : "loading…"));
-    const budget = Math.max(1, this.alt.terminal.rows - FIXED_ROWS);
+    const budget = Math.max(1, this.alt.terminal.rows - this.fixedRows());
     const framed = budget >= 3;
     const room = framed ? budget - 2 : budget;
     const selected = Math.min(menu.index, items.length - 1);
@@ -887,6 +1031,7 @@ class Workspace {
       const node = key === undefined ? undefined : this.byKey.get(key);
       if (node) {
         this.focus = "sidebar";
+        this.following = false;
         // Runs from pi-tui's mouse dispatch, outside input()'s try/catch: a throw here would escape uncaught.
         try {
           // Every row, a header too, draws its icon at column 2 + 2 * depth (SessionTreeNode.line).
