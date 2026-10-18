@@ -36,7 +36,7 @@ import {
   WORKFLOW_RUN_STARTED_EVENT,
   WORKFLOW_RUN_STATE_CHANGED_EVENT,
 } from "./types.js";
-import { finiteNumber, object } from "./utils.js";
+import { finiteNumber, object, sanitizeDisplayText } from "./utils.js";
 
 export type BackgroundWidgetAPI = Pick<ExtensionAPI, "appendEntry" | "on"> & {
   events?: { on?: (name: string, handler: (event: unknown) => void) => () => void; emit?: ExtensionAPI["events"]["emit"] };
@@ -404,7 +404,7 @@ interface Row {
    * Held to the right edge, they form a column.
    */
   right?: string;
-  /** 2 = a run header or something needing an answer, 1 = live or failed work, 0 = finished detail. */
+  /** 3 = an agent gone quiet, 2 = a run header or something needing an answer, 1 = live or failed work, 0 = finished detail. */
   rank: number;
   /**
    * Set on the one row that stands for a whole run.
@@ -415,6 +415,12 @@ interface Row {
    * is an invisible one.
    */
   header?: boolean;
+  /** A checkpoint waiting on a person: chosen with its run header, ahead of quiet agents. */
+  waiting?: boolean;
+  /** On a run header: its name, and the text it takes when another shown run shares the name. */
+  named?: { name: string; withId: string };
+  /** On the header of a run with a waiting checkpoint: its right-hand text when the checkpoint's own row is not drawn. */
+  flagged?: string;
   /**
    * A stable name for a row that can be folded shut, and the key of the row it
    * hangs from. Together they let the cursor walk a tree rather than a list:
@@ -423,12 +429,25 @@ interface Row {
    */
   key?: string;
   parent?: string;
+  /** The run header this row belongs to. */
+  run?: string;
+  /**
+   * What a row stands for when the tree is folded: a phase (with the glyph that
+   * leads it and how many agents it holds) or an agent (with the stem of the
+   * phase it hangs from). Folded rows leave a marker where they were.
+   */
+  fold?:
+    | { kind: "phase"; lead: string; agents: number }
+    | { kind: "agent"; phase: string; prefix: string; settled: boolean; last: boolean };
+  /** For rows inside a phase, the key of that phase's row. */
+  phase?: string;
 }
 
 /**
  * Folds the least interesting rows away once the tree outgrows its budget,
- * leaving a marker in their place. Run headers are prioritized so every visible
- * run retains its title without exceeding the frame budget.
+ * leaving a marker in their place. Quiet and stalled agents rank highest, then
+ * run headers, so a run with many quiet agents can push quieter runs into the
+ * bottom "more runs" marker.
  */
 /**
  * The furthest the window may travel: the offset whose window ends on the last
@@ -445,6 +464,15 @@ function maxOffset(total: number, budget: number): number {
 }
 
 function collapse(rows: readonly Row[], budget: number, paint: Paint, offset: number, scrolling: boolean): Row[] {
+  const shown = collapseRows(rows, budget, paint, offset, scrolling);
+  // A waiting checkpoint whose own row gave way to the run headers is still
+  // said on its run's header, so the count in the title is never unaccounted for.
+  const drawn = new Set(shown);
+  const unseen = new Set(rows.filter((row) => row.waiting === true && !drawn.has(row)).map((row) => row.run));
+  return shown.map((row) => row.header === true && row.flagged !== undefined && unseen.has(row.key) ? { ...row, right: row.flagged } : row);
+}
+
+function collapseRows(rows: readonly Row[], budget: number, paint: Paint, offset: number, scrolling: boolean): Row[] {
   if (rows.length <= budget) return [...rows];
 
   // Scrolling: a window onto the tree, with the count of what lies past the
@@ -460,32 +488,223 @@ function collapse(rows: readonly Row[], budget: number, paint: Paint, offset: nu
     ];
   }
 
-  // At rest: keep the rows that say most, since nobody is steering. Reserve
-  // one body row for the marker unless headers alone fill the budget.
-  const keep = new Set<number>();
-  const headerCount = rows.filter((row) => row.rank === 2 && row.header === true).length;
-  const reserveMarker = headerCount !== budget;
-  const capacity = reserveMarker ? Math.max(0, budget - 1) : budget;
+  // At rest: keep the rows that say most, since nobody is steering. What is
+  // folded away leaves a marker where it was, and the markers take rows of
+  // their own, so the share of rows kept shrinks until the result fits.
+  const indexOfKey = new Map<string, number>();
   for (const [index, row] of rows.entries()) {
-    if (row.rank === 2 && row.header === true && keep.size < capacity) keep.add(index);
+    if (row.key !== undefined) indexOfKey.set(row.key, index);
   }
-  for (const rank of [2, 1, 0]) {
+  const headerOf = (row: Row): number | undefined => row.run === undefined ? undefined : indexOfKey.get(row.run);
+  const phaseOf = (row: Row): number | undefined => row.phase === undefined ? undefined : indexOfKey.get(row.phase);
+
+  const select = (capacity: number): Set<number> => {
+    const keep = new Set<number>();
+    // A row is only worth showing with the run and phase it hangs from, so
+    // those come with it or the row does not come at all.
+    // Attention rows reserve a row for every run header still to come, so a
+    // run is never hidden behind another's attention.
+    const add = (index: number, reserve = false): boolean => {
+      const row = rows[index];
+      if (row === undefined) return false;
+      if (keep.has(index)) return true;
+      // The agents that spawned it come too, so the tree still says who asked.
+      //NOTE: parent keys come from rows drawn earlier, so the chain cannot loop.
+      const chain: number[] = [];
+      for (let at = row.parent === undefined ? undefined : indexOfKey.get(row.parent); at !== undefined; ) {
+        chain.push(at);
+        const parent = rows[at]?.parent;
+        at = parent === undefined ? undefined : indexOfKey.get(parent);
+      }
+      const group = [index, ...chain, headerOf(row), phaseOf(row)].filter((item): item is number => item !== undefined && !keep.has(item));
+      const grouped = new Set(group);
+      const reserved = reserve ? rows.filter((item, at) => item.header === true && !keep.has(at) && !grouped.has(at)).length : 0;
+      if (keep.size + grouped.size + reserved > capacity) return false;
+      for (const item of group) keep.add(item);
+      return true;
+    };
+    const pass = (test: (row: Row) => boolean): void => {
+      for (const [index, row] of rows.entries()) if (test(row)) add(index);
+    };
+    // One quiet agent per run before a second from any run, so no run's
+    // attention is hidden behind another's.
+    // A checkpoint waiting on a person counts as its run's attention row, since
+    // the title counts it. When its row does not fit beside every header, its
+    // run's header is taken now, so it is never the run folded into the count
+    // of runs that do not fit; the header then says the checkpoint is waiting.
+    const firstQuiet = new Set<string | undefined>();
     for (const [index, row] of rows.entries()) {
-      if (row.rank === rank && keep.size < capacity) keep.add(index);
+      if (row.waiting === true) {
+        const header = headerOf(row);
+        if (!add(index, true) && header !== undefined) add(header);
+      } else if (row.rank === 3 && !firstQuiet.has(row.run) && add(index, true)) firstQuiet.add(row.run);
     }
-  }
+    pass((row) => row.rank === 3);
+    pass((row) => row.rank === 2 && row.header === true);
+    pass((row) => row.rank === 2);
+    pass((row) => row.rank === 1);
+    pass((row) => row.rank === 0 && row.fold?.kind === "phase");
+    pass((row) => row.rank === 0);
+    return keep;
+  };
 
-  const out: Row[] = [];
-  let hidden = 0;
-  for (const [index, row] of rows.entries()) {
-    if (keep.has(index)) out.push(row);
-    else hidden += 1;
+  const fold = (keep: ReadonlySet<number>, markers: Set<Row>): Row[] => {
+    const hiddenAgents = new Map<string, number>();
+    const totalAgents = new Map<string, number>();
+    for (const [index, row] of rows.entries()) {
+      if (row.fold?.kind !== "agent") continue;
+      totalAgents.set(row.fold.phase, (totalAgents.get(row.fold.phase) ?? 0) + 1);
+      if (keep.has(index)) continue;
+      hiddenAgents.set(row.fold.phase, (hiddenAgents.get(row.fold.phase) ?? 0) + 1);
+    }
+    // Hidden agents of a shown phase, grouped into stretches: contiguous rows
+    // of one parent with no shown row between them. A stretch is one row
+    // standing for several, or the row itself when there is only one.
+    // Hidden descendants of a hidden agent, counted on the hidden ancestor that
+    // stands for them, so a marker accounts for the whole subtree it folds.
+    const carried = new Map<number, { count: number; settled: boolean }>();
+    const stretchOf = new Map<number, number[]>();
+    let stretch: number[] | undefined;
+    let stretchParent: string | undefined;
+    for (const [index, row] of rows.entries()) {
+      if (keep.has(index)) {
+        stretch = undefined;
+        continue;
+      }
+      if (row.fold?.kind !== "agent") continue;
+      const header = headerOf(row);
+      if (header !== undefined && !keep.has(header)) continue;
+      if (hiddenAgents.get(row.fold.phase) === totalAgents.get(row.fold.phase)) continue;
+      // Hidden under a hidden agent: the parent's row stands for it.
+      const parentIndex = row.parent === undefined ? undefined : indexOfKey.get(row.parent);
+      if (parentIndex !== undefined && rows[parentIndex]?.fold?.kind === "agent" && !keep.has(parentIndex)) {
+        // Walk up to the hidden ancestor that sits in a stretch; it carries this row.
+        //NOTE: parent keys come from rows drawn earlier, so the chain cannot loop.
+        let top = parentIndex;
+        for (;;) {
+          const up = rows[top]?.parent === undefined ? undefined : indexOfKey.get(rows[top]?.parent ?? "");
+          if (up === undefined || rows[up]?.fold?.kind !== "agent" || keep.has(up)) break;
+          top = up;
+        }
+        const entry = carried.get(top) ?? { count: 0, settled: true };
+        carried.set(top, { count: entry.count + 1, settled: entry.settled && row.fold.settled });
+        continue;
+      }
+      if (stretch === undefined || stretchParent !== row.parent) {
+        stretch = [];
+        stretchParent = row.parent;
+      }
+      stretch.push(index);
+      stretchOf.set(index, stretch);
+    }
+    const counted = (row: Row, total: number): Row => ({
+      ...row,
+      text: `${row.text}${paint(ROLE.quiet, ` (${String(total)} ${total === 1 ? "agent" : "agents"})`)}`,
+    });
+    const out: Row[] = [];
+    // Consecutive hidden phases: a lone one keeps its row (name, state, count);
+    // several share one marker, which is the only case where it saves rows.
+    let phases: { row: Row; total: number }[] = [];
+    const flush = (): void => {
+      if (phases.length === 1 && phases[0]) {
+        const lone = phases[0].total > 0 ? counted(phases[0].row, phases[0].total) : phases[0].row;
+        markers.add(lone);
+        out.push(lone);
+      } else if (phases.length > 1 && phases[0]?.row.fold?.kind === "phase") {
+        // The marker closes the list when the folded stretch includes its last phase.
+        const closing = phases.at(-1)?.row.fold;
+        const marker: Row = { rank: 0, text: paint(ROLE.quiet, `  ${closing?.kind === "phase" ? closing.lead : phases[0].row.fold.lead} … ${String(phases.length)} phases`) };
+        markers.add(marker);
+        out.push(marker);
+      }
+      phases = [];
+    };
+    for (const [index, row] of rows.entries()) {
+      const header = headerOf(row);
+      if (row.header !== true && header !== undefined && !keep.has(header)) continue;
+      if (keep.has(index)) {
+        flush();
+        const total = row.key === undefined ? 0 : totalAgents.get(row.key) ?? 0;
+        const all = row.key !== undefined && total > 0 && hiddenAgents.get(row.key) === total;
+        out.push(row.fold?.kind === "phase" && all ? counted(row, total) : row);
+        continue;
+      }
+      if (row.header === true) {
+        flush();
+        continue;
+      }
+      if (row.fold?.kind === "phase") {
+        phases.push({ row, total: row.key === undefined ? 0 : totalAgents.get(row.key) ?? 0 });
+        continue;
+      }
+      if (row.fold?.kind === "agent") {
+        const phase = row.fold.phase;
+        // Agents of a hidden phase are carried by the phase row.
+        if (hiddenAgents.get(phase) === totalAgents.get(phase)) continue;
+        flush();
+        const group = stretchOf.get(index);
+        if (group === undefined) continue;
+        const total = group.reduce((sum, item) => sum + 1 + (carried.get(item)?.count ?? 0), 0);
+        if (total === 1) {
+          // Alone, it is its own row; under pressure it gives way like a marker.
+          markers.add(row);
+          out.push(row);
+        } else if (group[0] === index) {
+          const members = group.map((item) => rows[item]?.fold);
+          const settled = members.every((fold) => fold?.kind === "agent" && fold.settled) && group.every((item) => carried.get(item)?.settled !== false);
+          const closes = members.some((fold) => fold?.kind === "agent" && fold.last);
+          const marker: Row = { rank: 0, text: paint(ROLE.quiet, `${row.fold.prefix}${closes ? "╰─ " : ""}… ${String(total)} ${settled ? "done" : "more"}`) };
+          markers.add(marker);
+          out.push(marker);
+        }
+      }
+      //NOTE: a hidden checkpoint or shell row inside a shown run is folded without a marker; its run header and phases stay.
+    }
+    flush();
+    return out;
+  };
+
+  const headers = rows.filter((row) => row.header === true).length;
+  const allHeaders = (keep: ReadonlySet<number>): boolean => rows.filter((row, index) => row.header === true && keep.has(index)).length === headers;
+  // When some runs do not fit, their count takes the last row, so the kept rows
+  // get one fewer. Making room for it afterwards would cut a phase away from
+  // the agents drawn under it.
+  const roomy = select(budget);
+  const room = allHeaders(roomy) ? budget : budget - 1;
+  // Quiet agents and run headers are what the widget is for. Lowering the
+  // capacity may only give up the rest: lone rows and markers give way before
+  // any of these does, and the same rows stay, not just as many.
+  const fullest = room === budget ? roomy : select(room);
+  const essential = [...fullest].filter((index) => rows[index]?.rank === 3 || rows[index]?.header === true);
+  let best: { shown: Row[]; markers: Set<Row> } | undefined;
+  for (let capacity = room; capacity >= 0; capacity -= 1) {
+    const keep = select(capacity);
+    if (best && essential.some((index) => !keep.has(index))) break;
+    const kept = rows.filter((row, index) => row.header === true && keep.has(index)).length;
+    const hiddenRuns = headers - kept;
+    // Waiting runs whose header is folded into the count. Their headers are
+    // taken first, so this is non-zero only when more runs wait than the body holds.
+    const hiddenWaiting = rows.filter((row) => row.waiting === true && !keep.has(headerOf(row) ?? -1)).length;
+    const markers = new Set<Row>();
+    const shown = fold(keep, markers);
+    if (hiddenRuns > 0) {
+      shown.push({
+        rank: 0,
+        text: `${paint(ROLE.quiet, `… ${String(hiddenRuns)} more ${hiddenRuns === 1 ? "run" : "runs"}`)}${hiddenWaiting > 0 ? `${paint(ROLE.quiet, " · ")}${paint(ROLE.warn, `◆ ${String(hiddenWaiting)} waiting`)}` : ""}`,
+      });
+    }
+    if (shown.length <= budget) return shown;
+    best = { shown, markers };
   }
-  if (hidden > 0 && reserveMarker) out.push({ rank: 0, text: paint(ROLE.quiet, `… ${String(hidden)} more`) });
-  return out.slice(0, budget);
+  if (!best) return [];
+  // No fold fits with all of its markers: the last markers give way, so some
+  // folded rows lose their accounting and a sibling may lose the rows below it.
+  // The rows left are the kept ones, at most the capacity, plus the count of
+  // hidden runs only when that capacity left a row for it, so they fit.
+  const final = best;
+  let spare = budget - final.shown.filter((row) => !final.markers.has(row)).length;
+  return final.shown.filter((row) => !final.markers.has(row) || spare-- > 0);
 }
-
-
 
 /** The whole widget frame, or undefined when nothing is running. */
 function renderFrame(runs: readonly Run[], now: number, width: number, offset = 0, theme?: Theme, scrolling = false, sizeOut: { rows: number } = { rows: 0 }): string[] | undefined {
@@ -508,6 +727,8 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
   const mtimes = new Map<string, number | undefined>();
 
   const rows: Row[] = [];
+  let waiting = 0;
+  let quiet = 0;
   for (const run of live) {
     const stats = [formatTokens(run.usage?.tokens), formatCost(run.usage?.costUsd)]
       .filter(Boolean)
@@ -515,22 +736,40 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
     const budget = budgetWarning(run);
     const state = run.state ?? "unknown";
     const runKey = `run:${run.id ?? ""}`;
+    // The spinner already says "running"; every other state needs its tag.
+    const tag = state === "running" ? "" : `${paint(ROLE.quiet, `[${state}]`)} `;
+    const name = sanitizeDisplayText(run.workflowName ?? "workflow");
+    const agentList = run.agents ?? [];
+    const headingWith = (label: string): string => [
+      label,
+      ...(run.phase ? [paint(ROLE.quiet, sanitizeDisplayText(run.phase))] : []),
+      paint(ROLE.quiet, `${String(agentList.filter((agent) => SETTLED_AGENT_STATES.has(agent.state)).length)}/${String(agentList.length)}`),
+    ].join(paint(ROLE.quiet, " · "));
+    const headerText = (heading: string): string => `${mark(state, now, paint, state)} ${tag}${heading}${budget ? `  ${paint(ROLE.warn, budget)}` : ""}`;
+    const elapsed = formatElapsed(now - run.startedAt);
     rows.push({
       rank: 2,
       header: true,
       key: runKey,
-      text: `${mark(state, now, paint, state)} ${paint(ROLE.quiet, `[${state}]`)} ${run.workflowName ?? "workflow"}${
-        budget ? `  ${paint(ROLE.warn, budget)}` : ""
-      }`,
-      right: `${stats ? `${stats} · ` : ""}${formatElapsed(now - run.startedAt)}`,
+      run: runKey,
+      text: headerText(headingWith(name)),
+      // The short id is added once the frame knows which runs are shown.
+      ...(run.id ? { named: { name, withId: headerText(headingWith(`${name} ${paint(ROLE.quiet, run.id.slice(0, 8))}`)) } } : {}),
+      // The right edge is never cut, so the mark goes there, in place of the
+      // tokens and cost: the name still says which run, however narrow the frame.
+      ...(run.waiting ? { flagged: `${paint(ROLE.warn, "◆ waiting")} · ${elapsed}` } : {}),
+      right: `${stats ? `${stats} · ` : ""}${elapsed}`,
     });
 
     // A checkpoint is the one thing here that a person has to act on, and it
     // only exists as an event: the run state on disk never mentions it.
     if (run.waiting) {
+      waiting += 1;
       rows.push({
         rank: 2,
+        waiting: true,
         parent: runKey,
+        run: runKey,
         text: `  ${paint(ROLE.warn, "◆")} waiting: ${run.waiting.name}`,
         right: formatElapsed(now - run.waiting.since),
       });
@@ -558,6 +797,8 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
         rank: liveAgents || failed ? 1 : 0,
         key: phaseKey,
         parent: runKey,
+        run: runKey,
+        fold: { kind: "phase", lead: last ? "╰─" : "├─", agents: slice.agents.length },
         text: `  ${last ? "╰─" : "├─"} ${mark(phaseState, now, paint, run.state)} ${slice.phase}`,
         ...(phaseStats ? { right: phaseStats } : {}),
       });
@@ -571,6 +812,8 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
         rows.push({
           rank: 1,
           parent: phaseKey,
+          run: runKey,
+          phase: phaseKey,
           text: `${stem} ${slice.agents.length === 0 ? "╰─" : "├─"} ${mark("running", now, paint, run.state)} ${shell.label}`,
           right: shell.elapsed,
         });
@@ -612,9 +855,13 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
         const kids = children.get(agent.id) ?? [];
         const agentKey = `${parentKey}/agent:${agent.id}`;
 
+        if (silent !== undefined) quiet += 1;
         rows.push({
-          rank: agentLive || agent.state === "failed" ? 1 : 0,
+          rank: silent !== undefined ? 3 : agentLive || agent.state === "failed" ? 1 : 0,
           parent: parentKey,
+          run: runKey,
+          phase: phaseKey,
+          fold: { kind: "agent", phase: phaseKey, prefix, settled: SETTLED_AGENT_STATES.has(agent.state), last: lastAgent },
           ...(kids.length > 0 ? { key: agentKey } : {}),
           text: `${prefix}${lastAgent ? "╰─" : "├─"} ${
 
@@ -637,7 +884,7 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
         });
 
         kids.forEach((child, childIndex) => {
-          drawAgent(child, `${prefix}${lastAgent ? "   " : "  │"}`, childIndex === kids.length - 1, agentKey);
+          drawAgent(child, `${prefix}${lastAgent ? "  " : "│ "}`, childIndex === kids.length - 1, agentKey);
         });
       };
 
@@ -650,9 +897,22 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
   // The rules change colour while scrolling, so it is obvious at a glance that
   // the arrows are going here and not to the editor.
   const accent = (text: string): string => paint(scrolling ? ROLE.warn : ROLE.live, text);
-  const title = live.length === 1 ? "Workflow" : `Workflows · ${String(live.length)} runs`;
+  const attention = [
+    ...(waiting > 0 ? [`◆ ${String(waiting)} waiting`] : []),
+    ...(quiet > 0 ? [`⚠ ${String(quiet)} quiet`] : []),
+  ];
+  const heading = live.length === 1 ? "Workflow" : "Workflows";
+  const withCount = [live.length === 1 ? heading : `${heading} · ${String(live.length)} runs`, ...attention].join(" · ");
+  // When the title is too long the run count goes before the counts that need a person.
+  const withoutCount = [heading, ...attention].join(" · ");
+  const room = Math.max(1, width - 8);
+  const fullTitle = visibleLength(withCount) <= room ? withCount : withoutCount;
+  const title = visibleLength(fullTitle) > room ? truncate(fullTitle, room) : fullTitle;
   sizeOut.rows = rows.length;
-  const body = collapse(rows, MAX_ROWS - 2, paint, offset, scrolling);
+  const collapsed = collapse(rows, MAX_ROWS - 2, paint, offset, scrolling);
+  const shownNames = new Map<string, number>();
+  for (const row of collapsed) if (row.named) shownNames.set(row.named.name, (shownNames.get(row.named.name) ?? 0) + 1);
+  const body = collapsed.map((row) => (row.named && (shownNames.get(row.named.name) ?? 0) > 1 ? { ...row, text: row.named.withId } : row));
 
   // A scrollbar on the right rule, drawn only when there is more tree than
   // frame. Without it the window's position is a guess: three rows of a
