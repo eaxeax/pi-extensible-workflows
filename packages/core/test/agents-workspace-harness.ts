@@ -35,9 +35,13 @@ export class FakeTerminal implements Terminal {
   failStop: Error | undefined;
   /** Calls of stop(), a failing one too: the alt screen stops the terminal on each of its stops. */
   stops = 0;
+  /** What the alt screen asked to hear about a resize; set by start(), cleared by stop(). */
+  onResize: (() => void) | undefined;
   constructor(public columns: number, public rows: number) {}
-  start(onInput: (data: string) => void): void { if (this.failStart) throw this.failStart; this.input = onInput; }
-  stop(): void { this.stops += 1; if (this.failStop) throw this.failStop; this.input = undefined; }
+  start(onInput: (data: string) => void, onResize: () => void): void { if (this.failStart) throw this.failStart; this.input = onInput; this.onResize = onResize; }
+  stop(): void { this.stops += 1; if (this.failStop) throw this.failStop; this.input = undefined; this.onResize = undefined; }
+  /** Takes the new size and reports it, as a terminal window resized by the person does. */
+  resize(columns: number): void { this.columns = columns; this.onResize?.(); }
   async drainInput(): Promise<void> {}
   write(data: string): void { this.written += data; }
   get kittyProtocolActive(): boolean { return false; }
