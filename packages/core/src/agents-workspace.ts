@@ -1,20 +1,45 @@
 import type { KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
-import { HStack, isKeyRelease, matchesKey, ScrollView, Text, truncateToWidth, TuiAltScreen, VStack, wrapTextWithAnsi, type Component, type Keybinding, type TuiInputListenerResult, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
-import type { AgentsWorkspaceOptions, OpenAgentsWorkspace, SessionAgent, SessionTreeNode, TranscriptView } from "./agents-workspace-contract.js";
+import { getKeybindings, HStack, isKeyRelease, matchesKey, parseKey, ScrollView, Text, TUI_KEYBINDINGS, truncateToWidth, TuiAltScreen, VStack, wrapTextWithAnsi, type Component, type Keybinding, type OverlayHandle, type OverlayOptions, type TuiInputListenerResult, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
+import type { ActionUi, AgentsAction, AgentsActionProvider, AgentsActionTarget } from "./agents-actions-contract.js";
+import type { AgentsWorkspaceExit, AgentsWorkspaceOptions, AgentsWorkspaceState, OpenAgentsWorkspace, SessionAgent, SessionTreeNode, TranscriptView } from "./agents-workspace-contract.js";
+import { workflowKeyMatches } from "./host-navigator.js";
 import { navigateWorkflowPhaseTree, workflowPhaseTreeVisibleNodes, type WorkflowPhaseTree, type WorkflowPhaseTreeDirection, type WorkflowPhaseTreeNode } from "./host-phases.js";
 import { progressStyleForState, themeWorkflowProgressStyles, type WorkflowProgressStyles } from "./host-view.js";
 import type { TranscriptPoll, TranscriptSource, TranscriptSourceStatus } from "./transcript-source.js";
 import { errorText, sanitizeDisplayText } from "./utils.js";
+import { openArtifactInEditor, type WorkflowTui } from "./workflow-artifacts.js";
 
 const SEPARATOR = " │ ";
 /** Below this width the sidebar starts hidden; s still shows it. */
 const SIDEBAR_MIN_COLUMNS = 80;
 /** Title and hint: one row each above and below the body. */
 const FIXED_ROWS = 2;
+/** The action menu: half the width, 32 columns at least, centred a row and a column clear of the edges, so it never covers the title or the hint. */
+const MENU_OVERLAY: OverlayOptions = { width: "50%", minWidth: 32, margin: 1 };
+const MENU_TITLES: Readonly<Record<AgentsActionTarget["kind"], string>> = { run: "Run actions", "workflow-agent": "Agent actions", subagent: "Subagent actions", subagents: "Subagents" };
 
 /** As the dashboards: 38% of the width less the separator, 24 to 42 columns, then the separator. */
 function sidebarWidth(columns: number): number { return Math.min(42, Math.max(24, Math.floor((columns - SEPARATOR.length) * 0.38))) + SEPARATOR.length; }
 function clean(text: string | undefined): string { return sanitizeDisplayText(text ?? "").replace(/\s+/g, " ").trim(); }
+/** A mouse report as the alt screen reads one: SGR, or the legacy six bytes. */
+function isMouse(data: string): boolean { return (data.startsWith("\x1b[<") && /^\d+;\d+;\d+[Mm]$/.test(data.slice(3))) || (data.length === 6 && data.startsWith("\x1b[M")); }
+/** The alt screen's own scroll and search actions: it acts on them before any input listener. */
+const ALT_SCREEN_ACTIONS = (Object.keys(TUI_KEYBINDINGS) as (keyof typeof TUI_KEYBINDINGS)[]).filter((id) => id.startsWith("tui.altScreen."));
+/**
+ * A keypress: what parseKey names, what the alt screen takes for one of its actions (with the keybindings it reads, so also the
+ * legacy home and end \x1b[1~ and \x1b[4~ of tmux and screen), text without a control character (é), or a bracketed paste. What
+ * else the terminal sends, a focus report or a query's answer, is not one.
+ */
+function isKey(data: string): boolean {
+  if (parseKey(data) !== undefined || data.startsWith("\x1b[200~")) return true;
+  const keybindings = getKeybindings();
+  return ALT_SCREEN_ACTIONS.some((id) => keybindings.matches(data, id)) || isText(data);
+}
+function isText(data: string): boolean {
+  if (data.length === 0) return false;
+  for (const char of data) if (char < " " || char === "\x7f") return false;
+  return true;
+}
 /** What makes a fresh transcript: another attempt, another session reference or another owner verdict. */
 function identity(agent: SessionAgent): string { return JSON.stringify([agent.attempt ?? null, agent.owned, agent.session ?? null]); }
 /** A component of one row, truncated to the width; nothing when the text is empty. */
@@ -53,6 +78,28 @@ class TranscriptScroll extends ScrollView {
     this.laidOut();
   }
 }
+
+/** A label of the menu with the provider that offered it. */
+interface MenuEntry { readonly action: AgentsAction; readonly provider: AgentsActionProvider }
+/** The action menu open on the node `key`, drawn as an overlay of the alternate screen. */
+interface Menu {
+  readonly key: string;
+  /** The node's target, taken again from every list. */
+  target: AgentsActionTarget;
+  readonly handle: OverlayHandle;
+  /** The labels the last read got, in provider order; undefined until the first answer. */
+  entries: readonly MenuEntry[] | undefined;
+  index: number;
+  /** The selected label: also kept while a read lacks it because a provider could not be read. */
+  label: string | undefined;
+  /** The first label row in view. */
+  top: number;
+  /** Counts the reads of the labels: only the latest one's answer is taken. */
+  generation: number;
+  /** The last read's errors, one for every provider whose labels it could not read: shown after the labels it read. */
+  failures: readonly string[];
+}
+interface Notice { readonly text: string; readonly level: "info" | "warning" | "error" | undefined }
 
 /** The selected agent's transcript; replaced as a whole when another agent, attempt or session is selected. */
 interface Shown {
@@ -94,16 +141,27 @@ class Workspace {
   private listed = false;
   /** options.initialKey until a node was selected. */
   private initialKey: string | undefined;
+  /** options.state until a node was selected: its selection is taken after the initial key's. */
+  private restore: AgentsWorkspaceState | undefined;
   private listing = false;
   /** A failed list, or a throw while no transcript is shown; in the title until the next list succeeds. */
   private failure: string | undefined;
   /** The transcript of the selected node when it is an agent. */
   private shown: Shown | undefined;
-  /** The right pane of the selected node when it is not an agent; a new one for each selection. */
+  /** The right pane of the selected node when it is not an agent, or an agent's on d; a new one for each selection. */
   private detailsScroll: ScrollView | undefined;
   private focus: "sidebar" | "transcript";
   private sidebarVisible: boolean;
-  private expanded = false;
+  private expanded: boolean;
+  /** d: an agent with details shows them instead of its transcript, for every agent selected until d again. */
+  private detailsShown: boolean;
+  private menu: Menu | undefined;
+  /** The status row's notices (options.notices, an in-place action's), until the next key. */
+  private notices: Notice[];
+  /** An in-place action runs: every key but ctrl+c is dropped and the ticks wait. */
+  private busy = false;
+  /** The in-place editor stopped the alternate screen and has the terminal. */
+  private editing = false;
   private sidebarTop = 0;
   /** The node key of each sidebar row of the last frame, for clicks; undefined for a rule. */
   private sidebarKeys: (string | undefined)[] = [];
@@ -119,12 +177,19 @@ class Workspace {
   /** The selected node's details, read at every frame, wrapped to the width. */
   private readonly details: Component = { render: (width) => this.detailsLines(width), invalidate() {} };
 
-  constructor(private readonly alt: TuiAltScreen, theme: Theme, private readonly keybindings: KeybindingsManager, private readonly options: AgentsWorkspaceOptions, private readonly leave: () => void) {
+  constructor(private readonly alt: TuiAltScreen, theme: Theme, private readonly keybindings: KeybindingsManager, private readonly options: AgentsWorkspaceOptions, private readonly leave: (exit?: AgentsWorkspaceExit, cause?: unknown) => void) {
     this.styles = themeWorkflowProgressStyles(theme);
     this.initialKey = options.initialKey;
-    this.sidebarVisible = alt.terminal.columns >= SIDEBAR_MIN_COLUMNS;
-    this.focus = this.sidebarVisible ? "sidebar" : "transcript";
-    // Runs after the viewport listener the constructor registered: pgup/pgdn, search and the wheel never reach it.
+    // A workspace that stepped aside for an action opens as it was; the sidebar still starts hidden below 80 columns.
+    const state = options.state;
+    this.restore = state;
+    for (const [key, expanded] of state?.expansion ?? []) this.expansion.set(key, expanded);
+    this.sidebarVisible = alt.terminal.columns >= SIDEBAR_MIN_COLUMNS && (state?.sidebarVisible ?? true);
+    this.focus = this.sidebarVisible ? state?.focus ?? "sidebar" : "transcript";
+    this.expanded = state?.toolsExpanded ?? false;
+    this.detailsShown = state?.detailsShown ?? false;
+    this.notices = (options.notices ?? []).map((text) => ({ text: clean(text), level: undefined }));
+    // Runs after the alt screen's viewport listener (pgup/pgdn, search, the wheel): start() puts gate() before both.
     alt.addInputListener((data) => this.input(data));
     this.rebuild();
     this.refresh();
@@ -140,30 +205,65 @@ class Workspace {
       this.shown = undefined;
       if (shown) this.close(shown);
     } finally {
-      // Last, so its throw skips nothing here; the caller restores Pi after it.
-      this.alt.stop({ preserveScreen: true });
+      // Last, so its throw skips nothing here; the caller restores Pi after it. Stopped already while the in-place editor runs.
+      if (!this.editing) this.alt.stop({ preserveScreen: true });
     }
   }
 
+  /**
+   * Starts the alt screen with the terminal's input going through gate() first: the alt screen's own listener (the page keys, its
+   * search box, the wheel) runs before any listener added later. The terminal's start is wrapped only while the alt screen starts;
+   * the terminal keeps the gated handler until it stops.
+   */
+  start(): void {
+    const terminal = this.alt.terminal;
+    const own = Object.getOwnPropertyDescriptor(terminal, "start");
+    const start = terminal.start.bind(terminal);
+    terminal.start = (onInput, onResize) => { start((data) => { this.gate(data, onInput); }, onResize); };
+    try { this.alt.start(); } finally {
+      if (own) Object.defineProperty(terminal, "start", own);
+      else Reflect.deleteProperty(terminal, "start");
+    }
+  }
+  /**
+   * The terminal's input before the alt screen sees it. While an in-place action runs or the menu is open the mouse goes nowhere and
+   * every key (isKey: a paste too) to the workspace alone: ctrl+c leaves, the menu takes the rest, an action drops them. A key also
+   * ends the notices (not one dropped while an action runs). Key releases and what is not a key (a focus report, the terminal's
+   * answer to a query) reach the alt screen as they came.
+   */
+  private gate(data: string, pass: (data: string) => void): void {
+    const held = this.busy || this.menu !== undefined;
+    if (isMouse(data)) { if (!held) pass(data); return; }
+    if (isKeyRelease(data) || !isKey(data)) { pass(data); return; }
+    if (!this.busy && this.notices.length > 0) { this.notices = []; this.alt.requestRender(); }
+    if (held) this.input(data);
+    else pass(data);
+  }
   private input(data: string): TuiInputListenerResult {
     // A throw from a view or a component ends as a status line, not in the alt screen's input dispatch.
     try { return this.key(data); } catch (error) { this.report(error); return { consume: true }; }
   }
   private key(data: string): TuiInputListenerResult {
     if (isKeyRelease(data)) return undefined;
-    // ctrl+c leaves at once, also while the search box is open.
+    // ctrl+c leaves at once, also while the search box or the menu is open or an in-place action runs.
     if (matchesKey(data, "ctrl+c")) { this.leave(); return { consume: true }; }
+    if (this.busy) return { consume: true };
+    const menu = this.menu;
+    if (menu) { this.menuKey(menu, data); this.alt.requestRender(); return { consume: true }; }
     // While an overlay (the search box) is open, every other key is its input.
     if (this.alt.hasOverlay()) return undefined;
     const is = (keybinding: Keybinding): boolean => this.keybindings.matches(data, keybinding);
+    // In the sidebar j, k, h and l move as the arrows do, as in /workflow.
+    const sidebar = this.focus === "sidebar";
+    const moves = (keybinding: Keybinding): boolean => sidebar ? workflowKeyMatches(this.keybindings, data, keybinding) : is(keybinding);
     if (is("tui.select.cancel")) { this.leave(); return { consume: true }; }
-    if (is("tui.input.tab")) { if (this.sidebarVisible) this.focus = this.focus === "sidebar" ? "transcript" : "sidebar"; }
-    else if (is("tui.select.up") || is("tui.select.down")) {
-      const up = is("tui.select.up");
-      if (this.focus === "sidebar") this.navigate(up ? "up" : "down");
+    if (is("tui.input.tab")) { if (this.sidebarVisible) this.focus = sidebar ? "transcript" : "sidebar"; }
+    else if (moves("tui.select.up") || moves("tui.select.down")) {
+      const up = moves("tui.select.up");
+      if (sidebar) this.navigate(up ? "up" : "down");
       else this.alt.scrollBy(up ? -1 : 1);
-    } else if (this.focus === "sidebar" && (is("tui.editor.cursorLeft") || is("tui.editor.cursorRight"))) this.navigate(is("tui.editor.cursorLeft") ? "left" : "right");
-    else if (this.focus === "sidebar" && matchesKey(data, "space")) { const node = this.selectedNode(); if (node) this.toggle(node); }
+    } else if (sidebar && (moves("tui.editor.cursorLeft") || moves("tui.editor.cursorRight"))) this.navigate(moves("tui.editor.cursorLeft") ? "left" : "right");
+    else if (sidebar && matchesKey(data, "space")) { const node = this.selectedNode(); if (node) this.toggle(node); }
     else if (matchesKey(data, "[") || matchesKey(data, "]")) this.jump(matchesKey(data, "[") ? -1 : 1);
     // The alt screen binds its top/bottom actions to home/end only; ctrl+home/ctrl+end reach the transcript here.
     else if (matchesKey(data, "ctrl+home")) this.alt.scrollToTop();
@@ -175,14 +275,20 @@ class Workspace {
     } else if (is("app.tools.expand")) {
       this.expanded = !this.expanded;
       this.shown?.view?.setExpanded(this.expanded);
-    } else if (is("tui.select.confirm")) this.loadLarge();
-    else return undefined;
+    } else if (matchesKey(data, "a")) { const node = this.selectedNode(); if (node) this.openMenu(node); }
+    else if (matchesKey(data, "d")) this.toggleDetails();
+    else if (is("tui.select.confirm")) {
+      // On a node that is not an agent enter opens the menu; on an agent it loads the large record.
+      const node = this.selectedNode();
+      if (sidebar && node && !node.agent) this.openMenu(node);
+      else this.loadLarge();
+    } else return undefined;
     this.alt.requestRender();
     return { consume: true };
   }
 
   private rebuild(): void {
-    const transcript = new VStack([{ component: this.shown?.scroll ?? this.detailsScroll ?? this.placeholder, grow: 1, basis: 0 }, { component: this.status, shrink: 0 }]);
+    const transcript = new VStack([{ component: this.detailsScroll ?? this.shown?.scroll ?? this.placeholder, grow: 1, basis: 0 }, { component: this.status, shrink: 0 }]);
     // The sidebar sizes itself from the terminal width (basis auto); stack entries shrink by default, so fixed parts need shrink 0.
     const body = new HStack(this.sidebarVisible ? [{ component: this.sidebar, shrink: 0 }, { component: transcript, grow: 1, basis: 0 }] : [{ component: transcript, grow: 1, basis: 0 }]);
     this.alt.setLayoutRoot(new VStack([{ component: this.title, shrink: 0 }, { component: body, grow: 1, basis: 0 }, { component: this.hint, shrink: 0 }]));
@@ -191,6 +297,21 @@ class Workspace {
   }
 
   private selectedNode(): SessionTreeNode | undefined { return this.selectedKey === undefined ? undefined : this.byKey.get(this.selectedKey); }
+  private hasDetails(node: SessionTreeNode): boolean { return node.details(this.styles, Date.now()).length > 0; }
+  /** The right pane of the selected node's details, scrolled from the top. */
+  private detailsPane(): ScrollView { return new ScrollView(this.details, { primary: true, scrollbar: "auto" }); }
+  /** What the workspace keeps when it steps aside for an action. */
+  private state(): AgentsWorkspaceState {
+    return {
+      selectedKey: this.selectedKey,
+      row: Math.max(0, this.visible().findIndex((node) => node.key === this.selectedKey)),
+      expansion: [...this.expansion],
+      focus: this.focus,
+      sidebarVisible: this.sidebarVisible,
+      toolsExpanded: this.expanded,
+      detailsShown: this.detailsShown,
+    };
+  }
   private isExpanded(node: SessionTreeNode): boolean { return this.expansion.get(node.key) ?? node.initiallyExpanded; }
   private expandedKeys(): ReadonlySet<string> { return new Set(this.nodes.filter((node) => this.isExpanded(node)).map(({ key }) => key)); }
   /** The nodes whose ancestors are all expanded, in sidebar order. */
@@ -250,13 +371,19 @@ class Workspace {
   /** Refresh and poll every pollIntervalMs from the first settled list on; called again by later lists, it keeps the running interval. */
   private startTicks(): void {
     if (this.timer || this.finished) return;
-    this.timer = setInterval(() => { this.refresh(); if (this.shown) this.poll(this.shown); }, this.options.pollIntervalMs ?? 1000);
+    this.timer = setInterval(() => {
+      // An in-place action holds the screen (the editor stops it): nothing is read until it settles.
+      if (this.busy) return;
+      this.refresh();
+      if (this.shown) this.poll(this.shown);
+    }, this.options.pollIntervalMs ?? 1000);
     this.timer.unref();
   }
   /**
    * A new list keeps the selection and the expansion by key; a removed node gives the selection to the node now at its row.
-   * A key listed for the first time takes its initiallyExpanded. Until a node is selected, the initial key or else the first
-   * agent node is selected, with its ancestors expanded.
+   * A key listed for the first time takes its initiallyExpanded. Until a node is selected, the initial key (its ancestors
+   * expanded), else the state's selection, else the first agent node (its ancestors expanded), else the first node is selected.
+   * An open menu reads its labels again, or closes when its node or the node's target went away.
    */
   private apply(nodes: readonly SessionTreeNode[]): void {
     const row = this.visible().findIndex((node) => node.key === this.selectedKey);
@@ -269,14 +396,11 @@ class Workspace {
     if (!wanted && this.selectedKey !== undefined) {
       const visible = this.visible();
       wanted = visible[Math.min(Math.max(0, row), visible.length - 1)];
-    } else if (!wanted) {
-      wanted = (this.initialKey === undefined ? undefined : this.byKey.get(this.initialKey)) ?? nodes.find((node) => node.agent !== undefined);
-      if (wanted) this.reveal(wanted);
-    }
+    } else if (!wanted) wanted = this.firstSelection(nodes);
     //NOTE: a refresh that moves the selected node under a node the user collapsed leaves it selected but hidden.
     const shown = this.shown;
     const agent = wanted?.agent;
-    if (shown && agent && wanted?.key === this.selectedKey && identity(agent) === shown.identity) {
+    if (wanted && shown && agent && wanted.key === this.selectedKey && identity(agent) === shown.identity) {
       // A live session registered after the agent was opened, or another one, needs its own subscription.
       if (agent.live !== shown.agent.live) {
         shown.unsubscribe?.();
@@ -284,20 +408,169 @@ class Workspace {
       }
       shown.agent = agent;
       if (agent.running) shown.polling = true;
+      // With d on, the pane follows the agent's details: emptied by a refresh it shows the transcript, back again the details.
+      if (this.detailsShown && this.hasDetails(wanted) !== (this.detailsScroll !== undefined)) {
+        this.detailsScroll = this.detailsScroll ? undefined : this.detailsPane();
+        this.rebuild();
+      }
     } else if (wanted?.key !== this.selectedKey || shown || agent) this.select(wanted);
+    const menu = this.menu;
+    const target = menu && this.byKey.get(menu.key)?.target;
+    if (menu && !target) this.closeMenu();
+    else if (menu && target) {
+      menu.target = target;
+      this.loadMenu(menu);
+    }
     this.alt.requestRender();
   }
+  private firstSelection(nodes: readonly SessionTreeNode[]): SessionTreeNode | undefined {
+    const initial = this.initialKey === undefined ? undefined : this.byKey.get(this.initialKey);
+    const restore = this.restore;
+    if (!initial && restore) {
+      const kept = restore.selectedKey === undefined ? undefined : this.byKey.get(restore.selectedKey);
+      const visible = this.visible();
+      const near = kept ?? visible[Math.min(Math.max(0, restore.row), visible.length - 1)];
+      if (near) return near;
+    }
+    const wanted = initial ?? nodes.find((node) => node.agent !== undefined) ?? nodes[0];
+    if (wanted) this.reveal(wanted);
+    return wanted;
+  }
 
-  /** An agent opens its transcript; any other node shows its details and opens nothing. */
+  /** An agent opens its transcript, shown unless d shows its details; any other node shows its details and opens nothing. */
   private select(node: SessionTreeNode | undefined): void {
     const previous = this.shown;
     this.shown = undefined;
     if (previous) this.close(previous);
     this.selectedKey = node?.key;
-    if (node) this.initialKey = undefined;
-    this.detailsScroll = node && !node.agent ? new ScrollView(this.details, { primary: true, scrollbar: "auto" }) : undefined;
+    if (node) {
+      this.initialKey = undefined;
+      this.restore = undefined;
+    }
+    this.detailsScroll = node && (!node.agent || (this.detailsShown && this.hasDetails(node))) ? this.detailsPane() : undefined;
     if (node?.agent) this.shown = this.open(node.agent);
     this.rebuild();
+  }
+  /** d on an agent with details: its details instead of its transcript, or the transcript again; the transcript goes on polling. */
+  private toggleDetails(): void {
+    const node = this.selectedNode();
+    if (!node?.agent || !this.hasDetails(node)) return;
+    this.detailsShown = !this.detailsShown;
+    this.detailsScroll = this.detailsShown ? this.detailsPane() : undefined;
+    this.rebuild();
+  }
+
+  /** a, and enter on a node that is not an agent: the menu of the node's target, only with providers. */
+  private openMenu(node: SessionTreeNode): void {
+    const target = node.target;
+    if (!target || (this.options.actions ?? []).length === 0 || this.menu) return;
+    const component: Component = { render: (width) => this.menuLines(width), invalidate() {} };
+    const menu: Menu = { key: node.key, target, handle: this.alt.showOverlay(component, MENU_OVERLAY), entries: undefined, index: 0, label: undefined, top: 0, generation: 0, failures: [] };
+    this.menu = menu;
+    this.loadMenu(menu);
+  }
+  private closeMenu(): void {
+    const menu = this.menu;
+    this.menu = undefined;
+    menu?.handle.hide();
+    this.alt.requestRender();
+  }
+  /**
+   * Asks every provider for the target's labels; a later read wins, and the selected label stays selected, else the last one. A
+   * provider that cannot be read costs only its own labels: the others show, then a row with its error.
+   */
+  private loadMenu(menu: Menu): void {
+    const generation = ++menu.generation;
+    const target = menu.target;
+    const current = (): boolean => !this.finished && this.menu === menu && menu.generation === generation;
+    void Promise.allSettled((this.options.actions ?? []).map(async (provider) => (await provider.actions(target)).map((action): MenuEntry => ({ action, provider })))).then((results) => {
+      if (!current()) return;
+      const entries = results.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+      const failures = results.flatMap((result) => result.status === "rejected" ? [errorText(result.reason)] : []);
+      const kept = entries.findIndex((entry) => entry.action.label === menu.label);
+      // The first label until one was selected; the last one when the selected label went away.
+      menu.index = kept >= 0 ? kept : menu.label === undefined ? 0 : Math.max(0, entries.length - 1);
+      // A label missing because its provider could not be read is still the one to select when the next read has it.
+      if (kept >= 0 || failures.length === 0) menu.label = entries[menu.index]?.action.label;
+      menu.entries = entries;
+      menu.failures = failures;
+      this.alt.requestRender();
+    });
+  }
+  /** ↑↓ and j/k move round the labels read, enter runs the selected one, esc, ← and h close; every other key is dropped. */
+  private menuKey(menu: Menu, data: string): void {
+    const is = (keybinding: Keybinding): boolean => workflowKeyMatches(this.keybindings, data, keybinding);
+    const entries = menu.entries ?? [];
+    if (is("tui.select.cancel") || is("tui.editor.cursorLeft")) this.closeMenu();
+    else if ((is("tui.select.up") || is("tui.select.down")) && entries.length > 0) {
+      menu.index = (menu.index + (is("tui.select.up") ? -1 : 1) + entries.length) % entries.length;
+      menu.label = entries[menu.index]?.action.label;
+    } else if (is("tui.select.confirm")) {
+      const entry = entries[menu.index];
+      if (entry) this.choose(menu, entry);
+    }
+  }
+  /** An in-place label runs here; any other leaves the workspace for the caller to run it with Pi's dialogs. */
+  private choose(menu: Menu, entry: MenuEntry): void {
+    this.closeMenu();
+    if (entry.action.inPlace) void this.runInPlace(menu.target, entry);
+    else this.leave({ target: menu.target, label: entry.action.label, state: this.state() });
+  }
+  /** Keys and ticks wait until it settles; what it reports, a failure too, is the status row's notice. */
+  private async runInPlace(target: AgentsActionTarget, entry: MenuEntry): Promise<void> {
+    const label = entry.action.label;
+    this.busy = true;
+    try {
+      //NOTE: an in-place action (a copy, an editor) selects nothing afterwards.
+      await entry.provider.run(target, label, this.inPlaceUi(label));
+    } catch (error) {
+      this.notify(errorText(error), "error");
+    } finally {
+      this.busy = false;
+      if (!this.finished) this.alt.requestRender();
+    }
+  }
+  private notify(message: string, level?: "info" | "warning" | "error"): void {
+    if (this.finished) return;
+    this.notices.push({ text: clean(message), level });
+    this.alt.requestRender();
+  }
+  /** Only notify and openArtifact work in place; every other method needs Pi's dialogs and fails, naming the label. */
+  private inPlaceUi(label: string): ActionUi {
+    const refused = (method: string): Error => new Error(`${label}: ${method} needs Pi's dialogs, which the workspace cannot show`);
+    return {
+      notify: (message, level) => { this.notify(message, level); },
+      confirm: () => Promise.reject(refused("confirm")),
+      select: () => Promise.reject(refused("select")),
+      input: () => Promise.reject(refused("input")),
+      editText: () => Promise.reject(refused("editText")),
+      reviewCheckpoint: () => Promise.reject(refused("reviewCheckpoint")),
+      openArtifact: (artifact, artifactLabel) => openArtifactInEditor(this.editorTui(), this.options.editorCommand?.(), artifact, artifactLabel, (message, level) => { this.notify(message, level); }),
+      status: () => { throw refused("status"); },
+      setWorkingMessage: () => { throw refused("setWorkingMessage"); },
+    };
+  }
+  /**
+   * The external editor takes the terminal from the alternate screen, not from Pi: stopping keeps Pi's screen as it was (no frame
+   * of the workspace written into it) and Pi's TUI stays stopped; starting enters the alternate screen again with a full frame.
+   * Once the workspace is left (an abort while the editor runs) both do nothing: Pi has the terminal back.
+   */
+  private editorTui(): WorkflowTui {
+    return {
+      stop: () => {
+        if (this.finished || this.editing) return;
+        this.alt.stop({ preserveScreen: true });
+        this.editing = true;
+      },
+      start: () => {
+        if (this.finished || !this.editing) return;
+        this.editing = false;
+        // A terminal that cannot start again goes back to Pi, which reports why the workspace closed.
+        try { this.start(); } catch (error) { this.leave(undefined, error); throw error; }
+        this.alt.renderNow(true);
+      },
+      requestRender: (force) => { if (!this.finished && !this.editing) this.alt.requestRender(force); },
+    };
   }
   private open(agent: SessionAgent): Shown {
     const base = { agent, identity: identity(agent), queue: Promise.resolve(), polling: true, pollInFlight: false, loadingEarlier: false, earlierFailed: false, loadingRecord: false, status: undefined, reason: undefined, failure: undefined, atStart: false };
@@ -461,18 +734,23 @@ class Workspace {
   private hintText(): string {
     const key = (keybinding: Keybinding, fallback: string): string => this.keybindings.getKeys(keybinding)[0] ?? fallback;
     const pending = (this.shown?.view?.pendingLarge().length ?? 0) > 0;
+    const node = this.selectedNode();
     return [
-      ...(this.focus === "sidebar" ? ["←→/space fold · [ ] agent"] : ["↑↓ scroll", "[ ] agent"]),
-      ...(this.sidebarVisible ? [`${key("tui.input.tab", "tab")} ${this.focus === "sidebar" ? "transcript" : "agents"}`] : []),
+      this.focus === "sidebar" ? "←→/space fold" : "↑↓ scroll",
+      "[ ] agent",
+      ...((this.options.actions ?? []).length > 0 ? ["a menu"] : []),
+      ...(node?.agent && this.hasDetails(node) ? ["d details"] : []),
+      ...(this.sidebarVisible ? [`${key("tui.input.tab", "tab")} focus`] : []),
       ...(pending ? [`${key("tui.select.confirm", "enter")} load`] : []),
-      "pgup/pgdn",
       `${key("tui.altScreen.search", "ctrl+shift+f")} search`,
       "s sidebar",
       `${key("app.tools.expand", "ctrl+o")} tools`,
       "esc back",
     ].join(" · ");
   }
+  /** The notices first, until the next key; then the shown transcript's state. */
   private statusText(): string {
+    if (this.notices.length > 0) return this.notices.map(({ text, level }) => level === "warning" ? this.styles.warning(text) : level === "error" ? this.styles.error(text) : text).join(" · ");
     const shown = this.shown;
     // A failure first: also an agent whose transcript could not be opened has one, and no source.
     if (shown?.failure) return this.styles.warning(clean(shown.failure));
@@ -505,7 +783,38 @@ class Workspace {
       return truncateToWidth(`${truncateToWidth(text, cell, "…", true)}${this.styles.dim(SEPARATOR)}`, total, "", true);
     });
   }
-  /** A click on a row selects its node, and on its ▾/▸ icon also toggles it; a click on a rule does nothing; the wheel is left to the transcript. */
+  /**
+   * The menu: a heading with the target's kind, the label rows ("→ " on the selected one) and a closing rule, in at most rows - 2
+   * rows (the heading and the rule go first when there are fewer), scrolled to keep the selected row in view.
+   */
+  private menuLines(width: number): string[] {
+    const menu = this.menu;
+    if (!menu) return [];
+    const cell = Math.max(1, width);
+    const entries = menu.entries ?? [];
+    // The labels read, then a row for every provider that could not be read.
+    const items = [
+      ...entries.map((entry, index) => `${index === menu.index ? "→ " : "  "}${clean(entry.action.label)}`),
+      ...menu.failures.map((failure) => this.styles.warning(`actions unavailable: ${clean(failure)}`)),
+    ];
+    if (items.length === 0) items.push(this.styles.muted(menu.entries ? "no actions" : "loading…"));
+    const budget = Math.max(1, this.alt.terminal.rows - FIXED_ROWS);
+    const framed = budget >= 3;
+    const room = framed ? budget - 2 : budget;
+    const selected = Math.min(menu.index, items.length - 1);
+    if (selected < menu.top) menu.top = selected;
+    else if (selected >= menu.top + room) menu.top = selected - room + 1;
+    menu.top = Math.max(0, Math.min(menu.top, items.length - room));
+    const rows = items.slice(menu.top, menu.top + room).map((item) => truncateToWidth(item, cell, "…"));
+    if (!framed) return rows;
+    const rule = this.styles.dim("─".repeat(cell));
+    const heading = truncateToWidth(`${this.styles.dim("─ ")}${this.styles.bold(MENU_TITLES[menu.target.kind])}${this.styles.dim(` ${"─".repeat(cell)}`)}`, cell, "");
+    return [heading, ...rows, rule];
+  }
+  /**
+   * A click on a row selects its node, and on its ▾/▸ icon also toggles it; a click on a rule does nothing; the wheel is left to the
+   * transcript. While the menu is open or an in-place action runs gate() lets no mouse report through.
+   */
   private sidebarMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
     if (event.button !== "left" || (event.type !== "press" && event.type !== "release" && event.type !== "click")) return undefined;
     if (event.type === "click") {
@@ -526,27 +835,31 @@ class Workspace {
   }
 }
 
+/** Resolves once Pi's TUI is back: with the label the workspace left for, undefined when the user just left. */
 export const openAgentsWorkspace: OpenAgentsWorkspace = async (ctx, options) => {
-  await ctx.ui.custom<undefined>((parent, theme, keybindings, done) => {
+  // Awaited inside an async function: a custom that throws synchronously rejects this promise.
+  return await ctx.ui.custom<AgentsWorkspaceExit | undefined>((parent, theme, keybindings, done) => {
     const signal = ctx.signal;
     let workspace: Workspace | undefined;
     /** Set before parent.stop(): from then on leaving restarts Pi, exactly once. */
     let stopped = false;
     let left = false;
-    const leave = (): void => {
+    const abort = (): void => { leave(); };
+    /** `cause`: what closed the workspace (a terminal that cannot start again after the editor), reported as the first error. */
+    const leave = (exit?: AgentsWorkspaceExit, cause?: unknown): void => {
       if (left) return;
       left = true;
-      signal?.removeEventListener("abort", leave);
+      signal?.removeEventListener("abort", abort);
       // Each step runs even when one before it throws (a terminal that cannot stop: setRawMode on a closed TTY), and nothing
       // escapes to the key or abort listener: Pi is started again, the command settles, and the first error is reported once.
-      let failure: string | undefined;
+      let failure = cause === undefined ? undefined : errorText(cause);
       const step = (run: () => void): void => { try { run(); } catch (error) { failure ??= errorText(error); } };
       step(() => { workspace?.dispose(); });
       if (stopped) step(() => { parent.start(); parent.renderNow(false); });
-      done(undefined);
+      done(exit);
       if (failure !== undefined) ctx.ui.notify(`agents workspace failed: ${failure}`, "error");
     };
-    signal?.addEventListener("abort", leave, { once: true });
+    signal?.addEventListener("abort", abort, { once: true });
     queueMicrotask(() => {
       if (left) return;
       if (signal?.aborted) { leave(); return; }
@@ -556,18 +869,16 @@ export const openAgentsWorkspace: OpenAgentsWorkspace = async (ctx, options) => 
         parent.stop({ preserveScreen: true });
         alt = new TuiAltScreen(parent.terminal, parent.getShowHardwareCursor(), undefined, { mouse: true, copyOnSelect: true, scrollToEndIndicator: () => " ↓ latest " });
         workspace = new Workspace(alt, theme, keybindings, options, leave);
-        alt.start();
+        workspace.start();
         alt.renderNow();
       } catch (error) {
-        // Pi must not stay stopped: drop what started, then leave gives the terminal back to Pi and settles.
+        // Pi must not stay stopped: drop what started, then leave gives the terminal back to Pi, settles and reports this error first, once.
         const started = workspace;
         workspace = undefined;
         try { if (started) started.dispose(); else alt?.stop({ preserveScreen: true }); } catch { /* the terminal goes back to Pi in leave */ }
-        leave();
-        ctx.ui.notify(`agents workspace failed: ${errorText(error)}`, "error");
+        leave(undefined, error);
       }
     });
     return { render: (width) => [truncateToWidth("opening agents…", Math.max(1, width), "…")], invalidate() {} };
   }, { overlay: true });
-  return undefined;
 };
