@@ -146,6 +146,7 @@ function decodeRetention(value: unknown): Readonly<WorkflowRetentionSettings> | 
 function decodeWorkflowSettings(value: unknown): LaunchSnapshot["settings"] | undefined {
   if (!object(value) || !positiveInteger(value.concurrency)) return undefined;
   const backgroundWidget = optionalBoolean(value.backgroundWidget);
+  const backgroundWidgetLayout = value.backgroundWidgetLayout === undefined || value.backgroundWidgetLayout === "phases" || value.backgroundWidgetLayout === "scopes" ? value.backgroundWidgetLayout : INVALID_PERSISTED_VALUE;
   const modelAliases = value.modelAliases === undefined ? undefined : decodeStringMap(value.modelAliases);
   const skills = value.skills === undefined ? undefined : decodeStringArray(value.skills);
   const tools = value.tools === undefined ? undefined : decodeStringArray(value.tools);
@@ -154,10 +155,10 @@ function decodeWorkflowSettings(value: unknown): LaunchSnapshot["settings"] | un
   const extensionSettings = value.extensionSettings === undefined ? undefined : decodeWorkflowExtensions(value.extensionSettings);
   const effectiveExtensionSettings = extensionSettings ?? legacyExtensionSettings;
   const retention = value.retention === undefined ? undefined : decodeRetention(value.retention);
-  if (backgroundWidget === INVALID_PERSISTED_VALUE || (value.modelAliases !== undefined && !modelAliases) || value.skills !== undefined && !skills || value.tools !== undefined && !tools || value.extensions !== undefined && !extensions && !legacyExtensionSettings || value.extensionSettings !== undefined && !extensionSettings || retention === INVALID_PERSISTED_VALUE) return undefined;
+  if (backgroundWidget === INVALID_PERSISTED_VALUE || backgroundWidgetLayout === INVALID_PERSISTED_VALUE || (value.modelAliases !== undefined && !modelAliases) || value.skills !== undefined && !skills || value.tools !== undefined && !tools || value.extensions !== undefined && !extensions && !legacyExtensionSettings || value.extensionSettings !== undefined && !extensionSettings || retention === INVALID_PERSISTED_VALUE) return undefined;
   return {
     concurrency: value.concurrency,
-    ...(backgroundWidget === undefined ? {} : { backgroundWidget }), ...(modelAliases === undefined ? {} : { modelAliases }), ...(skills === undefined ? {} : { skills }), ...(tools === undefined ? {} : { tools }),
+    ...(backgroundWidget === undefined ? {} : { backgroundWidget }), ...(backgroundWidgetLayout === undefined ? {} : { backgroundWidgetLayout }), ...(modelAliases === undefined ? {} : { modelAliases }), ...(skills === undefined ? {} : { skills }), ...(tools === undefined ? {} : { tools }),
     ...(extensions === undefined ? {} : { extensions }), ...(effectiveExtensionSettings === undefined ? {} : { extensionSettings: effectiveExtensionSettings }), ...(retention === undefined ? {} : { retention }),
   };
 }
@@ -382,6 +383,11 @@ function decodeShellActivity(value: unknown): PersistedShellActivity | undefined
   if (!object(value) || !integer(value.phaseIndex) || !integer(value.active) || !finiteNumber(value.startedAt)) return undefined;
   return { phaseIndex: value.phaseIndex, active: value.active, startedAt: value.startedAt };
 }
+function decodeScopeShellActivity(value: unknown): NonNullable<RunRecord["activeShellsByScope"]>[number] | undefined {
+  if (!object(value) || typeof value.path !== "string" || typeof value.command !== "string" || !finiteNumber(value.startedAt)) return undefined;
+  const structuralPath = decodeStringArray(value.structuralPath);
+  return structuralPath ? { path: value.path, structuralPath, command: value.command, startedAt: value.startedAt } : undefined;
+}
 function decodeRunEvent(value: unknown): WorkflowRunEvent | undefined {
   if (!object(value) || typeof value.type !== "string" || typeof value.message !== "string") return undefined;
   const timestamp = optionalNumber(value.timestamp);
@@ -425,6 +431,7 @@ export function decodePersistedRun(value: unknown, allowLegacyAgentSessions = fa
   const activeShells = optionalNumber(value.activeShells);
   const activeShellStartedAt = optionalNumber(value.activeShellStartedAt);
   const activeShellsByPhase = value.activeShellsByPhase === undefined ? undefined : decodeArray(value.activeShellsByPhase, decodeShellActivity);
+  const activeShellsByScope = value.activeShellsByScope === undefined ? undefined : decodeArray(value.activeShellsByScope, decodeScopeShellActivity);
   const error = value.error === undefined ? undefined : decodeWorkflowError(value.error);
   const failedAt = optionalString(value.failedAt);
   const budget = value.budget === undefined ? undefined : decodeBudget(value.budget);
@@ -435,7 +442,7 @@ export function decodePersistedRun(value: unknown, allowLegacyAgentSessions = fa
   const delivery = value.delivery === undefined ? undefined : decodeDelivery(value.delivery);
   const scriptCalls = value.scriptCalls === undefined ? undefined : decodeArray(value.scriptCalls, decodeScriptCall);
   if (value.scriptCalls !== undefined && !scriptCalls) return undefined;
-  if (!agentSessions || !agents || parentRunId === INVALID_PERSISTED_VALUE || value.retry !== undefined && !retry || phase === INVALID_PERSISTED_VALUE || value.phaseHistory !== undefined && !phaseHistory || phaseHistoryIndex === INVALID_PERSISTED_VALUE || activeShells === INVALID_PERSISTED_VALUE || activeShellStartedAt === INVALID_PERSISTED_VALUE || value.activeShellsByPhase !== undefined && !activeShellsByPhase || value.error !== undefined && !error || failedAt === INVALID_PERSISTED_VALUE || value.budget !== undefined && !budget || budgetVersion === INVALID_PERSISTED_VALUE || value.budgetVersion !== undefined && !integer(budgetVersion) || value.usage !== undefined && !usage || value.budgetEvents !== undefined && !budgetEvents || value.events !== undefined && !events || value.delivery !== undefined && !delivery) return undefined;
+  if (!agentSessions || !agents || parentRunId === INVALID_PERSISTED_VALUE || value.retry !== undefined && !retry || phase === INVALID_PERSISTED_VALUE || value.phaseHistory !== undefined && !phaseHistory || phaseHistoryIndex === INVALID_PERSISTED_VALUE || activeShells === INVALID_PERSISTED_VALUE || activeShellStartedAt === INVALID_PERSISTED_VALUE || value.activeShellsByPhase !== undefined && !activeShellsByPhase || value.activeShellsByScope !== undefined && !activeShellsByScope || value.error !== undefined && !error || failedAt === INVALID_PERSISTED_VALUE || value.budget !== undefined && !budget || budgetVersion === INVALID_PERSISTED_VALUE || value.budgetVersion !== undefined && !integer(budgetVersion) || value.usage !== undefined && !usage || value.budgetEvents !== undefined && !budgetEvents || value.events !== undefined && !events || value.delivery !== undefined && !delivery) return undefined;
   if (value.agentSessions === undefined && !allowLegacyAgentSessions) return undefined;
   return {
     id: value.id,
@@ -453,6 +460,7 @@ export function decodePersistedRun(value: unknown, allowLegacyAgentSessions = fa
     ...(activeShells === undefined ? {} : { activeShells }),
     ...(activeShellStartedAt === undefined ? {} : { activeShellStartedAt }),
     ...(activeShellsByPhase === undefined ? {} : { activeShellsByPhase }),
+    ...(activeShellsByScope === undefined ? {} : { activeShellsByScope }),
     ...(scriptCalls === undefined ? {} : { scriptCalls }),
     ...(error === undefined ? {} : { error }),
     ...(failedAt === undefined ? {} : { failedAt }),

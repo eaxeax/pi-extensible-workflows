@@ -6,6 +6,7 @@ import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { contextualWorkflowAction, testExtensionApi, waitForIssue105 } from "./support.js";
 import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, formatAgentDetail, formatCost, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowPhaseDashboard, formatWorkflowProgress, mergeBudget, RunStore, truncateWorkflowProgress, WORKFLOW_AGENT_STALL_THRESHOLD_MS, type AgentRecord, type PersistedRun } from "../src/index.js";
+import { withoutActiveShells } from "../src/host-runtime.js";
 import { navigatorRunLabels, textBlock, workflowProgressBlock } from "../src/host-view.js";
 import { listRunIds } from "../src/persistence.js";
 import { testTransport, type TestPiSession, type TestPiSessionEvent } from "./test-transport.js";
@@ -491,6 +492,39 @@ void test("foreground workflow progress reports a shell waiting after agents set
   assert.equal(result.details.run.activeShellStartedAt, undefined);
   assert.equal(result.details.run.activeShellsByPhase, undefined);
   assert.equal(updates.some(({ activeShells }) => activeShells === undefined), true);
+});
+
+void test("a shell outside any phase records its structural path and first command line, cleared when it ends", { timeout: 10000 }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-scope-shell-"));
+  const startedPath = join(home, "shell-started");
+  const releasePath = join(home, "shell-release");
+  const head = `${process.execPath} -e ${JSON.stringify(`const fs=require("node:fs");fs.writeFileSync(${JSON.stringify(startedPath)},"started");const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(releasePath)})){clearInterval(timer);process.exit(0);}},1);`)}`;
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(async (): Promise<TestPiSession> => { throw new Error("no agent expected"); }));
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const updates: PersistedRun[] = [];
+  let reportActive!: () => void;
+  const active = new Promise<void>((resolve) => { reportActive = resolve; });
+  const running = workflow.execute("id", { name: "scope-shell", script: `await shell(${JSON.stringify(`${head}\n# second line`)}); return true;`, foreground: true }, new AbortController().signal, (update: { details: { run: PersistedRun } }) => {
+    updates.push(update.details.run);
+    if (update.details.run.activeShellsByScope?.length === 1) reportActive();
+  }, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  await active;
+  await waitForIssue105(() => existsSync(startedPath));
+  const live = updates.find((run) => run.activeShellsByScope?.length === 1);
+  assert.ok(live?.activeShellsByScope);
+  const [record] = live.activeShellsByScope;
+  assert.ok(record);
+  assert.ok(Array.isArray(record.structuralPath));
+  assert.equal(record.command, head.trim().slice(0, 200));
+  assert.equal(record.command.includes("\n"), false);
+  assert.equal(typeof record.startedAt, "number");
+  assert.deepEqual(live.activeShellsByPhase?.map(({ phaseIndex }) => phaseIndex), [-1]);
+  assert.equal(withoutActiveShells(live).activeShellsByScope, undefined);
+  writeFileSync(releasePath, "release");
+  const result = await running as { details: { run: PersistedRun } };
+  assert.equal(result.details.run.activeShellsByScope, undefined);
 });
 
 void test("foreground workflow reports parallel agent activities together", { timeout: 5000 }, async () => {

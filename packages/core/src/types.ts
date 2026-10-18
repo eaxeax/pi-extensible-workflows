@@ -99,8 +99,9 @@ export type WorkflowExtensionSettingsValidator = (settings: Readonly<WorkflowExt
 export interface WorkflowSessionStartEvent { type: "session_start"; reason: "startup" | "reload" | "new" | "resume" | "fork"; previousSessionFile?: string; settings: Readonly<WorkflowExtensionSettings> }
 export interface WorkflowRetentionSettings { olderThanDays?: number; maxTerminalRuns?: number }
 export type CodemodeToolsSetting = "all" | "read-only" | "none";
-export interface WorkflowSettings { concurrency: number; backgroundWidget?: boolean; codemodeTools?: CodemodeToolsSetting; modelAliases?: Readonly<Record<string, string>>; skills?: readonly string[]; extensions?: readonly string[]; extensionSettings?: Readonly<WorkflowExtensionSettings>; tools?: readonly string[]; retention?: Readonly<WorkflowRetentionSettings> }
-export type WorkflowSettingsOverrides = Partial<Omit<WorkflowSettings, "backgroundWidget" | "codemodeTools">>;
+export type BackgroundWidgetLayout = "phases" | "scopes";
+export interface WorkflowSettings { concurrency: number; backgroundWidget?: boolean; backgroundWidgetLayout?: BackgroundWidgetLayout; codemodeTools?: CodemodeToolsSetting; modelAliases?: Readonly<Record<string, string>>; skills?: readonly string[]; extensions?: readonly string[]; extensionSettings?: Readonly<WorkflowExtensionSettings>; tools?: readonly string[]; retention?: Readonly<WorkflowRetentionSettings> }
+export type WorkflowSettingsOverrides = Partial<Omit<WorkflowSettings, "backgroundWidget" | "backgroundWidgetLayout" | "codemodeTools">>;
 export interface WorkflowSettingsSources { concurrency: string; modelAliases: string; skills?: string; extensions?: string; tools?: string; extensionSettings?: string; retention?: string }
 export interface WorkflowSettingsResolution { selectorSources?: AgentResourceSelectorSources; globalSettingsPath: string; projectSettingsPath: string; projectTrusted: boolean; global: Readonly<WorkflowSettings>; project: Readonly<WorkflowSettingsOverrides>; effective: Readonly<WorkflowSettings>; sources: Readonly<WorkflowSettingsSources> }
 export interface AgentResourceSelectors { skills?: readonly string[]; extensions?: readonly string[]; tools?: readonly string[] }
@@ -179,6 +180,8 @@ export interface WorkflowRunEvent { type: string; message: string; timestamp?: n
 export interface WorkflowRetryProvenance { sourceRunId: string; lineageRootRunId: string; completedPaths: readonly string[]; incompletePaths: readonly string[]; namedWorktrees: readonly string[] }
 export interface WorkflowPhaseRecord { phase: string; afterAgent: number }
 export interface WorkflowPhaseShellActivity { phaseIndex: number; active: number; startedAt: number }
+/** One running shell() call with the structural path of its call site; `command` is the head of its first line. */
+export interface WorkflowScopeShellActivity { path: string; structuralPath: readonly string[]; command: string; startedAt: number }
 /** A script call recorded for inspection. Tool payloads stay in the replay journal, not this record. Oversized shell inputs are JSON prefixes, with `inputBytes` their full size. */
 export interface WorkflowScriptCall { kind: "shell" | "tool"; name: string; path: string; input?: JsonValue; inputBytes?: number; phase?: string; startedAt: number; finishedAt?: number; error?: { code: WorkflowErrorCode; message?: string } }
 export interface RunRecord {
@@ -197,6 +200,7 @@ export interface RunRecord {
   activeShells?: number;
   activeShellStartedAt?: number;
   activeShellsByPhase?: readonly WorkflowPhaseShellActivity[];
+  activeShellsByScope?: readonly WorkflowScopeShellActivity[];
   activeTools?: readonly { name: string; startedAt: number }[]; // Script tool calls in flight: a live overlay for rendering, never persisted.
   scriptCalls?: readonly WorkflowScriptCall[];
   error?: WorkflowErrorShape;

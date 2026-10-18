@@ -43,6 +43,6 @@ void test("persistence keeps one name for the persisted run type", () => {
 
 void test("project settings overrides are derived from the global settings shape", () => {
   const source = readFileSync(typesPath, "utf8");
-  assert.match(source, /export type WorkflowSettingsOverrides = Partial<Omit<WorkflowSettings, "backgroundWidget" \| "codemodeTools">>;/);
+  assert.match(source, /export type WorkflowSettingsOverrides = Partial<Omit<WorkflowSettings, "backgroundWidget" \| "backgroundWidgetLayout" \| "codemodeTools">>;/);
   assert.doesNotMatch(source, /export interface WorkflowSettingsOverrides/);
 });

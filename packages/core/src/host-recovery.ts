@@ -110,7 +110,7 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
   const coldResumeRun = async (run: WorkflowRunRecord, hasUI: boolean, ui: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }, trustedProject: boolean, context?: { model: { provider: string; id: string } | undefined; modelRegistry: WorkflowRecoveryContext["modelRegistry"]; deliveryContext: CompletionDeliveryContext; toolContext?: ExtensionToolContext | undefined; signal?: AbortSignal | undefined; resolvedAliases?: Readonly<Record<string, string>>; resolvedDynamicAliasNames?: readonly string[]; blockedAliases?: ReadonlySet<string>; blockedAliasTargets?: Readonly<Record<string, string>> }, modeOverride?: boolean, waitForCompletion = true): Promise<ColdResumeResult | undefined> => {
     const loaded = await run.store.load();
     const foreground = modeOverride ?? (loaded.run.delivery?.mode === "foreground" || (loaded.run.delivery?.mode === "background" && loaded.run.delivery.toolCallId !== undefined) || (loaded.run.delivery === undefined && loaded.snapshot.launchMode === "foreground"));
-    if (loaded.run.activeShells !== undefined || loaded.run.activeShellStartedAt !== undefined || loaded.run.activeShellsByPhase !== undefined) await persistRunState(run.store, run.metadata, withoutActiveShells);
+    if (loaded.run.activeShells !== undefined || loaded.run.activeShellStartedAt !== undefined || loaded.run.activeShellsByPhase !== undefined || loaded.run.activeShellsByScope !== undefined) await persistRunState(run.store, run.metadata, withoutActiveShells);
     await run.store.validateRetrySource();
     await run.store.validateBorrowedWorktrees();
     assertResumableSnapshot(loaded.snapshot);
