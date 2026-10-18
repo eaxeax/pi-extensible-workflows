@@ -8,6 +8,11 @@ import workflowExtension, { widgetAgentsOpener } from "../src/host.js";
 import { createLaunchSnapshot, DEFAULT_SETTINGS, RunStore } from "../src/index.js";
 import { WORKFLOW_RUN_STARTED_EVENT } from "../src/types.js";
 import { testExtensionApi } from "./support.js";
+import { leave, open as openHarness, settle, sidebarRows, title } from "./agents-workspace-harness.js";
+import { loadingRegistry } from "../src/registry.js";
+import { clearSubagentManager, setSubagentManager } from "../src/subagent-manager-handle.js";
+import type { SessionAgentsSource } from "../src/agents-workspace-contract.js";
+import type { SubagentManager, SubagentStatus } from "../subagents/src/contracts.js";
 
 const context = (mode: string, session: string, command: boolean): ExtensionCommandContext => ({ mode, hasUI: true, sessionManager: { getSessionId: () => session }, ...(command ? { waitForIdle: async () => {} } : {}) }) as unknown as ExtensionCommandContext;
 
@@ -201,4 +206,71 @@ void test("two hosts keep their own command context: a widget opens the workspac
     assert.deepEqual(a.opened, [undefined, "run:run"], "host A's widget opens on its remembered context");
     assert.deepEqual(b.opened, [], "host B remembered nothing: A's context is not used for it");
   } finally { a.cleanup(); b.cleanup(); }
+});
+
+void test("a background subagent status the host observes reaches the widget; enter on its row opens /agents on it, and that workspace selects its node", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-widget-subagents-"));
+  const ids = Array.from({ length: 9 }, (_, index) => `sub-${String(index)}`);
+  const status = (id: string): SubagentStatus => ({ id, sessionId: "session", state: "running", startedAt: Date.now() - 1_000, progress: { lastEventAt: Date.now(), toolCalls: [], accounting: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0 } } });
+  const manager = { inspect: async (params: { id?: string }) => params.id === undefined ? ids.map(status) : status(params.id) } as unknown as SubagentManager;
+  setSubagentManager(manager);
+  try {
+    const cwd = join(home, "project");
+    mkdirSync(cwd);
+    const commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
+    const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+    const opened: Array<{ initialKey: string | undefined; agents: SessionAgentsSource }> = [];
+    workflowExtension(testExtensionApi({
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) { commands.set(name, options.handler); },
+      registerTool() {},
+      on(name: string, handler: unknown) { handlers.set(name, [...(handlers.get(name) ?? []), handler as (event: unknown, ctx: unknown) => unknown]); },
+      registerEntryRenderer() {},
+      registerShortcut() {},
+      events: { on: () => () => {}, emit: () => {} },
+    }), home, undefined, undefined, join(home, "agent"), [], async (_ctx, options) => { opened.push({ initialKey: options.initialKey, agents: options.agents }); return undefined; });
+    const inputs: Array<(data: string) => { consume?: boolean } | undefined> = [];
+    const drawn = { lines: [] as string[] };
+    const ui = {
+      notify() {},
+      setWidget(_key: string, value: unknown) {
+        if (typeof value !== "function") { drawn.lines = []; return; }
+        const tui = { requestRender: () => { drawn.lines = component.render(100); } };
+        const component = (value as (tui: object, theme: object) => { render(width: number): string[] })(tui, { fg: (_c: string, text: string) => text, bold: (text: string) => text, bg: (_c: string, text: string) => text });
+        drawn.lines = component.render(100);
+      },
+      onTerminalInput: (handler: (data: string) => { consume?: boolean } | undefined) => { inputs.push(handler); return () => {}; },
+    };
+    const session = { cwd, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "session", getEntries: () => [] }, ui };
+    const key = (data: string): boolean => inputs.some((handler) => handler(data)?.consume === true);
+    for (const handler of handlers.get("session_start") ?? []) await handler(undefined, session);
+    assert.equal(drawn.lines.length, 0, "nothing runs yet");
+
+    loadingRegistry().observeSubagentStatus(status("sub-0"), { prompt: "work", mode: "background", label: "alpha" });
+    assert.ok(drawn.lines.some((line) => line.includes("Subagents")) && drawn.lines.some((line) => line.includes("alpha")), drawn.lines.join("\n"));
+    loadingRegistry().observeSubagentStatus(status("fg"), { prompt: "work", mode: "foreground", label: "fore" });
+    assert.ok(!drawn.lines.some((line) => line.includes("fore")), "a foreground subagent stays out of the widget");
+    for (const id of ids.slice(1)) loadingRegistry().observeSubagentStatus(status(id), { prompt: "work", mode: "background", label: id });
+
+    // /agents remembers its command context; the widget's Enter then opens the workspace on the row.
+    await commands.get("agents")?.("", { ...session, waitForIdle: async () => {} });
+    assert.equal(opened.length, 1);
+    assert.equal(key("\u001bo"), true, "the tree is taller than the frame, so the widget scrolls");
+    for (let press = 0; press < 20; press += 1) key("j");
+    key("\r");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(opened.map((entry) => entry.initialKey), [undefined, "subagent:sub-8"]);
+
+    const reopened = opened[1];
+    assert.ok(reopened?.initialKey);
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const workspace = await openHarness([], { source: reopened.agents, initialKey: reopened.initialKey });
+    await settle();
+    assert.match(title(workspace), /sub-8/, workspace.screen().join("\n"));
+    assert.ok(sidebarRows(workspace).some((row) => row.startsWith("→") && row.includes("sub-8")), sidebarRows(workspace).join("\n"));
+    await leave(workspace);
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler(undefined, session);
+  } finally {
+    clearSubagentManager(manager);
+    rmSync(home, { recursive: true, force: true });
+  }
 });

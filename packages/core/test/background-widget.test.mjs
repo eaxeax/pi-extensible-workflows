@@ -6,6 +6,7 @@ import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import widget, { formatCost, renderReceipt, __navigationForTests } from "../dist/src/background-widget.js";
 import { RunStore } from "../dist/src/persistence.js";
+import { subagentsInWorkflowWidget } from "../dist/src/subagent-widget-flag.js";
 import {
   WORKFLOW_AGENT_STATE_CHANGED_EVENT,
   WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT,
@@ -141,7 +142,7 @@ function harness(sessionId = "session-1", options = {}) {
     },
   };
 
-  const controller = widget(pi, options.backgroundWidget ?? true, options.opener, options.layout);
+  const controller = widget(pi, options.backgroundWidget ?? true, options.opener, options.layout, options.subagents);
   return {
     context,
     controller,
@@ -2499,4 +2500,251 @@ void test("scopes layout: folded groups under budget are counted once", () => {
   const text = drawAt(host, 120).map(plain).join("\n");
   assert.doesNotMatch(text, /\(\d+ agents?\)[\s\S]*… \d+ done/, text);
   host.shutdown();
+});
+
+/** A background subagent as the core host observes it: its latest status and the request that started it. */
+function backgroundSubagent(id, label, extra = {}) {
+  const now = Date.now();
+  return {
+    status: {
+      id,
+      sessionId: "session-1",
+      state: "running",
+      startedAt: now - 5_000,
+      progress: { lastEventAt: now, toolCalls: [], accounting: { input: 1_000, output: 200, cacheRead: 0, cacheWrite: 0, cost: 0.01 }, state: { model: { provider: "p", model: "sub-model" } } },
+      ...extra.status,
+    },
+    request: { prompt: "work", mode: "background", label, ...extra.request },
+  };
+}
+
+function quietSubagent(id, label, silentMs = 4 * 60_000) {
+  const entry = backgroundSubagent(id, label);
+  return { ...entry, status: { ...entry.status, progress: { ...entry.status.progress, lastEventAt: Date.now() - silentMs } } };
+}
+
+/** Runs and background subagents in one widget; `set` changes a subagent and tells the widget, as the host's observer does. */
+function subagentHost(runs, subagents, options = {}) {
+  const live = new Map(subagents.map((entry) => [entry.status.id, entry]));
+  const host = startRuns(runs, { ...options, subagents: () => live.values() });
+  host.controller.subagentsChanged();
+  return { host, live, set: (entry) => { live.set(entry.status.id, entry); host.controller.subagentsChanged(); } };
+}
+
+void test("background subagents draw as one Subagents group after the runs, a row each, and the title counts them", () => {
+  const { host, set } = subagentHost([{ id: "run-1", workflowName: "flow", agents: [agent("a1", "scout", "running")] }], [
+    backgroundSubagent("s1", "alpha"),
+    backgroundSubagent("s2", "beta", { status: { attempts: 2 } }),
+    backgroundSubagent("s3", "foreground", { request: { mode: "foreground" } }),
+    backgroundSubagent("s4", "finished", { status: { state: "completed" } }),
+  ]);
+  for (const width of [120, 70, 40]) assertFits(drawAt(host, width), width);
+  const frame = drawAt(host, 120).map(stableLine);
+  const text = frame.join("\n");
+  assert.match(frame[0], /^╭ Workflows · 1 run · 2 subagents ─/, text);
+  const at = (pattern) => frame.findIndex((line) => pattern.test(line));
+  assert.ok(at(/⣷ flow/) > 0 && at(/scout/) > at(/⣷ flow/), text);
+  assert.ok(at(/Subagents/) > at(/scout/), `the group comes after the runs\n${text}`);
+  assert.match(frame[at(/alpha/)], /^│ {3}├─ ⣷ alpha +sub-model · 1\.2kt · \$0\.01 · 00:00 │$/, text);
+  assert.match(frame[at(/beta/)], /^│ {3}╰─ ⣷ beta +sub-model · 1\.2kt · \$0\.01 · 00:00 · attempt 2 │$/, text);
+  assert.ok(at(/beta/) > at(/alpha/) && at(/alpha/) > at(/Subagents/), text);
+  assert.ok(!/foreground|finished/.test(text), `foreground and settled subagents are not drawn\n${text}`);
+  // A status the observer reports reaches the frame.
+  set(backgroundSubagent("s5", "gamma"));
+  assert.match(drawAt(host, 120)[0], /^╭ Workflows · 1 run · 3 subagents /);
+  assert.ok(drawAt(host, 120).some((line) => /gamma/.test(line)));
+  set(backgroundSubagent("s1", "alpha", { status: { state: "failed" } }));
+  assert.ok(!drawAt(host, 120).some((line) => /alpha/.test(line)), "a settled subagent leaves the group");
+  host.shutdown();
+});
+
+void test("with only subagents running the widget still shows, and clears when the last one settles", () => {
+  const { host, set } = subagentHost([], [backgroundSubagent("s1", "alpha"), quietSubagent("s2", "beta")]);
+  for (const width of [120, 70, 40]) assertFits(drawAt(host, width), width);
+  const frame = drawAt(host, 120).map(stableLine);
+  assert.match(frame[0], /^╭ Workflows · 2 subagents · ⚠ 1 quiet ─/, frame.join("\n"));
+  assert.match(frame[1], /^│ ⣷ Subagents/);
+  assert.ok(drawAt(host, 120).some((line) => /^│ {3}╰─ ⚠ beta {2}quiet 04:00 /.test(line)), frame.join("\n"));
+  set(backgroundSubagent("s1", "alpha", { status: { state: "completed" } }));
+  set(backgroundSubagent("s2", "beta", { status: { state: "stopped" } }));
+  assert.equal(host.frames.at(-1), undefined, "the frame is cleared");
+  host.shutdown();
+});
+
+void test("a frame without subagents is byte-identical to one drawn without the subagent reader, in both layouts", () => {
+  for (const layout of ["phases", "scopes"]) {
+    const runs = [lanesRun(), { id: "run-2", workflowName: "two", agents: [silentAgent("q1", "asker")] }];
+    const without = startRuns(runs, { layout });
+    const { host: empty } = subagentHost(runs, [], { layout });
+    // Colours kept: only the spinner glyph and the clocks, which move between two draws, are normalized.
+    const raw = (line) => line.replace(/[⣷⣯⣟⡿⢿⣽⣻]/g, "⣷").replace(/\b\d{2}:\d{2}\b/g, "00:00");
+    for (const width of [120, 70, 40]) assert.deepEqual(empty.widgets.at(-1)(empty.tui, theme).render(width).map(raw), without.widgets.at(-1)(without.tui, theme).render(width).map(raw), `${layout} at ${String(width)}`);
+    without.shutdown();
+    empty.shutdown();
+  }
+});
+
+void test("many subagents and runs share the ten rows: headers stay, folded subagents become a marker inside the group", () => {
+  const runs = [0, 1, 2].map((index) => ({ id: `run-${String(index)}`, workflowName: `flow${String(index)}`, agents: many2(`r${String(index)}a`, 3, "running") }));
+  const subagents = Array.from({ length: 10 }, (_, index) => backgroundSubagent(`s${String(index)}`, `sub-${String(index)}`));
+  const { host } = subagentHost(runs, subagents);
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(host, width);
+    assertFits(frame, width);
+    const text = frame.join("\n");
+    for (let index = 0; index < 3; index += 1) assert.match(text, new RegExp(`flow${String(index)}`), text);
+    assert.match(text, /Subagents/, text);
+    assert.doesNotMatch(text, /more runs?/, text);
+  }
+  const frame = drawAt(host, 120).map(stableLine);
+  const text = frame.join("\n");
+  const group = frame.findIndex((line) => /Subagents/.test(line));
+  assert.ok(frame.slice(group + 1).some((line) => /^│ {3}(├─|╰─) … \d+ more/.test(line)), `the group's folded rows leave a marker inside it\n${text}`);
+  assert.match(frame[0], /^╭ Workflows · 3 runs · 10 subagents /, text);
+  host.shutdown();
+});
+
+void test("a quiet subagent ranks like a quiet agent: it is kept when its siblings fold, and the title counts it", () => {
+  const subagents = [...Array.from({ length: 11 }, (_, index) => backgroundSubagent(`s${String(index)}`, `sub-${String(index)}`)), quietSubagent("q", "asker", 11 * 60_000)];
+  const { host } = subagentHost([{ id: "run-1", workflowName: "flow", agents: many2("d", 6, "completed") }], subagents);
+  for (const width of [120, 70, 40]) assertFits(drawAt(host, width), width);
+  const frame = drawAt(host, 120).map(stableLine);
+  const text = frame.join("\n");
+  assert.match(frame[0], /^╭ Workflows · 1 run · 12 subagents · ⚠ 1 quiet /, text);
+  assert.ok(drawAt(host, 120).some((line) => /⚠ asker {2}stalled 11:00/.test(line)), text);
+  assert.ok(frame.some((line) => /flow/.test(line)), text);
+  host.shutdown();
+});
+
+void test("the scroll cursor walks the group and its rows; left and right fold it, enter opens subagents or the subagent", () => {
+  __navigationForTests.enabled = true;
+  const opened = [];
+  const root = mkdtempSync(join(tmpdir(), "widget-subagent-cursor-"));
+  const live = new Map([backgroundSubagent("s1", "alpha"), backgroundSubagent("s2", "beta")].map((entry) => [entry.status.id, entry]));
+  const host = harness("session-1", { opener: { available: () => true, open: (_context, key) => { opened.push(key); } }, subagents: () => live.values() });
+  host.start();
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: writeRun(join(root, "run-1"), tallRun()), sessionId: "session-1" });
+  const draw = () => host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
+  const cursorLine = () => host.widgets.at(-1)(host.tui, { ...theme, fg: (_c, text) => text }).render(WIDTH).find((line) => line.includes("\u0001"))?.replaceAll("\u0001", "") ?? "";
+  assert.match(draw()[0], /Alt\+O to scroll/);
+  host.key("\u001bo");
+  for (let press = 0; press < 30; press += 1) host.key("j");
+  assert.match(cursorLine(), /beta/, "the last row is the last subagent");
+  host.key("\r");
+  assert.deepEqual(opened, ["subagent:s2"]);
+  host.key("\u001bo");
+  for (let press = 0; press < 30; press += 1) host.key("j");
+  host.key("k");
+  assert.match(cursorLine(), /alpha/);
+  host.key("k");
+  assert.match(cursorLine(), /Subagents/);
+  host.key("h");
+  assert.ok(!draw().some((line) => /alpha|beta/.test(line)), "folding the group hides its subagents");
+  assert.match(cursorLine(), /Subagents/);
+  host.key("l");
+  host.key("j");
+  assert.match(cursorLine(), /alpha/, "unfolding shows them again");
+  host.key("h");
+  assert.match(cursorLine(), /Subagents/, "left on a subagent folds its group and the cursor goes there");
+  host.key("l");
+  host.key("\r");
+  assert.deepEqual(opened, ["subagent:s2", "subagents"]);
+  for (const line of draw()) assert.ok(visibleWidth(line) <= WIDTH);
+  host.shutdown();
+});
+
+void test("the scopes layout gets the Subagents group too", () => {
+  const { host } = subagentHost([lanesRun()], [backgroundSubagent("s1", "alpha")], { layout: "scopes" });
+  for (const width of [120, 70, 40]) assertFits(drawAt(host, width), width);
+  const frame = drawAt(host, 120).map(stableLine);
+  const text = frame.join("\n");
+  assert.ok(frame.findIndex((line) => /Subagents/.test(line)) > frame.findIndex((line) => /workspace/.test(line)), text);
+  assert.ok(frame.some((line) => /╰─ ⣷ alpha/.test(line)), text);
+  host.shutdown();
+});
+
+void test("the widget holds the subagent flag while it is started with a subagent reader, and lets it go when it stops", () => {
+  assert.equal(subagentsInWorkflowWidget(), false);
+  const plainHost = harness();
+  plainHost.start();
+  assert.equal(subagentsInWorkflowWidget(), false, "a widget without subagents does not claim them");
+  plainHost.shutdown();
+  const disabled = harness("session-1", { backgroundWidget: false, subagents: () => [] });
+  assert.equal(subagentsInWorkflowWidget(), false);
+  const first = harness("session-1", { subagents: () => [] });
+  const second = harness("session-1", { subagents: () => [] });
+  first.start();
+  assert.equal(subagentsInWorkflowWidget(), true);
+  second.start();
+  second.shutdown();
+  assert.equal(subagentsInWorkflowWidget(), true, "another instance stopping leaves the flag to the first");
+  first.shutdown();
+  assert.equal(subagentsInWorkflowWidget(), false);
+  assert.equal(disabled.renderer, undefined);
+});
+
+/**
+ * How many subagents a plain frame accounts for: their own rows, a count on the group row,
+ * "… N more" markers inside the group and the bottom count of subagents whose group is folded.
+ */
+function subagentsAccounted(frame, labels) {
+  const group = frame.findIndex((line) => /Subagents/.test(line));
+  let total = frame.filter((line) => labels.test(line)).length;
+  if (group >= 0) {
+    total += Number(/Subagents \((\d+) more\)/.exec(frame[group])?.[1] ?? 0);
+    for (const line of frame.slice(group + 1)) total += Number(/^│ {3}(?:├─|╰─) … (\d+) more/.exec(line)?.[1] ?? 0);
+  }
+  for (const line of frame) total += Number(/… (?:\d+ more runs? · )?(\d+) subagents?/.exec(line)?.[1] ?? 0);
+  return total;
+}
+
+void test("a kept Subagents group whose subagents partly fold still accounts for every subagent", () => {
+  for (const count of [5, 7]) {
+    const runs = Array.from({ length: count }, (_, index) => ({ id: `run-${String(index)}`, workflowName: `flow${String(index)}`, agents: [agent(`r${String(index)}`, `work${String(index)}`, "running")] }));
+    const subagents = [...[0, 1, 2].map((index) => backgroundSubagent(`s${String(index)}`, `sub-${String(index)}`)), quietSubagent("q", "asker")];
+    const { host } = subagentHost(runs, subagents);
+    for (const width of [120, 70, 40]) {
+      const frame = drawAt(host, width);
+      assertFits(frame, width, `${String(count)} runs: `);
+      const text = frame.join("\n");
+      if (width > 40) assert.match(frame[0], new RegExp(`^╭ Workflows · ${String(count)} runs · 4 subagents · ⚠ 1 quiet`), text);
+      assert.ok(frame.some((line) => /Subagents/.test(line)), `the group row is kept\n${text}`);
+      // At 40 columns the label gives way to the model and numbers on the right, as an agent's does.
+      if (width > 40) assert.ok(frame.some((line) => /⚠ asker/.test(line)), `the quiet subagent is kept\n${text}`);
+      assert.ok(frame.filter((line) => /sub-model/.test(line)).length < 4, `some subagents fold\n${text}`);
+      assert.equal(subagentsAccounted(frame, /sub-model/), 4, `${String(count)} runs at ${String(width)}: every subagent is accounted for\n${text}`);
+    }
+    host.shutdown();
+  }
+});
+
+void test("when the runs push the Subagents group out, the bottom count names its subagents apart from the runs", () => {
+  const subagents = [0, 1, 2].map((index) => backgroundSubagent(`s${String(index)}`, `sub-${String(index)}`));
+  const twelve = Array.from({ length: 12 }, (_, index) => ({ id: `run-${String(index)}`, workflowName: `flow${String(index)}`, agents: [agent(`r${String(index)}`, `work${String(index)}`, "running")] }));
+  const { host: many } = subagentHost(twelve, subagents);
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(many, width);
+    assertFits(frame, width, "12 runs: ");
+    const text = frame.join("\n");
+    // The title gives up its counts before it overflows a narrow frame.
+    if (width > 40) assert.match(frame[0], /^╭ Workflows · 12 runs · 3 subagents/, text);
+    assert.ok(!frame.some((line) => /Subagents|sub-\d/.test(line)), `the group is folded\n${text}`);
+    const hidden = 12 - frame.filter((line) => /flow\d+ ·/.test(line)).length;
+    assert.match(frame.at(-2), new RegExp(`… ${String(hidden)} more runs · 3 subagents`), text);
+  }
+  many.shutdown();
+
+  const quietRuns = [0, 1].map((index) => ({ id: `run-${String(index)}`, workflowName: `flow${String(index)}`, agents: Array.from({ length: 4 }, (_, at) => silentAgent(`q${String(index)}-${String(at)}`, `asker${String(index)}-${String(at)}`)) }));
+  const { host: quiet } = subagentHost(quietRuns, subagents);
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(quiet, width);
+    assertFits(frame, width, "quiet runs: ");
+    const text = frame.join("\n");
+    if (width > 40) assert.match(frame[0], /^╭ Workflows · 2 runs · 3 subagents · ⚠ 8 quiet/, text);
+    assert.ok(frame.some((line) => /flow0/.test(line)) && frame.some((line) => /flow1/.test(line)), text);
+    assert.ok(!frame.some((line) => /Subagents|sub-\d/.test(line)), `the group is folded\n${text}`);
+    assert.match(frame.at(-2), /│ … 3 subagents +│$/, text);
+    assert.doesNotMatch(text, /more runs?/, text);
+  }
+  quiet.shutdown();
 });
