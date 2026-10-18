@@ -127,17 +127,23 @@ export const createTranscriptView: CreateTranscriptView = ({ ui, cwd }) => {
   const definitions = new Map([...BUILT_IN_TOOLS].map(([name, create]) => [name, create(cwd)] as const));
   let items: Item[] = [];
   let streaming: { readonly component: AssistantMessageComponent; readonly box: Container; message: AssistantMessage; tools: { readonly id: string; readonly name: string; readonly tool: ToolExecutionComponent }[] } | undefined;
+  /**
+   * Assistant messages that ended but whose records were not appended yet (Pi writes the record after message_end). They stay drawn
+   * until then, so the content does not shrink and spring back under a transcript scrolled up.
+   */
+  let finished: NonNullable<typeof streaming>[] = [];
   let expanded = false;
   /** Records left undrawn: the empty message Pi records when an accepted workflow_result aborts its session (agent-execution.ts), which Pi's components would draw as an error. */
   let hidden = new Set<Item>();
 
   function changed(): void {
-    root.children = [...items.flatMap((item) => hidden.has(item) ? [] : [item.child]), ...(streaming ? [streaming.box] : [])];
+    root.children = [...items.flatMap((item) => hidden.has(item) ? [] : [item.child]), ...finished.map(({ box }) => box), ...(streaming ? [streaming.box] : [])];
     ui.requestRender();
   }
   function clear(): void {
     items = [];
     streaming = undefined;
+    finished = [];
     hidden = new Set();
   }
   /** Pi's renderers print the arguments and details they get without removing terminal sequences: they reach them cleaned. */
@@ -264,6 +270,10 @@ export const createTranscriptView: CreateTranscriptView = ({ ui, cwd }) => {
     },
     append(records) {
       for (const record of records) items.push(build(record));
+      // Each assistant record takes the place of the oldest finished message, in the order Pi wrote them.
+      //NOTE: a record too large to read counts as one, as it may be the message; then that message disappears until its record is read.
+      const arrived = records.filter((record) => record.kind === "large" || (record.kind === "entry" && record.value.type === "message" && object(record.value.message) && record.value.message.role === "assistant")).length;
+      finished = finished.slice(arrived);
       pair();
       changed();
     },
@@ -284,7 +294,7 @@ export const createTranscriptView: CreateTranscriptView = ({ ui, cwd }) => {
       if (next === expanded) return;
       expanded = next;
       for (const item of items) for (const component of item.child.children) if (expandable(component)) component.setExpanded(next);
-      for (const { tool: component } of streaming?.tools ?? []) component.setExpanded(next);
+      for (const { tool: component } of [...finished, ...(streaming ? [streaming] : [])].flatMap((live) => live.tools)) component.setExpanded(next);
       changed();
     },
     live(event) {
@@ -300,7 +310,7 @@ export const createTranscriptView: CreateTranscriptView = ({ ui, cwd }) => {
         else appendDelta(streaming.message, event.assistantMessageEvent);
         streaming.component.updateContent(streaming.message, true);
         streamTools(streaming);
-      } else if (event.type === "message_end" && streaming) streaming = undefined;
+      } else if (event.type === "message_end" && streaming) { finished.push(streaming); streaming = undefined; }
       else return;
       changed();
     },

@@ -892,11 +892,13 @@ export function formatWorkflowPhaseDashboard(run: PersistedRun, snapshot: Readon
 function wrapNavigatorLine(text: string, width: number): string[] {
   return truncateToVisualLines(text, Number.MAX_SAFE_INTEGER, Math.max(1, width), 0).visualLines.map((line) => line.trimEnd());
 }
+/** The sidebar's columns beside details: 38% of the width less the 3-column separator, 24 to 42. */
+export function navigatorSidebarWidth(width: number): number { return Math.min(42, Math.max(24, Math.floor((width - 3) * 0.38))); }
 /** The navigator layout: a sidebar beside details at 80 columns or wider, otherwise one of them (or both stacked). */
 export function formatNavigatorColumns(sidebar: readonly string[], detail: readonly string[], width: number, layout: Readonly<{ treeOnly?: boolean | undefined; detailsOnly?: boolean | undefined; detailOffset?: number | undefined }> = {}): string[] {
   const safeWidth = Math.max(1, width);
   if (safeWidth >= 80) {
-    const sidebarWidth = Math.min(42, Math.max(24, Math.floor((safeWidth - 3) * 0.38)));
+    const sidebarWidth = navigatorSidebarWidth(safeWidth);
     const left = sidebar.flatMap((line) => wrapNavigatorLine(line, sidebarWidth));
     const wrapped = detail.flatMap((line) => wrapNavigatorLine(line, safeWidth - sidebarWidth - 3));
     // Keep the details in view when the tree is scrolled, without making the block taller than the tree.

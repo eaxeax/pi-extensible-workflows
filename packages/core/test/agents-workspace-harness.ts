@@ -248,7 +248,7 @@ export interface FakePi {
  * `fail` makes opening fail before the workspace exists (the cursor query) or after it was built (the terminal's start);
  * `context` adds fields to the command context (cwd, mode, sessionManager, ...).
  */
-export function fakePi(options: { columns?: number | undefined; rows?: number | undefined; signal?: AbortSignal | undefined; fail?: "cursor" | "start" | undefined; context?: Readonly<Record<string, unknown>> | undefined } = {}): FakePi {
+export function fakePi(options: { columns?: number | undefined; rows?: number | undefined; signal?: AbortSignal | undefined; fail?: "cursor" | "start" | undefined; keybindings?: PiKeybindings | undefined; context?: Readonly<Record<string, unknown>> | undefined } = {}): FakePi {
   const terminal = new FakeTerminal(options.columns ?? 120, options.rows ?? 20);
   if (options.fail === "start") terminal.failStart = new Error("terminal unavailable");
   const parent: string[] = [];
@@ -292,7 +292,7 @@ export function fakePi(options: { columns?: number | undefined; rows?: number | 
             events.push("done");
             resolve(result);
           };
-          const component = factory(parentTui, THEME, KEYBINDINGS, done);
+          const component = factory(parentTui, THEME, options.keybindings ?? KEYBINDINGS, done);
           assert.ok(component.render(40).every((line) => visibleWidth(line) <= 40));
           // A component closed while it was built is not shown.
           if (!state.closed) { entry = { component, options: customOptions, close: () => { done(undefined as T); } }; customs.push(entry); }
@@ -355,6 +355,7 @@ export interface OpenOptions {
   state?: AgentsWorkspaceState;
   notices?: readonly string[];
   editorCommand?: () => string | undefined;
+  keybindings?: PiKeybindings;
 }
 
 /**
@@ -365,7 +366,7 @@ export interface OpenOptions {
  * `actions`, `state`, `notices` and `editorCommand` go to the workspace as they are.
  */
 export async function open(agents: Listed[], options: OpenOptions = {}): Promise<Harness> {
-  const pi = fakePi({ columns: options.columns, rows: options.rows, signal: options.signal, fail: options.fail });
+  const pi = fakePi({ columns: options.columns, rows: options.rows, signal: options.signal, fail: options.fail, keybindings: options.keybindings });
   const harness: Harness = Object.assign(pi, {
     agents, nodes: options.nodes, listError: undefined, listThrow: options.listThrow, listCalls: 0, opened: [], sources: [], views: [], left: false,
     done: Promise.resolve(), exit: undefined, parentAtExit: undefined,
