@@ -16,6 +16,8 @@ Install the core workflow extension for deterministic orchestration:
 pi install npm:pi-extensible-workflows
 ```
 
+In Pi's TUI, when the session has runs or subagents, `/workflow` and `/subagents` open the `/agents` workspace, scoped to runs or to subagents. Actions run from `a`, or `enter` on a node that is not an agent, through `src/workflow-actions.ts` and `subagents/src/actions.ts`.
+
 The core installation includes workflow orchestration, the `reviewLoop` starter, standalone subagent tools, and Trajectory. The starter ships `reviewLoop`, dynamic `developer-model`/`reviewer-model`/`scout-model`/`oracle-model`/`researcher-model` aliases, and slash-command prompts (`/scout`, `/parallel-scout`, `/oracle`, `/council`, `/review`, `/parallel-review`, `/review-loop`, `/deep-research`) that launch subagents or workflows with those roles. Role behavior requires explicitly installing and enabling the independent `@piewf/pi-ext-roles` Pi extension; core and CLI have no roles dependency. Static settings `modelAliases` shadow the dynamic resolvers. `reviewLoop` cannot be overridden: a duplicate name is `GLOBAL_COLLISION`. Disable optional entries with Pi package filters `"-dist/starter/index.js"`, `"-dist/subagents/index.js"`, and `"-dist/trajectory/index.js"`; keep `dist/src/index.js` for workflow tools. Package prompts are declared in the package manifest and are not removed by the starter filter. The same package-root paths apply to `pi install "$PWD/packages/core"`. See `docs/extensions.html#bundled-filters`. Add companion packages only for the capability you need:
 
 ```sh
@@ -203,7 +205,7 @@ export default function extension() {
 | `functions` | Named host functions with JSON schemas and `run(input, context)`. |
 | `modelAliases` | Named dynamic resolvers with `resolve(context)`. |
 | `agentSetupHooks` | Named trusted setup hooks with optional finite `priority`. |
-| `agentAttemptActions` | Named `/workflow` actions, optionally shared with `/subagents` through paired `visibleStandalone(context)` and `runStandalone(context)`, alongside `label`, synchronous `visible(context)`, and `run(context)`. |
+| `agentAttemptActions` | Named `/workflow` actions (in the workspace's `a` menu on an agent), optionally shared with `/subagents` through paired `visibleStandalone(context)` and `runStandalone(context)`, alongside `label`, synchronous `visible(context)`, and `run(context)`. |
 
 Unknown top-level extension keys are rejected. Function names must be identifier-shaped, globally unique, and must not be reserved globals such as `agent`, `args`, `JSON`, `extensions`, or `workflow_catalog`. Model alias names must match `[A-Za-z][A-Za-z0-9_-]*`. Hook and action names must be identifier-shaped and globally unique.
 
