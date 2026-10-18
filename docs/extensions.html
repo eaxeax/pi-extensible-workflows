@@ -76,7 +76,7 @@
     <span class="tok-punctuation">}</span>
   <span class="tok-punctuation">]</span>
 <span class="tok-punctuation">}</span></code></pre>
-        <p>The same exclusions apply to the documented source install, <code>pi install "$PWD/packages/core"</code>, because that directory is the package root. A repository-root package source loads the TypeScript source entries instead, so filters there use the <code>packages/core/</code> prefix with <code>.ts</code> paths. Restart Pi after changing the filter.</p>
+        <p>The same exclusions apply to <code>pi install "$PWD/packages/core"</code>, because that directory is the package root; it loads the checkout's own copy of Pi's packages, so a source install for development uses the repository root, <code>pi install "$PWD"</code>. The repository-root package loads the TypeScript source entries, so its filters are <code>"-packages/core/starter/index.ts"</code>, <code>"-packages/core/subagents/index.ts"</code>, and <code>"-packages/core/trajectory/index.ts"</code>, and <code>packages/core/src/index.ts</code> stays for workflow tools. Restart Pi after changing the filter.</p>
       </section>
       <section id="starter">
         <h2>Bundled starter</h2>

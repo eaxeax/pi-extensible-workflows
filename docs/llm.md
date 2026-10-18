@@ -16,7 +16,7 @@ Install the core workflow extension for deterministic orchestration:
 pi install npm:pi-extensible-workflows
 ```
 
-The core installation includes workflow orchestration, the `reviewLoop` starter, standalone subagent tools, and Trajectory. The starter ships `reviewLoop`, dynamic `developer-model`/`reviewer-model`/`scout-model`/`oracle-model`/`researcher-model` aliases, and slash-command prompts (`/scout`, `/parallel-scout`, `/oracle`, `/council`, `/review`, `/parallel-review`, `/review-loop`, `/deep-research`) that launch subagents or workflows with those roles. Role behavior requires explicitly installing and enabling the independent `@piewf/pi-ext-roles` Pi extension; core and CLI have no roles dependency. Static settings `modelAliases` shadow the dynamic resolvers. `reviewLoop` cannot be overridden: a duplicate name is `GLOBAL_COLLISION`. Disable optional entries with Pi package filters `"-dist/starter/index.js"`, `"-dist/subagents/index.js"`, and `"-dist/trajectory/index.js"`; keep `dist/src/index.js` for workflow tools. Package prompts are declared in the package manifest and are not removed by the starter filter. The same package-root paths apply to `pi install "$PWD/packages/core"`. See `docs/extensions.html#bundled-filters`. Add companion packages only for the capability you need:
+The core installation includes workflow orchestration, the `reviewLoop` starter, standalone subagent tools, and Trajectory. The starter ships `reviewLoop`, dynamic `developer-model`/`reviewer-model`/`scout-model`/`oracle-model`/`researcher-model` aliases, and slash-command prompts (`/scout`, `/parallel-scout`, `/oracle`, `/council`, `/review`, `/parallel-review`, `/review-loop`, `/deep-research`) that launch subagents or workflows with those roles. Role behavior requires explicitly installing and enabling the independent `@piewf/pi-ext-roles` Pi extension; core and CLI have no roles dependency. Static settings `modelAliases` shadow the dynamic resolvers. `reviewLoop` cannot be overridden: a duplicate name is `GLOBAL_COLLISION`. Disable optional entries with Pi package filters `"-dist/starter/index.js"`, `"-dist/subagents/index.js"`, and `"-dist/trajectory/index.js"`; keep `dist/src/index.js` for workflow tools. Package prompts are declared in the package manifest and are not removed by the starter filter. The same package-root paths apply to `pi install "$PWD/packages/core"`, which loads the checkout's own copy of Pi's packages; a source install for development uses the repository root (`pi install "$PWD"`), whose filters are `"-packages/core/starter/index.ts"`, `"-packages/core/subagents/index.ts"`, and `"-packages/core/trajectory/index.ts"`, keeping `packages/core/src/index.ts`. See `docs/extensions.html#bundled-filters`. Add companion packages only for the capability you need:
 
 ```sh
 pi install npm:@piewf/herdr
@@ -36,7 +36,7 @@ git clone https://github.com/vekexasia/pi-extensible-workflows.git
 cd pi-extensible-workflows
 npm ci
 npm run check
-pi install "$PWD/packages/core"
+pi install "$PWD"
 ```
 
 A one-session source run is:

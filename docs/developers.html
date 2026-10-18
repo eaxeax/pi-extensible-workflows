@@ -51,7 +51,8 @@
 <span class="tok-command">cd</span> pi-extensible-workflows
 <span class="tok-command">npm</span> ci
 <span class="tok-command">npm</span> run check
-<span class="tok-command">pi</span> install "$PWD/packages/core"</code></pre>
+<span class="tok-command">pi</span> install "$PWD"</code></pre>
+        <p>A source install for development uses the repository root, which loads the TypeScript sources with Pi's own packages. <code>pi install "$PWD/packages/core"</code> loads the built <code>dist</code> files, which resolve the checkout's own copy of Pi's packages (a development dependency) instead of the copy Pi provides.</p>
         <p>Core and CLI install and operate without <code>@piewf/pi-ext-roles</code>. Roles are an optional extension. See <a href="roles.html#migration">role migration</a> and <a href="../RELEASING.md">release gating</a>.</p>
         <p>For a one-session trial without changing Pi settings:</p>
         <pre><code class="language-shell"><span class="tok-command">pi</span> --no-extensions --extension "$PWD/packages/core/src/index.ts"</code></pre>
