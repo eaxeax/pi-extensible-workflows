@@ -55,10 +55,7 @@ void test("the other pi session entries and message roles show their text; usage
   assert.deepEqual(recordBlocks(entry(150, { type: "future_entry" })), [{ text: "future_entry", style: "dim" }]);
 });
 
-void test("agentActionLabels puts View transcript first only when asked", () => {
+void test("agentActionLabels lists the agent's actions", () => {
   const options = { extensionLabels: ["Ext"], hasWorktree: false, openPrompt: true, openSystemPrompt: false, openResult: false };
-  const without = agentActionLabels(options);
-  assert.deepEqual(without, ["Ext", "Open prompt in editor", "Copy agent ID", "Back"]);
-  assert.deepEqual(agentActionLabels({ ...options, viewTranscript: false }), without);
-  assert.deepEqual(agentActionLabels({ ...options, viewTranscript: true }), ["View transcript", ...without]);
+  assert.deepEqual(agentActionLabels(options), ["Ext", "Open prompt in editor", "Copy agent ID", "Back"]);
 });

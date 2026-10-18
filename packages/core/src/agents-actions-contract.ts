@@ -4,14 +4,14 @@ import type { WorkflowProgressStyles } from "./host-view.js";
 import type { WorkflowArtifact } from "./workflow-artifacts.js";
 
 /**
- * Ports of the actions /workflow and /subagents offer on a run, an agent or a subagent, so the /agents workspace, the
- * old dashboards and the rpc pickers run the same code.
+ * Ports of the actions /workflow and /subagents offer on a run, an agent or a subagent, so the /agents workspace, Pi's
+ * dialogs and the rpc pickers run the same code.
  *
  * Hexagonal: an AgentsActionProvider is the driving port. Its implementations hold the action rules and talk to the
  * host's run operations and the subagent manager; they never touch ctx.ui or a TUI. Whatever they ask of the person
  * goes through the driven port ActionUi, which the callers adapt: src/pi-action-ui.ts to Pi's own dialogs, the
- * workspace to its status row and an alternate-screen editor for the in-place actions, an old dashboard to its inline
- * confirm until it is removed.
+ * workspace's in-place adapter to its status row and an alternate-screen editor for copies and external editors, the rpc
+ * pickers to their own prompts.
  */
 
 /** What an action applies to; every SessionTreeNode of a run or of the Subagents group carries one. */
@@ -52,7 +52,7 @@ export interface ActionUi {
 
 /** Driving port: the actions of the targets one provider owns. */
 export interface AgentsActionProvider {
-  /** Labels in menu order for a target this provider owns, [] for any other; never "Back" or "View transcript". Reads current state on every call. */
+  /** Labels in menu order for a target this provider owns, [] for any other; never "Back". Reads current state on every call. */
   actions(target: AgentsActionTarget): Promise<readonly AgentsAction[]>;
   /**
    * Runs a label this provider offers now: it re-checks first, and a label no longer offered is reported through

@@ -1758,7 +1758,7 @@ void test("an in-place editor without a configured editor reports it in the stat
   }
 });
 
-void test("an abort while the editor runs restores Pi once, and the editor's exit does not bring the workspace back", async (t) => {
+void test("an abort while the editor runs leaves when the editor exits: Pi is started once and the workspace does not come back", async (t) => {
   timers(t);
   const escaped = escapes(t);
   const external = editor();
@@ -1776,14 +1776,20 @@ void test("an abort while the editor runs restores Pi once, and the editor's exi
   const stopped = harness.terminal.written.length;
   assert.equal(harness.terminal.stops, 1, "the editor stopped the terminal");
   const cursorShown = harness.terminal.written.split(`${ESC}[?25h`).length;
+  let resolved = false;
+  void harness.done.then(() => { resolved = true; });
   controller.abort();
+  await settle();
+  assert.equal(harness.terminal.input, undefined, "no key reaches the workspace while the editor runs");
+  assert.deepEqual(harness.parent, ["stop:true"], "Pi stays stopped while the editor has the terminal");
+  assert.equal(resolved, false, "the workspace is not left while the editor runs");
+  external.release(0);
+  await until(() => finished === 1, "the editor exited");
   await harness.done;
   assert.equal(harness.exit, undefined);
   assert.deepEqual(harness.parent, ["stop:true", "start", "renderNow:false"], "Pi is back");
   assert.equal(harness.terminal.stops, 1, "leaving stops the terminal no second time");
   assert.equal(harness.terminal.written.split(`${ESC}[?25h`).length, cursorShown, "nor shows the cursor again");
-  external.release(0);
-  await until(() => finished === 1, "the editor exited");
   await settle();
   assert.ok(!harness.terminal.written.slice(stopped).includes(`${ESC}[?1049h`), "the alternate screen was not entered again");
   assert.equal(harness.terminal.input, undefined);

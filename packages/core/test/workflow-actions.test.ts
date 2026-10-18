@@ -163,7 +163,7 @@ async function agentFixture(actions: Readonly<Record<string, AgentAttemptAction>
   return { f, store, branch, path };
 }
 
-void test("agent labels drop View transcript and Back; copies and editors run in place", async () => {
+void test("agent labels have no View transcript and no Back; copies and editors run in place", async () => {
   const extension: AgentAttemptAction = { label: "Inspect attempt", visible: () => true, run: () => {} };
   const { f } = await agentFixture({ inspect: extension });
   const worktrees = await new RunStore(f.cwd, "session", "agents", f.home).worktrees();

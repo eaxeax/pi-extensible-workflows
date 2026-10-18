@@ -203,7 +203,7 @@ export function agentActionOptions(deps: WorkflowActionDependencies, ctx: Extens
     openResult: ctx.mode === "tui" && view.agentResults.has(agent.id),
   });
 }
-/** Runs one of the agent's labels other than View transcript and Back; a label it does not know does nothing. */
+/** Runs one of the agent's labels other than Back; a label it does not know does nothing. */
 export async function runAgentAction(deps: WorkflowActionDependencies, ui: ActionUi, view: WorkflowRunView, agent: AgentRecord, label: string): Promise<void> {
   const worktree = agentWorktree(view, agent);
   if (label === "Open prompt in editor") { if (agent.prompt !== undefined) await ui.openArtifact(workflowPromptArtifact(agent.prompt), "agent prompt"); return; }

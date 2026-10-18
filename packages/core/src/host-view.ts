@@ -680,13 +680,10 @@ export interface AgentActionPresentation {
   readonly openSystemPrompt: boolean;
   readonly openResult: boolean;
   readonly standaloneState?: "running" | "completed" | "failed" | "stopped";
-  /** Puts "View transcript" first, for dashboards that can show the agent's transcript. */
-  readonly viewTranscript?: boolean;
 }
 
 export function agentActionLabels(options: Readonly<AgentActionPresentation>): string[] {
   return [
-    ...(options.viewTranscript ? ["View transcript"] : []),
     ...options.extensionLabels,
     ...(options.hasWorktree ? ["Copy branch", "Copy worktree path"] : []),
     ...(options.openPrompt ? ["Open prompt in editor"] : []),
