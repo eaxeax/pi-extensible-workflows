@@ -75,6 +75,8 @@ Supported settings shape:
 {
   "concurrency": 8,
   "backgroundWidget": true,
+  "backgroundWidgetLayout": "phases",
+  "codemodeTools": "all",
   "modelAliases": {
     "reviewer-model": "anthropic/claude-fable-5:high"
   },
@@ -99,7 +101,7 @@ Trajectory also publishes current-session durable standalone subagents as first-
 
 ### Background workflow widget
 
-`backgroundWidget` is a global boolean that defaults to `true`. Set it to `false` to disable the live background-run tree and durable background-run transcript receipts. Foreground workflow rendering is unchanged. Headless and non-TUI hosts do not draw the widget or append receipts.
+`backgroundWidget` is a global boolean that defaults to `true`. Set it to `false` to disable the live background-run tree and durable background-run transcript receipts. Foreground workflow rendering is unchanged. Headless and non-TUI hosts do not draw the widget or append receipts. Background subagents show in the same frame as a "Subagents" group; the cursor and `enter` open `/agents` on the group or a subagent, and the subagents extension draws its own frame only when the core widget is not active (workflow extension not loaded or `backgroundWidget` false).
 
 ### Models and aliases
 
