@@ -31,6 +31,7 @@ import {
   type JsonValue,
 } from "../src/index.js";
 import type { PersistedRun } from "../src/persistence.js";
+import { canonicalPath } from "../src/paths.js";
 
 // ── Inputs ─────────────────────────────────────────────────────────────────
 
@@ -115,7 +116,8 @@ export class TestHarness {
    * Add fixtures with `addRun()`, then call `launch()`.
    */
   static create(options: { prefix?: string; model?: string; sessionId?: string; agentDir?: string; homeDir?: string; environment?: Readonly<Record<string, string>> } = {}): TestHarness {
-    const cwd = mkdtempSync(join(tmpdir(), `pi-wf-${options.prefix ?? "test"}-`));
+    // Pi runs in the shell's physical directory (macOS: /private/var/...), and the run store keys projects by the exact path.
+    const cwd = canonicalPath(mkdtempSync(join(tmpdir(), `pi-wf-${options.prefix ?? "test"}-`)));
     const sessionId = options.sessionId ?? randomUUID();
     return new TestHarness(cwd, sessionId, options.model, options.agentDir, options.homeDir, options.environment);
   }
