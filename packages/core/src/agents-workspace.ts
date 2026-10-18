@@ -10,7 +10,7 @@ import { errorText, sanitizeDisplayText } from "./utils.js";
 import { openArtifactInEditor, type WorkflowTui } from "./workflow-artifacts.js";
 
 const SEPARATOR = " │ ";
-/** Below this width the sidebar starts hidden; s still shows it. */
+/** Below this width the sidebar hides, at open and when the terminal narrows to it; s still shows it. */
 const SIDEBAR_MIN_COLUMNS = 80;
 /** Title and hint: one row each above and below the body. */
 const FIXED_ROWS = 2;
@@ -133,9 +133,10 @@ class Workspace {
   private tree: WorkflowPhaseTree = navigationTree([]);
   private selectedKey: string | undefined;
   /**
-   * The expansion of every key a list contained: its initiallyExpanded the first time a list contains it, so a later list never
-   * changes it (a run that finishes while shown does not collapse); then left/right, space, an icon click, and [, ] and the initial
-   * key for the ancestors of the agent they selected.
+   * The expansion of every key recorded: its initiallyExpanded the first time a list gives its node children (a phase listed
+   * before its first agent then expands as /workflow expands it), so a later list never changes it (a run that finishes while
+   * shown does not collapse); then left/right, space, an icon click, and [, ] and the initial key for the ancestors of the agent
+   * they selected.
    */
   private readonly expansion = new Map<string, boolean>();
   private listed = false;
@@ -152,6 +153,10 @@ class Workspace {
   private detailsScroll: ScrollView | undefined;
   private focus: "sidebar" | "transcript";
   private sidebarVisible: boolean;
+  /** The terminal has SIDEBAR_MIN_COLUMNS at least, as the last resize left it. */
+  private wide: boolean;
+  /** s hid the sidebar while the terminal was wide: a widening does not bring it back. */
+  private sidebarHidden: boolean;
   private expanded: boolean;
   /** d: an agent with details shows them instead of its transcript, for every agent selected until d again. */
   private detailsShown: boolean;
@@ -184,7 +189,10 @@ class Workspace {
     const state = options.state;
     this.restore = state;
     for (const [key, expanded] of state?.expansion ?? []) this.expansion.set(key, expanded);
-    this.sidebarVisible = alt.terminal.columns >= SIDEBAR_MIN_COLUMNS && (state?.sidebarVisible ?? true);
+    this.wide = alt.terminal.columns >= SIDEBAR_MIN_COLUMNS;
+    // A state's sidebar is the one the user wants (state()): hidden only when s hid it while it could show.
+    this.sidebarHidden = state?.sidebarVisible === false;
+    this.sidebarVisible = this.wide && !this.sidebarHidden;
     this.focus = this.sidebarVisible ? state?.focus ?? "sidebar" : "transcript";
     this.expanded = state?.toolsExpanded ?? false;
     this.detailsShown = state?.detailsShown ?? false;
@@ -212,14 +220,16 @@ class Workspace {
 
   /**
    * Starts the alt screen with the terminal's input going through gate() first: the alt screen's own listener (the page keys, its
-   * search box, the wheel) runs before any listener added later. The terminal's start is wrapped only while the alt screen starts;
-   * the terminal keeps the gated handler until it stops.
+   * search box, the wheel) runs before any listener added later; and every resize through resized() first, so that the frame the
+   * alt screen then draws has the sidebar it wants. The terminal's start is wrapped only while the alt screen starts; the terminal
+   * keeps the wrapped handlers until it stops.
    */
   start(): void {
     const terminal = this.alt.terminal;
     const own = Object.getOwnPropertyDescriptor(terminal, "start");
     const start = terminal.start.bind(terminal);
-    terminal.start = (onInput, onResize) => { start((data) => { this.gate(data, onInput); }, onResize); };
+    // The resize handler runs from the terminal's resize event: a throw must stay here.
+    terminal.start = (onInput, onResize) => { start((data) => { this.gate(data, onInput); }, () => { this.guard(() => { this.resized(); }); onResize(); }); };
     try { this.alt.start(); } finally {
       if (own) Object.defineProperty(terminal, "start", own);
       else Reflect.deleteProperty(terminal, "start");
@@ -270,6 +280,7 @@ class Workspace {
     else if (matchesKey(data, "ctrl+end")) this.alt.scrollToBottom();
     else if (matchesKey(data, "s")) {
       this.sidebarVisible = !this.sidebarVisible;
+      this.sidebarHidden = !this.sidebarVisible && this.wide;
       this.focus = this.sidebarVisible ? "sidebar" : "transcript";
       this.rebuild();
     } else if (is("app.tools.expand")) {
@@ -287,6 +298,21 @@ class Workspace {
     return { consume: true };
   }
 
+  /**
+   * A resize across SIDEBAR_MIN_COLUMNS: narrower hides the sidebar, wider shows it again, focused, unless s hid it while the
+   * terminal was wide; a resize that stays on one side changes nothing, so s still decides there.
+   */
+  private resized(): void {
+    const wide = this.alt.terminal.columns >= SIDEBAR_MIN_COLUMNS;
+    if (wide === this.wide) return;
+    this.wide = wide;
+    const visible = wide && !this.sidebarHidden;
+    if (visible === this.sidebarVisible) return;
+    this.sidebarVisible = visible;
+    this.focus = visible ? "sidebar" : "transcript";
+    this.rebuild();
+  }
+
   private rebuild(): void {
     const transcript = new VStack([{ component: this.detailsScroll ?? this.shown?.scroll ?? this.placeholder, grow: 1, basis: 0 }, { component: this.status, shrink: 0 }]);
     // The sidebar sizes itself from the terminal width (basis auto); stack entries shrink by default, so fixed parts need shrink 0.
@@ -300,14 +326,17 @@ class Workspace {
   private hasDetails(node: SessionTreeNode): boolean { return node.details(this.styles, Date.now()).length > 0; }
   /** The right pane of the selected node's details, scrolled from the top. */
   private detailsPane(): ScrollView { return new ScrollView(this.details, { primary: true, scrollbar: "auto" }); }
-  /** What the workspace keeps when it steps aside for an action. */
+  /**
+   * What the workspace keeps when it steps aside for an action. The sidebar is the one the user wants: one hidden below 80 columns
+   * is kept shown and focused, so that it opens again as a widening brings it back; hidden only when s hid it while it could show.
+   */
   private state(): AgentsWorkspaceState {
     return {
       selectedKey: this.selectedKey,
       row: Math.max(0, this.visible().findIndex((node) => node.key === this.selectedKey)),
       expansion: [...this.expansion],
-      focus: this.focus,
-      sidebarVisible: this.sidebarVisible,
+      focus: !this.sidebarVisible && !this.sidebarHidden ? "sidebar" : this.focus,
+      sidebarVisible: !this.sidebarHidden,
       toolsExpanded: this.expanded,
       detailsShown: this.detailsShown,
     };
@@ -347,8 +376,9 @@ class Workspace {
   }
   /** Space and a click on the ▾/▸ icon: a node with children collapses or expands; any other node stays as it is. */
   private toggle(node: SessionTreeNode): void {
-    if ((this.tree.byId.get(node.key)?.children.length ?? 0) > 0) this.expansion.set(node.key, !this.isExpanded(node));
+    if (this.hasChildren(node)) this.expansion.set(node.key, !this.isExpanded(node));
   }
+  private hasChildren(node: SessionTreeNode): boolean { return (this.tree.byId.get(node.key)?.children.length ?? 0) > 0; }
 
   private refresh(): void {
     if (this.listing || this.finished) return;
@@ -381,9 +411,9 @@ class Workspace {
   }
   /**
    * A new list keeps the selection and the expansion by key; a removed node gives the selection to the node now at its row.
-   * A key listed for the first time takes its initiallyExpanded. Until a node is selected, the initial key (its ancestors
-   * expanded), else the state's selection, else the first agent node (its ancestors expanded), else the first node is selected.
-   * An open menu reads its labels again, or closes when its node or the node's target went away.
+   * A key takes its initiallyExpanded the first time a list gives its node children. Until a node is selected, the initial key
+   * (its ancestors expanded), else the state's selection, else the first agent node (its ancestors expanded), else the first node
+   * is selected. An open menu reads its labels again, or closes when its node or the node's target went away.
    */
   private apply(nodes: readonly SessionTreeNode[]): void {
     const row = this.visible().findIndex((node) => node.key === this.selectedKey);
@@ -391,7 +421,8 @@ class Workspace {
     this.nodes = nodes;
     this.byKey = new Map(nodes.map((node) => [node.key, node]));
     this.tree = navigationTree(nodes);
-    for (const node of nodes) if (!this.expansion.has(node.key)) this.expansion.set(node.key, node.initiallyExpanded);
+    // A node without children yet (a phase before its first agent) is not recorded: it takes its initiallyExpanded once it has some.
+    for (const node of nodes) if (!this.expansion.has(node.key) && this.hasChildren(node)) this.expansion.set(node.key, node.initiallyExpanded);
     let wanted = this.selectedNode();
     if (!wanted && this.selectedKey !== undefined) {
       const visible = this.visible();
@@ -567,6 +598,8 @@ class Workspace {
         this.editing = false;
         // A terminal that cannot start again goes back to Pi, which reports why the workspace closed.
         try { this.start(); } catch (error) { this.leave(undefined, error); throw error; }
+        // The terminal reported no resize while the editor had it: the width is measured again.
+        this.guard(() => { this.resized(); });
         this.alt.renderNow(true);
       },
       requestRender: (force) => { if (!this.finished && !this.editing) this.alt.requestRender(force); },

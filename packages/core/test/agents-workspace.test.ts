@@ -82,6 +82,62 @@ void test("the layout shows the title, the sidebar tree and the transcript at 12
   await leave(narrow);
 });
 
+/** The sidebar is drawn: its Subagents group header shows. */
+function sidebarShown(pi: FakePi): boolean { return pi.screen().some((line) => line.includes("▾ Subagents")); }
+
+void test("the sidebar hidden below 80 columns comes back focused when the terminal widens to 80 or more, and hides again when it narrows", async (t) => {
+  timers(t);
+  const harness = await open(AGENTS(), { columns: 70 });
+  assert.equal(sidebarShown(harness), false);
+  harness.terminal.resize(80);
+  assert.equal(sidebarShown(harness), true, "back at 80 columns");
+  assert.match(harness.screen().at(-1) ?? "", /^←→\/space fold/, "with the sidebar focused");
+  assert.deepEqual(sidebarRows(harness).slice(0, 2), ["  ▾ build a1b2 · ⠦", "→   ▾ alpha · ⠦"], "on the same node");
+  assert.ok(harness.screen().every((line) => visibleWidth(line) <= 80));
+  harness.terminal.resize(79);
+  assert.equal(sidebarShown(harness), false, "hidden again below 80 columns");
+  assert.match(harness.screen().at(-1) ?? "", /^↑↓ scroll/, "the transcript has the focus");
+  harness.send("s", "s");
+  assert.equal(sidebarShown(harness), false);
+  harness.terminal.resize(120);
+  assert.equal(sidebarShown(harness), true, "hidden with s while it could not show, it comes back");
+  assert.match(harness.screen().at(-1) ?? "", /^←→\/space fold/);
+  await leave(harness);
+});
+
+void test("a sidebar hidden with s while it could show stays hidden across a resize; s still toggles it", async (t) => {
+  timers(t);
+  const harness = await open(AGENTS());
+  harness.send("s");
+  for (const columns of [70, 120]) {
+    harness.terminal.resize(columns);
+    assert.equal(sidebarShown(harness), false, `${String(columns)} columns`);
+    assert.match(harness.screen().at(-1) ?? "", /^↑↓ scroll/);
+  }
+  harness.send("s");
+  assert.equal(sidebarShown(harness), true, "s shows it again");
+  harness.terminal.resize(70);
+  harness.terminal.resize(120);
+  assert.equal(sidebarShown(harness), true, "shown with s, it comes back after the terminal narrowed and widened");
+  await leave(harness);
+});
+
+void test("a resize that stays below 80 columns keeps a sidebar shown with s, and its focus", async (t) => {
+  timers(t);
+  const harness = await open(AGENTS(), { columns: 70 });
+  harness.send("s");
+  assert.equal(sidebarShown(harness), true);
+  harness.terminal.resize(71);
+  assert.equal(sidebarShown(harness), true, "still shown at 71 columns");
+  assert.match(harness.screen().at(-1) ?? "", /^←→\/space fold/, "the sidebar keeps the focus");
+  harness.send(KEY.tab);
+  harness.terminal.resize(75);
+  assert.equal(sidebarShown(harness), true, "still shown at 75 columns");
+  assert.match(harness.screen().at(-1) ?? "", /^↑↓ scroll/, "the transcript keeps the focus");
+  assert.ok(harness.screen().every((line) => visibleWidth(line) <= 75));
+  await leave(harness);
+});
+
 void test("pgup and pgdn scroll the transcript while the sidebar has focus", async (t) => {
   timers(t);
   const harness = await open(AGENTS(), { setup: (source) => { source.polls.push(polled(entries(0, 100))); } });
@@ -846,6 +902,52 @@ void test("expansion and selection survive a refresh that adds nodes; new nodes 
   await leave(harness);
 });
 
+void test("a phase listed before it has children is expanded once a later list gives it its first child, as /workflow expands it", async (t) => {
+  timers(t);
+  const root: Spec = { key: "run:R", kind: "run", label: "Workflow" };
+  const plan: Spec = { key: "P", parent: "run:R", label: "plan" };
+  const review: Spec = { key: "Q", parent: "run:R", label: "review" };
+  const harness = await open([], { nodes: tree([root, plan]) });
+  assert.deepEqual(sidebarRows(harness), ["→ ▾ Workflow · ⠦", "      plan · ⠦"], "the phase before its first agent has no icon");
+  harness.nodes = tree([root, plan, { key: "a", parent: "P", agent: agent("a") }, review]);
+  await advance(t);
+  assert.deepEqual(sidebarRows(harness), ["→ ▾ Workflow · ⠦", "    ▾ plan · ⠦", "      • a · ⠦", "      review · ⠦"], "its first child comes in view");
+  harness.nodes = tree([root, plan, { key: "a", parent: "P", agent: agent("a") }, review, { key: "b", parent: "Q", agent: agent("b") }]);
+  await advance(t);
+  assert.deepEqual(sidebarRows(harness), ["→ ▾ Workflow · ⠦", "    ▾ plan · ⠦", "      • a · ⠦", "    ▾ review · ⠦", "      • b · ⠦"], "also a phase first listed by a later list");
+  await leave(harness);
+});
+
+void test("a node listed before it has children that comes collapsed stays collapsed when a later list gives it its first child", async (t) => {
+  timers(t);
+  const root: Spec = { key: "run:R", kind: "run", label: "Workflow", state: "completed", expanded: false };
+  const harness = await open([], { nodes: tree([root]) });
+  assert.deepEqual(sidebarRows(harness), ["→   Workflow · ✓"]);
+  harness.nodes = tree([root, { key: "a", parent: "run:R", agent: agent("a", { state: "completed", running: false }) }]);
+  await advance(t);
+  assert.deepEqual(sidebarRows(harness), ["→ ▸ Workflow · ✓"], "collapsed, its first child hidden");
+  await leave(harness);
+});
+
+void test("a node the user collapsed stays collapsed through lists that take its children away and give them back", async (t) => {
+  timers(t);
+  const root: Spec = { key: "run:R", kind: "run", label: "Workflow" };
+  const plan: Spec = { key: "P", parent: "run:R", label: "plan" };
+  const harness = await open([], { nodes: tree([root, plan, { key: "a", parent: "P", agent: agent("a") }]) });
+  harness.send(KEY.left, KEY.left);
+  await settle();
+  assert.deepEqual(sidebarRows(harness), ["  ▾ Workflow · ⠦", "→   ▸ plan · ⠦"]);
+  harness.nodes = tree([root, plan]);
+  await advance(t);
+  assert.deepEqual(sidebarRows(harness), ["  ▾ Workflow · ⠦", "→     plan · ⠦"]);
+  harness.nodes = tree([root, plan, { key: "a", parent: "P", agent: agent("a") }, { key: "b", parent: "P", agent: agent("b") }]);
+  await advance(t);
+  assert.deepEqual(sidebarRows(harness), ["  ▾ Workflow · ⠦", "→   ▸ plan · ⠦"], "its children back, it stays as the user left it");
+  harness.send(" ");
+  assert.deepEqual(sidebarRows(harness), ["  ▾ Workflow · ⠦", "→   ▾ plan · ⠦", "      • a · ⠦", "      • b · ⠦"]);
+  await leave(harness);
+});
+
 void test("the initial key selects its agent and expands its ancestors; without one the first agent node is selected and shown", async (t) => {
   timers(t);
   const collapsed = (): Spec[] => TREE().map((spec) => spec.key === "P" || spec.key === "subagents" ? { ...spec, expanded: false } : spec);
@@ -1448,7 +1550,7 @@ void test("a label that needs Pi's dialogs leaves the workspace as esc does and 
   assert.deepEqual(harness.parentAtExit, ["stop:true", "start", "renderNow:false"], "Pi restarted before the promise resolved");
   assert.deepEqual(harness.exit && { ...harness.exit, state: { ...harness.exit.state, expansion: Object.fromEntries(harness.exit.state.expansion) } }, {
     target: RUN, label: "Stop",
-    state: { selectedKey: "O", row: 2, expansion: { "run:R": true, P: true, O: true, a: false, b: false, c: false, subagents: true, s: false }, focus: "sidebar", sidebarVisible: true, toolsExpanded: false, detailsShown: false },
+    state: { selectedKey: "O", row: 2, expansion: { "run:R": true, P: true, O: true, subagents: true }, focus: "sidebar", sidebarVisible: true, toolsExpanded: false, detailsShown: false },
   });
   assert.deepEqual(provider.runs, [], "the caller runs it with Pi's dialogs");
   assert.equal(harness.source("a").calls.at(-1), "close");
@@ -1612,6 +1714,35 @@ void test("an in-place editor leaves the alternate screen without writing the wo
   assert.deepEqual(harness.parent, ["stop:true", "start", "renderNow:false"]);
 });
 
+void test("a resize across 80 columns while the in-place editor has the terminal hides or shows the sidebar, with its focus, when the workspace comes back", async (t) => {
+  timers(t);
+  const external = editor();
+  let round = 0;
+  let finished = 0;
+  const provider = new FakeProvider({ run: inPlace("Open script in editor") }, async (_label, ui) => {
+    await ui.openArtifact({ extension: ".js", content: "return 1;" }, "script");
+    finished += 1;
+  });
+  const harness = await open([], { nodes: tree(TARGETED()), initialKey: "O", actions: [provider], editorCommand: () => external.command(round, 0) });
+  for (const [columns, shown] of [[70, false], [120, true]] as const) {
+    harness.send("a");
+    await settle();
+    harness.send(KEY.enter);
+    await until(() => existsSync(external.opened(round)), "the editor started");
+    assert.equal(harness.terminal.onResize, undefined, "no resize reaches the workspace while the editor has the terminal");
+    harness.terminal.columns = columns;
+    external.release(round);
+    await until(() => finished === round + 1, "the editor exited");
+    await settle();
+    assert.ok(harness.terminal.input, "the workspace is back");
+    assert.equal(sidebarShown(harness), shown, `${String(columns)} columns`);
+    assert.match(harness.screen().at(-1) ?? "", shown ? /^←→\/space fold/ : /^↑↓ scroll/, shown ? "the sidebar has the focus" : "the transcript has the focus");
+    assert.match(title(harness), /^O running/, "on the same node");
+    round += 1;
+  }
+  await leave(harness);
+});
+
 void test("an in-place editor without a configured editor reports it in the status row", async (t) => {
   timers(t);
   for (const editorCommand of [undefined, () => undefined]) {
@@ -1760,6 +1891,53 @@ void test("a state's sidebar stays hidden below 80 columns; its tools and d hold
   await leave(details);
 });
 
+/** Opens TARGETED at `columns`, presses `keys`, then steps aside for the selected agent's Stop: the state its exit keeps. */
+async function steppedAside(columns: number, ...keys: string[]): Promise<AgentsWorkspaceState> {
+  const harness = await open([], { columns, nodes: tree(TARGETED()), actions: [new FakeProvider({ "workflow-agent": steps("Stop") })] });
+  harness.send(...keys, "a");
+  await settle();
+  harness.send(KEY.enter);
+  await harness.done;
+  const exit = harness.exit;
+  assert.ok(exit);
+  assert.equal(exit.label, "Stop");
+  return exit.state;
+}
+
+void test("a sidebar hidden below 80 columns when the workspace stepped aside comes back focused when it opens again on a wide terminal", async (t) => {
+  timers(t);
+  const narrow = await steppedAside(70);
+  for (const columns of [120, 70]) {
+    const again = await open([], { columns, nodes: tree(TARGETED()), state: narrow });
+    if (columns === 70) {
+      assert.equal(sidebarShown(again), false, "still hidden below 80 columns");
+      assert.match(again.screen().at(-1) ?? "", /^↑↓ scroll/);
+      again.terminal.resize(120);
+    }
+    assert.equal(sidebarShown(again), true, `opened at ${String(columns)} columns`);
+    assert.match(again.screen().at(-1) ?? "", /^←→\/space fold/, "with the sidebar focused");
+    assert.match(title(again), /^#1\/4 a/, "on the same node");
+    await leave(again);
+  }
+});
+
+void test("a sidebar hidden with s while it could show stays hidden when the workspace stepped aside and opens again, also across a resize; s still shows it", async (t) => {
+  timers(t);
+  const hidden = await steppedAside(120, "s");
+  for (const columns of [70, 120]) {
+    const again = await open([], { columns, nodes: tree(TARGETED()), state: hidden });
+    assert.equal(sidebarShown(again), false, `opened at ${String(columns)} columns`);
+    if (columns === 120) again.terminal.resize(70);
+    again.terminal.resize(120);
+    assert.equal(sidebarShown(again), false, `opened at ${String(columns)} columns, then 120`);
+    assert.match(again.screen().at(-1) ?? "", /^↑↓ scroll/, "the transcript has the focus");
+    again.send("s");
+    assert.equal(sidebarShown(again), true, "s shows it");
+    assert.match(title(again), /^#1\/4 a/, "on the same node");
+    await leave(again);
+  }
+});
+
 void test("the exit's state is the workspace's at that moment and opens it again as it was", async (t) => {
   timers(t);
   const specs = TARGETED().map((spec) => spec.key === "b" ? { ...spec, details: ["Model: gpt-5"] } : spec);
@@ -1776,7 +1954,7 @@ void test("the exit's state is the workspace's at that moment and opens it again
   const exit = harness.exit;
   assert.ok(exit);
   assert.deepEqual(exit.target, { kind: "workflow-agent", runId: "R", agentId: "b" });
-  assert.deepEqual({ ...exit.state, expansion: Object.fromEntries(exit.state.expansion) }, { selectedKey: "b", row: 4, expansion: { "run:R": true, P: true, O: true, a: false, b: false, c: false, subagents: false, s: false }, focus: "transcript", sidebarVisible: true, toolsExpanded: true, detailsShown: true });
+  assert.deepEqual({ ...exit.state, expansion: Object.fromEntries(exit.state.expansion) }, { selectedKey: "b", row: 4, expansion: { "run:R": true, P: true, O: true, subagents: false }, focus: "transcript", sidebarVisible: true, toolsExpanded: true, detailsShown: true });
   const again = await open([], { nodes: tree(specs), actions: [provider], state: exit.state });
   assert.deepEqual(again.screen(), frame, "the same frame");
   assert.ok(again.view("b").calls.includes("expanded:true"));
