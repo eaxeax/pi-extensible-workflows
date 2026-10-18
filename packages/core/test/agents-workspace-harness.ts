@@ -137,8 +137,11 @@ export class FakeView implements TranscriptView {
 export class FakeLive implements TranscriptLiveStream {
   readonly listeners = new Set<(event: WorkflowAgentSessionEvent) => void>();
   unsubscribed = 0;
+  /** Events a subscriber gets synchronously while it subscribes, as a stream that replays the message being generated does. */
+  readonly replay: WorkflowAgentSessionEvent[] = [];
   subscribe(listener: (event: WorkflowAgentSessionEvent) => void): () => void {
     this.listeners.add(listener);
+    for (const event of this.replay) listener(event);
     return () => { this.unsubscribed += 1; this.listeners.delete(listener); };
   }
   emit(event: WorkflowAgentSessionEvent): void { for (const listener of this.listeners) listener(event); }

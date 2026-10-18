@@ -733,7 +733,7 @@ test("in the TUI /subagents closes its workspace with the empty notice once Dele
   }
 });
 
-test("/subagents in the TUI hands its workspace this session's subagents, their actions and the configured editor; one that fails to open warns once and the next /subagents opens it again", async () => {
+test("/subagents in the TUI hands its workspace this session's subagents, their actions and the configured editor; one that fails to open is reported once and the next /subagents opens it again", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagents-workspace-opener-"));
   const { storageDir, manager } = await workspaceRuns(cwd);
   const opens = [];
@@ -749,9 +749,9 @@ test("/subagents in the TUI hands its workspace this session's subagents, their 
   process.env.VISUAL = "configured-editor --wait";
   try {
     await command.handler("", context);
-    assert.deepEqual(notices, ["warning: Cannot inspect subagents: boom"]);
+    assert.deepEqual(notices, ["error: agents workspace failed: boom"]);
     await command.handler("", context);
-    assert.deepEqual(notices, ["warning: Cannot inspect subagents: boom"], "the next /subagents opens the workspace again");
+    assert.deepEqual(notices, ["error: agents workspace failed: boom"], "the next /subagents opens the workspace again");
     assert.equal(opens.length, 2);
     const { context: openedContext, options } = opens[1];
     assert.equal(openedContext, context);
