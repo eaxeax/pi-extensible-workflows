@@ -163,6 +163,8 @@ interface Shown {
   loadingEarlier: boolean;
   /** Set by a rejected loadEarlier: no retry on every frame; cleared by a reset or when the user scrolls away from the top. */
   earlierFailed: boolean;
+  /** The status line of the failed earlier load: a poll that succeeds leaves it; cleared with earlierFailed. */
+  earlierFailure: string | undefined;
   loadingRecord: boolean;
   status: TranscriptSourceStatus | undefined;
   reason: string | undefined;
@@ -195,6 +197,8 @@ class Workspace {
   private failure: string | undefined;
   /** The transcript of the selected node when it is an agent. */
   private shown: Shown | undefined;
+  /** The view being opened: it takes the events a stream replays while it is subscribed, before `shown` holds it. */
+  private opening: TranscriptView | undefined;
   /** The right pane of the selected node when it is not an agent, or an agent's on d; a new one for each selection. */
   private detailsScroll: ScrollView | undefined;
   private focus: "sidebar" | "transcript";
@@ -794,7 +798,7 @@ class Workspace {
     };
   }
   private open(agent: SessionAgent): Shown {
-    const base = { agent, identity: identity(agent), queue: Promise.resolve(), polling: true, pollInFlight: false, loadingEarlier: false, earlierFailed: false, loadingRecord: false, status: undefined, reason: undefined, failure: undefined, atStart: false };
+    const base = { agent, identity: identity(agent), queue: Promise.resolve(), polling: true, pollInFlight: false, loadingEarlier: false, earlierFailed: false, earlierFailure: undefined, loadingRecord: false, status: undefined, reason: undefined, failure: undefined, atStart: false };
     // The session file of an agent that is not owned is never opened.
     if (!agent.owned) return { ...base, source: undefined, view: undefined, unsubscribe: undefined, scroll: new TranscriptScroll(new Text("transcript unavailable", 0, 0), () => undefined) };
     let source: TranscriptSource | undefined;
@@ -804,7 +808,8 @@ class Workspace {
       source = this.options.openSource(agent);
       view = this.options.createView({ ui: this.alt, cwd: agent.cwd });
       view.setExpanded(this.expanded);
-      unsubscribe = this.subscribe(agent, view);
+      this.opening = view;
+      try { unsubscribe = this.subscribe(agent, view); } finally { this.opening = undefined; }
       const shown: Shown = { ...base, source, view, unsubscribe, scroll: new TranscriptScroll(view.component, () => { this.laidOut(); }) };
       const place = this.place;
       this.place = undefined;
@@ -821,7 +826,7 @@ class Workspace {
   private subscribe(agent: SessionAgent, view: TranscriptView): (() => void) | undefined {
     // The listener runs in the agent session's event emitter: a throw from the view must stay here.
     return agent.live?.subscribe((event) => {
-      if (this.shown?.view === view) this.guard(() => { view.live(event); this.alt.requestRender(); });
+      if (this.shown?.view === view || this.opening === view) this.guard(() => { view.live(event); this.alt.requestRender(); });
     });
   }
   /** Every step runs even when an earlier one throws: a view that fails to dispose still lets the source close. */
@@ -881,9 +886,11 @@ class Workspace {
     shown.reason = result.reason;
     shown.atStart = result.atStart;
     if (result.atStart) shown.scroll.giveUpRestore();
-    shown.failure = undefined;
+    shown.failure = shown.earlierFailure;
     if (result.reset) {
       shown.earlierFailed = false;
+      shown.earlierFailure = undefined;
+      shown.failure = undefined;
       view.reset();
       shown.scroll.cancelRestore();
       shown.scroll.scrollToEnd();
@@ -896,7 +903,12 @@ class Workspace {
     const shown = this.shown;
     const { source, view } = shown ?? {};
     if (!shown || !source || !view) return;
-    if (shown.scroll.scrollTop !== 0) { shown.earlierFailed = false; return; }
+    if (shown.scroll.scrollTop !== 0) {
+      shown.earlierFailed = false;
+      if (shown.failure === shown.earlierFailure) shown.failure = undefined;
+      shown.earlierFailure = undefined;
+      return;
+    }
     // Nothing more will load above: a saved place beyond the content is clamped to the top for good.
     if (shown.earlierFailed || shown.atStart || (shown.status !== undefined && shown.status !== "available")) shown.scroll.giveUpRestore();
     if (shown.loadingEarlier || shown.earlierFailed || shown.atStart || shown.status !== "available") return;
@@ -907,7 +919,7 @@ class Workspace {
       shown.atStart = result.atStart;
       if (result.atStart) shown.scroll.reachedStart();
       // A chunk the view could not take is not loaded again on every frame either.
-      shown.earlierFailed = !this.guard(() => {
+      const loaded = this.guard(() => {
         if (result.records.length > 0) {
           const width = this.transcriptWidth();
           const before = view.component.render(width).length;
@@ -916,10 +928,13 @@ class Workspace {
         }
         this.alt.requestRender();
       });
+      shown.earlierFailed = !loaded;
+      if (!loaded) shown.earlierFailure = shown.failure;
     }, (error: unknown) => {
       shown.loadingEarlier = false;
       shown.earlierFailed = true;
       this.failed(shown, error);
+      shown.earlierFailure = shown.failure;
     });
   }
   private loadLarge(): void {

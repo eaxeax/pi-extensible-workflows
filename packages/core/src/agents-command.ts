@@ -1,4 +1,5 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { errorText } from "./utils.js";
 import type { ActionUi, AgentsActionProvider, AgentsActionTarget } from "./agents-actions-contract.js";
 import type { AgentsWorkspaceExit, AgentsWorkspaceOptions, OpenAgentsWorkspace, SessionAgentsSource, SessionTreeNode } from "./agents-workspace-contract.js";
 
@@ -25,6 +26,11 @@ export interface AgentsWorkspaceLoop {
 async function listNodes(source: SessionAgentsSource): Promise<readonly SessionTreeNode[] | undefined> {
   try { return await source.list(); } catch { return undefined; }
 }
+/** The source whose first list() is `nodes`, already listed for the emptiness check; later lists go to the source (a refresh must see changes). */
+function seeded(source: SessionAgentsSource, nodes: readonly SessionTreeNode[]): SessionAgentsSource {
+  let first: readonly SessionTreeNode[] | undefined = nodes;
+  return { list: async () => { const seed = first; first = undefined; return seed ?? source.list(); } };
+}
 /** Whether `provider` offers `label` for `target` now; a provider that cannot be read offers nothing. */
 async function offers(provider: AgentsActionProvider, target: AgentsActionTarget, label: string): Promise<boolean> {
   try { return (await provider.actions(target)).some((action) => action.label === label); } catch { return false; }
@@ -47,14 +53,18 @@ async function runAction(providers: readonly AgentsActionProvider[], exit: Agent
  * Foreground resume) keeps Pi's screen until it settles.
  */
 export async function runAgentsWorkspace(ctx: ExtensionCommandContext, loop: AgentsWorkspaceLoop): Promise<void> {
-  if (globalLoops[LOOP_KEY]) { ctx.ui.notify("The agents workspace is already open.", "info"); return; }
+  if (globalLoops[LOOP_KEY]) { ctx.ui.notify("The agents workspace is already opening or open.", "info"); return; }
   globalLoops[LOOP_KEY] = true;
   try {
     let reopen: Pick<AgentsWorkspaceOptions, "initialKey" | "state" | "notices"> = loop.initialKey === undefined ? {} : { initialKey: loop.initialKey };
     for (;;) {
       const nodes = await listNodes(loop.options.agents);
       if (nodes !== undefined && !loop.hasContent(nodes)) { loop.onEmpty(); return; }
-      const exit = await loop.open(ctx, { ...loop.options, ...(loop.providers.length > 0 ? { actions: loop.providers } : {}), ...reopen });
+      const options = nodes === undefined ? loop.options : { ...loop.options, agents: seeded(loop.options.agents, nodes) };
+      let exit: AgentsWorkspaceExit | undefined;
+      // The same notice at the same level in /agents, /workflow and /subagents.
+      try { exit = await loop.open(ctx, { ...options, ...(loop.providers.length > 0 ? { actions: loop.providers } : {}), ...reopen }); }
+      catch (error) { ctx.ui.notify(`agents workspace failed: ${errorText(error)}`, "error"); return; }
       if (exit === undefined || ctx.signal?.aborted) return;
       const notices: string[] = [];
       const select = await runAction(loop.providers, exit, loop.actionUi((message) => { notices.push(message); }));

@@ -126,7 +126,7 @@ void test("the workspace opens again with the exit's state, the action's select 
   assert.equal(first.initialKey, "run:R:a");
   assert.equal("state" in first, false);
   assert.equal("notices" in first, false);
-  assert.equal(first.agents, loop.options.agents);
+  assert.deepEqual(await first.agents.list(), [NODE], "the first open lists what the loop listed");
   assert.equal(first.openSource, loop.options.openSource);
   assert.equal(first.createView, loop.options.createView);
   assert.equal(first.pollIntervalMs, 250);
@@ -134,7 +134,7 @@ void test("the workspace opens again with the exit's state, the action's select 
   assert.deepEqual(second.state, retried);
   assert.equal(second.initialKey, "subagent:t", "the new run after a Retry");
   assert.deepEqual(second.notices, ["Retried subagent s as t."]);
-  assert.equal(second.agents, loop.options.agents);
+  assert.deepEqual(await second.agents.list(), [NODE], "so does every reopen");
   assert.deepEqual(third.state, paused);
   assert.equal("initialKey" in third, false, "an action that selects nothing keeps the state's selection");
   assert.deepEqual(third.notices, ["Paused workflow W.", "Cannot pause twice."]);
@@ -204,7 +204,25 @@ void test("a source with nothing to show calls onEmpty and opens nothing, before
   assert.deepEqual(failingCalls, ["open", "status:undefined", "open"], "a list that fails opens the workspace, whose title says why");
 });
 
-void test("one loop at a time across bundles: a second one says the workspace is already open and opens nothing", async () => {
+void test("the list that decided whether to open is the workspace's first list; a list that failed, and every later one, goes to the source", async () => {
+  const later: SessionTreeNode = { ...NODE, key: "run:L", title: () => "Later" };
+  const seen: (readonly string[])[] = [];
+  const reading: OpenAgentsWorkspace = async (_ctx, options) => {
+    seen.push([(await options.agents.list()).map((node) => node.key).join(), (await options.agents.list()).map((node) => node.key).join()].filter(Boolean));
+    return undefined;
+  };
+  const seeded = loopOf(reading, [], [], {}, [[NODE], [later]]);
+  await runAgentsWorkspace(commandContext([]), seeded);
+  assert.deepEqual(seen, [["run:R", "run:L"]]);
+  assert.equal(seeded.listed(), 2, "the check, then the open's second list; its first list was the check's");
+  const failing = loopOf(reading, [], [], {}, [new Error("locked"), [later]]);
+  seen.length = 0;
+  await runAgentsWorkspace(commandContext([]), failing);
+  assert.deepEqual(seen, [["run:L", "run:L"]], "a failed list is not seeded: the workspace lists itself");
+  assert.equal(failing.listed(), 3, "the check failed; the open listed twice itself");
+});
+
+void test("one loop at a time across bundles: a second one says the workspace is already opening or open and opens nothing", async () => {
   const calls: string[] = [];
   let leave = (): void => {};
   const { open, opens } = opener([() => new Promise((resolve) => { leave = () => { resolve(undefined); }; })], calls);
@@ -216,7 +234,7 @@ void test("one loop at a time across bundles: a second one says the workspace is
   const second = opener([undefined]);
   const secondLoop = loopOf(second.open, [], []);
   await runAgentsWorkspace(commandContext(notices), secondLoop);
-  assert.deepEqual(notices, ["The agents workspace is already open."]);
+  assert.deepEqual(notices, ["The agents workspace is already opening or open."]);
   assert.equal(second.opens.length, 0);
   assert.equal(secondLoop.listed(), 0, "not even listed");
   leave();
@@ -226,12 +244,17 @@ void test("one loop at a time across bundles: a second one says the workspace is
   Reflect.set(globalThis, LOOP_KEY, true);
   const other: string[] = [];
   try { await runAgentsWorkspace(commandContext(other), loopOf(second.open, [], [])); } finally { Reflect.deleteProperty(globalThis, LOOP_KEY); }
-  assert.deepEqual(other, ["The agents workspace is already open."]);
+  assert.deepEqual(other, ["The agents workspace is already opening or open."]);
   assert.equal(second.opens.length, 0);
 
   // A loop that ends with a throw lets the next one run.
   const failing: OpenAgentsWorkspace = () => Promise.reject(new Error("boom"));
-  await assert.rejects(runAgentsWorkspace(commandContext([]), loopOf(failing, [], [])), /boom/);
+  const failed: string[] = [];
+  const levels: string[] = [];
+  const failingContext = { cwd: "/project", ui: { notify(message: string, level?: string) { failed.push(message); levels.push(String(level)); } } } as unknown as ExtensionCommandContext;
+  await runAgentsWorkspace(failingContext, loopOf(failing, [], []));
+  assert.deepEqual(failed, ["agents workspace failed: boom"], "a rejected opener is reported, not thrown");
+  assert.deepEqual(levels, ["error"]);
   await runAgentsWorkspace(commandContext([]), loopOf(second.open, [], []));
   assert.equal(second.opens.length, 1);
 });

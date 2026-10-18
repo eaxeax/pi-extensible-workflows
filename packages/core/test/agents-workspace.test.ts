@@ -287,6 +287,52 @@ void test("a click whose new view throws while drawing shows the error instead o
   await leave(harness);
 });
 
+void test("a stream that replays synchronously while the view subscribes reaches the view", async (t) => {
+  timers(t);
+  const live = new FakeLive();
+  live.replay.push({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "so far" } });
+  const harness = await open([agent("alpha", { live })]);
+  assert.ok(harness.view("alpha").calls.includes("live:message_update"), "the replayed event was not dropped");
+  await leave(harness);
+});
+
+void test("the failure of the earlier history stays in the status line through the next polls, until the user leaves the top or a read fails", async (t) => {
+  timers(t);
+  const harness = await open([agent("alpha")], { columns: 70, setup: (source) => {
+    source.polls.push(polled(entries(1000, 40)), polled([]), polled([]), new Error("permission denied"));
+    source.failEarlier = new Error("disk read failed");
+  } });
+  harness.screen();
+  harness.send(KEY.home);
+  harness.screen();
+  await settle();
+  assert.ok(harness.screen().some((line) => line.includes("transcript read failed: disk read failed")));
+  await advance(t);
+  assert.ok(harness.screen().some((line) => line.includes("transcript read failed: disk read failed")), "a poll that succeeded leaves it");
+  await advance(t);
+  assert.ok(harness.screen().some((line) => line.includes("transcript read failed: disk read failed")), "and so does the next");
+  await advance(t);
+  assert.ok(harness.screen().some((line) => line.includes("transcript read failed: permission denied")), "a failed poll replaces it");
+  await leave(harness);
+});
+
+void test("leaving the top clears the earlier history's failure", async (t) => {
+  timers(t);
+  const harness = await open([agent("alpha")], { columns: 70, setup: (source) => {
+    source.polls.push(polled(entries(1000, 40)));
+    source.failEarlier = new Error("disk read failed");
+  } });
+  harness.screen();
+  harness.send(KEY.home);
+  harness.screen();
+  await settle();
+  assert.ok(harness.screen().some((line) => line.includes("disk read failed")));
+  harness.send(KEY.pageDown);
+  harness.screen();
+  assert.ok(!harness.screen().some((line) => line.includes("disk read failed")));
+  await leave(harness);
+});
+
 void test("selecting another agent closes the previous source, unsubscribes its live stream and disposes its view", async (t) => {
   timers(t);
   const live = new FakeLive();
