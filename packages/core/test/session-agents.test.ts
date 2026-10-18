@@ -100,6 +100,8 @@ function fakePresenter(names: Readonly<Record<string, string>>, calls: (readonly
   };
 }
 
+const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
+
 void test("lists this session's workflow runs in attention order, each as its /workflow tree, with the agents' summary, attempt and keys", async () => {
   const { home, cwd } = fixture();
   // Whatever order readdir returns: the running run first, then the settled runs by the time they settled, newest first.
@@ -136,6 +138,12 @@ void test("lists this session's workflow runs in attention order, each as its /w
   assert.deepEqual(overlaid.sort(), [older, newer, active].sort(), "every run goes through overlayRun");
   assert.ok(nodes.every((node) => (node.kind === "agent") === (node.agent?.key === node.key)), "an agent node carries its agent, under the same key; no other node has one");
   assert.equal(nodes.find(({ key }) => key === `run:${active}:grandchild`)?.line(PLAIN, false, false), "          • helper · ○", "the label is display text");
+  // Agents outside any phase appear in the run's timeline and in the Unassigned node's details.
+  const unassignedRun = nodes.find(({ key }) => key === `run:${active}`)?.details(PLAIN, Date.now()) ?? [];
+  assert.match(unassignedRun.join("\n"), /Timeline {2}0s ── [\s\S]*Unassigned\s+Planner/);
+  const unassignedPhase = nodes.find(({ key }) => key === `run:${active}:node:phase/unassigned`)?.details(PLAIN, Date.now()) ?? [];
+  assert.ok(unassignedPhase.some((row) => /^Timeline {2}0s ── /.test(row)));
+  assert.equal(unassignedPhase.filter((row) => /Planner|worker|helper/.test(row)).length, 3);
   const agents = agentsOf(nodes);
   assert.deepEqual(agents.map(({ name }) => name), ["Planner", "worker", "helper", "solo", "only"]);
   assert.deepEqual(agents.map(({ state }) => state), ["running", "completed", "queued", "completed", "completed"]);
@@ -197,8 +205,27 @@ void test("a run with phases, a shell and parallel scopes gives the /workflow tr
   assert.equal(nodes[1]?.line(PLAIN, false, false), "    ▸ plan · ✓", "a collapsed node");
   // The details /workflow shows beside the tree, without its enter hints.
   const details = (key: string): readonly string[] => nodes.find((node) => node.key === key)?.details(PLAIN, now) ?? [];
-  assert.deepEqual(details("run:run"), ["Selected workflow: review flow", "Run ID: run", "Status: running", "agents completed=2 running=1 failed=0 cancelled=0 pending=1", "Agents: 4"]);
-  assert.deepEqual(details(review), ["Selected phase: review", "Status: running", "agents completed=1 running=1 failed=0 cancelled=0 pending=1", "Agents: 3", "Tokens: ∑1.2k ↑1.2k ↓0 ⇢0 ⇠0", "Cost: $0.38", "Elapsed: 30s"]);
+  const runDetails = details("run:run");
+  assert.deepEqual(runDetails.slice(0, 5), ["Selected workflow: review flow", "Run ID: run", "Status: running", "agents completed=2 running=1 failed=0 cancelled=0 pending=1", "Agents: 4"]);
+  assert.equal(runDetails[5], "", "a blank line before the timeline");
+  assert.equal(runDetails[6], "Timeline  0s ── 1m");
+  assert.equal(runDetails.length, 7 + 4, "one timeline row per agent");
+  assert.match(runDetails[7] ?? "", /^plan\s+planner/, "the first row carries its phase group and label");
+  const timelineRow = (rows: readonly string[], label: string): string => rows.map((line) => line.replace(ANSI, "")).find((line) => new RegExp(`^\\s*(?:\\S+\\s+)?${label}\\s`).test(line)) ?? "";
+  assert.match(timelineRow(runDetails, "planner"), /20s ✓$/, "a settled agent ends at its start plus duration");
+  assert.match(timelineRow(runDetails, "ui"), /10s ✓$/);
+  assert.match(timelineRow(runDetails, "api"), /30s ⠦$/, "a running agent grows to now");
+  assert.match(timelineRow(runDetails, "helper"), /○ queued/);
+  const phaseDetails = details(review);
+  assert.deepEqual(phaseDetails.slice(0, 7), ["Selected phase: review", "Status: running", "agents completed=1 running=1 failed=0 cancelled=0 pending=1", "Agents: 3", "Tokens: ∑1.2k ↑1.2k ↓0 ⇢0 ⇠0", "Cost: $0.38", "Elapsed: 30s"]);
+  assert.equal(phaseDetails[7], "");
+  assert.equal(phaseDetails[8], "Timeline  0s ── 30s");
+  assert.equal(phaseDetails.length, 9 + 3);
+  assert.deepEqual(phaseDetails.slice(9).map((line) => /(api|helper|ui)/.exec(line)?.[1]).sort(), ["api", "helper", "ui"]);
+  assert.doesNotMatch(phaseDetails.join("\n"), /planner/, "agents of other phases are absent");
+  assert.match(timelineRow(phaseDetails, "ui"), /10s ✓$/);
+  assert.match(timelineRow(phaseDetails, "api"), /30s ⠦$/);
+  assert.match(timelineRow(phaseDetails, "helper"), /○ queued/);
   assert.deepEqual(details(`${review}/operation/p/b`), ["Selected operation: p > b", "Phase: review", "Status: completed", "agents completed=1 running=0 failed=0 cancelled=0 pending=0", "Agents: 1", "Tokens: ∑400 ↑400 ↓0 ⇢0 ⇠0", "Cost: $0.13", "Elapsed: 10s"]);
   assert.deepEqual(details(`${review}/shell`).slice(0, 1), ["Selected shell"]);
   assert.deepEqual(details("run:run:api"), ["State: running", "Structural path: p > a", "Model: openai/gpt", "Tools: (none)", "Duration: 30s", "Tokens: ∑800 ↑800 ↓0 ⇢0 ⇠0", "Cost: $0.25"], "what d shows for an agent: /workflow's agent details");
@@ -401,7 +428,10 @@ void test("lists the subagents of this session after the runs and owns only thos
   // the state the /subagents order puts first.
   assert.equal(group.line(PLAIN, true, true), "→ ▾ Subagents  2 running · 1 failed · 1 stopped · 2 completed · $1.50");
   assert.equal(group.line(PLAIN, false, false), "  ▸ Subagents  2 running · 1 failed · 1 stopped · 2 completed · $1.50");
-  assert.deepEqual(group.details(PLAIN, Date.now()), ["Subagents", "2 running · 1 failed · 1 stopped · 2 completed · $1.50"]);
+  const groupDetails = group.details(PLAIN, Date.now());
+  assert.deepEqual(groupDetails.slice(0, 3), ["Subagents", "2 running · 1 failed · 1 stopped · 2 completed · $1.50", ""]);
+  assert.match(groupDetails[3] ?? "", /^Timeline {2}0s ── /);
+  assert.equal(groupDetails.length, 4 + 6, "one timeline row per subagent");
   assert.equal(group.title(PLAIN), "Subagents running");
   assert.equal(group.agent, undefined);
   // The rows of the /subagents list, one level down.
@@ -514,6 +544,23 @@ void test("the Subagents group's row is a header with its counts and cost, and t
   const busy = await group([row("sub-done", "completed", 0, { finishedAt: 2 }), row("sub-running", "running", 0)]);
   assert.equal(busy.initiallyExpanded, true, "a subagent runs");
   assert.equal(busy.line(PLAIN, false, true), "  ▾ Subagents  1 running · 1 completed");
+});
+
+void test("the Subagents group's timeline starts and ends at the subagents' status times", async () => {
+  const { home, cwd } = fixture();
+  const T = 1_000_000;
+  const row = (id: string, state: string, extra: Record<string, unknown>): Record<string, unknown> => ({ id, sessionId: "session", state, attempts: 1, progress: { accounting: ZERO, toolCalls: [] }, ...extra });
+  const manager = fakeManager([row("sub-done", "completed", { startedAt: T, finishedAt: T + 20_000 }), row("sub-live", "running", { startedAt: T + 10_000 })]);
+  const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => manager })).list();
+  const lines = nodes.find(({ key }) => key === "subagents")?.details(PLAIN, T + 30_000) ?? [];
+  assert.equal(lines[3], "Timeline  0s ── 30s");
+  const done = lines.find((line) => line.includes("sub-done")) ?? "";
+  const live = lines.find((line) => line.includes("sub-live")) ?? "";
+  assert.match(done, /20s ✓$/);
+  assert.match(live, /20s ⠦$/);
+  const cells = (line: string): string => /sub-\w+\s(.*)\s+\d+s /.exec(line)?.[1] ?? "";
+  assert.ok(cells(done).startsWith("█") && cells(live).startsWith(" "), "the later start sits further right");
+  assert.ok(cells(live).trimEnd().length > cells(done).trimEnd().length - 1);
 });
 
 void test("the workflows scope lists only the runs and the subagents scope only the Subagents group, without reading the other side", async () => {
