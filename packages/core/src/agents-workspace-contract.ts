@@ -44,6 +44,11 @@ export interface SessionAgent {
   /** One line of current activity while running. */
   readonly activity: string | undefined;
   readonly running: boolean;
+  /** Input plus output tokens and the cost of its accounting, for the session totals in the title; undefined when not known. */
+  readonly tokens?: number;
+  readonly cost?: number;
+  /** Its newest sign of life in ms (src/agent-activity.ts agentLastActivity for a workflow agent, the progress's last event for a subagent), for follow mode. */
+  readonly lastActivityAt?: number;
 }
 
 /**
@@ -81,6 +86,11 @@ export interface SessionTreeNode {
   readonly agent: SessionAgent | undefined;
   /** What the node's actions apply to; a node without one has no action menu. */
   readonly target?: AgentsActionTarget;
+  /**
+   * Why the node needs a person, when it does: a run header awaiting input or with its budget exhausted, a failed agent or
+   * subagent, a running workflow agent quiet or stalled by src/agent-activity.ts. `n` and `N` visit these nodes.
+   */
+  readonly needsPerson?: "awaiting_input" | "budget_exhausted" | "failed" | "quiet" | "stalled";
 }
 
 export interface SessionAgentsSource {
@@ -142,6 +152,10 @@ export interface AgentsWorkspaceState {
   readonly toolsExpanded: boolean;
   /** `d`: an agent's details shown instead of its transcript. */
   readonly detailsShown: boolean;
+  /** `f`: follow mode, the selection moving to the agent with the newest activity. */
+  readonly following?: boolean;
+  /** `/`: the sidebar filter text, when one is set. */
+  readonly filter?: string;
 }
 
 /** The workspace left for an action that needs Pi's dialogs: the caller runs it with Pi's UI and opens the workspace again with `state`. */

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { JsonValue } from "./types.js";
 import { errorText } from "./utils.js";
 
-export interface WorkflowArtifact { extension: ".js" | ".json" | ".md"; content: string }
+export interface WorkflowArtifact { extension: ".js" | ".json" | ".md" | ".diff"; content: string }
 export type WorkflowTui = { stop(): void; start(): void; requestRender(force?: boolean): void };
 
 export function workflowScriptArtifact(script: string): WorkflowArtifact { return { extension: ".js", content: script }; }

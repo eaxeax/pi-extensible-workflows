@@ -71,20 +71,20 @@ void test("/agents needs the TUI, says when the session has no agents, and opens
   await executeCommand(agents, "", context(cwd, "tui", notices));
   assert.deepEqual(notices.slice(1), ["No agents in this session."]);
   assert.equal(opened.length, 0, "no agents: the workspace does not open");
-  // A run whose tree has no agent yet (its root and declared phases only) is no agent either.
+  // A run whose tree has no agent yet (its root and declared phases only) is shown, as /workflow shows it.
   await createRun(home, cwd, [], "run-empty", ["plan"]);
   await executeCommand(agents, "", context(cwd, "tui", notices));
-  assert.deepEqual(notices.slice(2), ["No agents in this session."]);
-  assert.equal(opened.length, 0, "a tree without agents: the workspace does not open");
+  assert.equal(notices.length, 2);
+  assert.equal(opened.length, 1, "a run without agents: the workspace opens on it");
 
   const alpha = piSession(home, "ALPHA PROMPT");
   await createRun(home, cwd, [agent("alpha-id", "alpha", alpha)]);
   await executeCommand(agents, "", context(cwd, "tui", notices));
-  assert.equal(notices.length, 3);
-  assert.equal(opened.length, 1);
-  const options = opened[0]?.options;
+  assert.equal(notices.length, 2);
+  assert.equal(opened.length, 2);
+  const options = opened[1]?.options;
   assert.ok(options);
-  assert.equal(opened[0]?.cwd, cwd);
+  assert.equal(opened[1]?.cwd, cwd);
   assert.equal("initialKey" in options, false, "/agents selects the first agent");
   assert.equal(options.createView, createTranscriptView);
   const listed = await options.agents.list();
