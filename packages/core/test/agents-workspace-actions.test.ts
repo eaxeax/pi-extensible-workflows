@@ -93,7 +93,8 @@ function command(t: TestContext, cwd: string, options: CommandOptions, wiring: {
 const WORKSPACE_PLACEHOLDER = "opening agents…";
 /** The workspace is Pi's custom component and reads the terminal: not stepped aside, not in its external editor. */
 function workspaceOpen(pi: FakePi): boolean { return pi.terminal.input !== undefined && pi.customs.some(({ component }) => component.render(40)[0] === WORKSPACE_PLACEHOLDER); }
-function titleOf(pi: FakePi): string { return (pi.screen()[0] ?? "").trimEnd(); }
+/** The title row without the session totals the workspace right-aligns after two or more spaces. */
+function titleOf(pi: FakePi): string { return (pi.screen()[0] ?? "").replace(/ {2,}\S.*$/, "").trimEnd(); }
 /** Waits until the workspace is open, listed, with `title` in its title row. */
 async function shown(pi: FakePi, title: RegExp): Promise<void> {
   await until(() => workspaceOpen(pi) && title.test(titleOf(pi)), () => `the workspace open on ${String(title)}; it shows:\n${workspaceOpen(pi) ? pi.screen().join("\n") : "nothing"}\nPi saw:\n${pi.events.join("\n")}`);

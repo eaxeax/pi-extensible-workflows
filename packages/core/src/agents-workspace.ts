@@ -1,7 +1,8 @@
 import type { KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
-import { getKeybindings, HStack, isKeyRelease, matchesKey, parseKey, ScrollView, Text, TUI_KEYBINDINGS, truncateToWidth, TuiAltScreen, VStack, wrapTextWithAnsi, type Component, type Keybinding, type OverlayHandle, type OverlayOptions, type TuiInputListenerResult, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { getKeybindings, HStack, isKeyRelease, matchesKey, parseKey, ScrollView, Text, TUI_KEYBINDINGS, truncateToWidth, TuiAltScreen, visibleWidth, VStack, wrapTextWithAnsi, type Component, type Keybinding, type OverlayHandle, type OverlayOptions, type TuiInputListenerResult, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import type { ActionUi, AgentsAction, AgentsActionProvider, AgentsActionTarget } from "./agents-actions-contract.js";
 import type { AgentsWorkspaceExit, AgentsWorkspaceOptions, AgentsWorkspaceState, OpenAgentsWorkspace, SessionAgent, SessionTreeNode, TranscriptView } from "./agents-workspace-contract.js";
+import { formatCost, formatTokens } from "./background-widget.js";
 import { workflowKeyMatches } from "./host-navigator.js";
 import { navigateWorkflowPhaseTree, workflowPhaseTreeVisibleNodes, type WorkflowPhaseTree, type WorkflowPhaseTreeDirection, type WorkflowPhaseTreeNode } from "./host-phases.js";
 import { progressStyleForState, themeWorkflowProgressStyles, type WorkflowProgressStyles } from "./host-view.js";
@@ -176,7 +177,7 @@ class Workspace {
   private readonly styles: WorkflowProgressStyles;
   /** The refresh and poll ticks; started once the first list settled. */
   private timer: ReturnType<typeof setInterval> | undefined;
-  private readonly title = row(() => this.titleText());
+  private readonly title: Component = { render: (width) => [this.titleRow(Math.max(1, width))], invalidate() {} };
   private readonly hint = row(() => this.styles.dim(this.hintText()));
   private readonly status = row(() => this.statusText());
   private readonly sidebar: Component = { render: (width) => this.renderSidebar(width), handleMouse: (event) => this.sidebarMouse(event), invalidate() {} };
@@ -285,6 +286,7 @@ class Workspace {
     } else if (sidebar && (moves("tui.editor.cursorLeft") || moves("tui.editor.cursorRight"))) this.navigate(moves("tui.editor.cursorLeft") ? "left" : "right");
     else if (sidebar && matchesKey(data, "space")) { const node = this.selectedNode(); if (node) this.toggle(node); }
     else if (matchesKey(data, "[") || matchesKey(data, "]")) this.jump(matchesKey(data, "[") ? -1 : 1);
+    else if (matchesKey(data, "n") || matchesKey(data, "shift+n")) this.jump(matchesKey(data, "n") ? 1 : -1, (node) => node.needsPerson !== undefined);
     // The alt screen binds its top/bottom actions to home/end only; ctrl+home/ctrl+end reach the transcript here.
     else if (matchesKey(data, "ctrl+home")) this.alt.scrollToTop();
     else if (matchesKey(data, "ctrl+end")) this.alt.scrollToBottom();
@@ -368,10 +370,10 @@ class Workspace {
     const node = next.nodeId === undefined ? undefined : this.byKey.get(next.nodeId);
     if (node && node.key !== this.selectedKey) this.select(node);
   }
-  /** [ and ]: the agent before or after the selected node in sidebar order, hidden ones included, round at both ends; its ancestors are expanded. */
-  private jump(delta: number): void {
+  /** [ and ]: the agent (n and N: the node that needs a person) before or after the selected node in sidebar order, hidden ones included, round at both ends; its ancestors are expanded. */
+  private jump(delta: number, wanted: (node: SessionTreeNode) => boolean = (node) => node.agent !== undefined): void {
     const index = this.nodes.findIndex((node) => node.key === this.selectedKey);
-    const others = [...this.nodes.slice(index + 1), ...this.nodes.slice(0, Math.max(0, index))].filter((node) => node.agent !== undefined);
+    const others = [...this.nodes.slice(index + 1), ...this.nodes.slice(0, Math.max(0, index))].filter(wanted);
     const next = delta > 0 ? others[0] : others.at(-1);
     if (!next) return;
     this.reveal(next);
@@ -772,6 +774,22 @@ class Workspace {
     const state = clean(agent.state);
     return [position, this.styles.bold(clean(agent.name)), progressStyleForState(state, this.styles)(state), this.styles.muted(clean(agent.summary))].filter((part) => part).join(" ") + failure;
   }
+  /** The session's totals over the listed agents: "running/total agents · tokens · cost"; parts without data are left out. */
+  private totalsText(): string {
+    const agents = this.nodes.flatMap((node) => node.agent ?? []);
+    if (agents.length === 0) return "";
+    const tokens = agents.reduce((sum, { tokens: value }) => sum + (value ?? 0), 0);
+    const cost = agents.reduce((sum, { cost: value }) => sum + (value ?? 0), 0);
+    return [`${String(agents.filter(({ running }) => running).length)}/${String(agents.length)} running`, formatTokens(tokens), formatCost(cost)].filter((part) => part).join(" · ");
+  }
+  /** The title, with the totals at the right end when they fit beside it; the title keeps its width first. */
+  private titleRow(width: number): string {
+    const title = this.titleText();
+    const totals = this.totalsText();
+    const gap = width - visibleWidth(title) - visibleWidth(totals);
+    if (!totals || gap < 2) return truncateToWidth(title, width, "…");
+    return `${title}${" ".repeat(gap)}${this.styles.muted(totals)}`;
+  }
   /** The selected node's details as /workflow shows them, wrapped to the pane. */
   private detailsLines(width: number): string[] {
     const cell = Math.max(1, width);
@@ -784,6 +802,7 @@ class Workspace {
     return [
       this.focus === "sidebar" ? "←→/space fold" : "↑↓ scroll",
       "[ ] agent",
+      ...(this.nodes.some((candidate) => candidate.needsPerson !== undefined) ? ["n next"] : []),
       ...((this.options.actions ?? []).length > 0 ? ["a menu"] : []),
       ...(node?.agent && this.hasDetails(node) ? ["d details"] : []),
       ...(this.sidebarVisible ? [`${key("tui.input.tab", "tab")} focus`] : []),

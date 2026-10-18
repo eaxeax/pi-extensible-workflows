@@ -6,11 +6,11 @@ import test, { after } from "node:test";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import type { ActionUi, AgentsAction, AgentsActionProvider, AgentsActionTarget } from "../src/agents-actions-contract.js";
-import type { AgentsWorkspaceState } from "../src/agents-workspace-contract.js";
+import type { AgentsWorkspaceState, SessionTreeNode } from "../src/agents-workspace-contract.js";
 import { createLaunchSnapshot, DEFAULT_SETTINGS, formatWorkflowPhaseDashboard, RunStore, type AgentRecord, type PersistedRun, type RunState } from "../src/index.js";
 import { openAgentsWorkspace } from "../src/agents-workspace.js";
 import { createSessionAgentsSource } from "../src/session-agents.js";
-import { advance, agent, click, entries, entry, ESC, escapes, FakeLive, fakePi, KEY, large, leave, nodesOf, open, opened, paste, polled, polls, rowOf, rule, settle, sidebarColumn, sidebarRows, timers, title, topRow, tree, type FakePi, type Listed, type Spec } from "./agents-workspace-harness.js";
+import { advance, agent, click, entries, entry, ESC, escapes, FakeLive, fakePi, KEY, large, leave, nodesOf, open, opened, paste, polled, polls, rowOf, rule, settle, sidebarColumn, sidebarRows, timers, title as titleRow, topRow, tree, type FakePi, type Listed, type Spec } from "./agents-workspace-harness.js";
 
 const AGENTS = (): Listed[] => [agent("alpha"), agent("beta", { depth: 1, state: "completed", running: false }), agent("scout", { group: "Subagents", state: "failed", running: false })];
 /**
@@ -30,6 +30,9 @@ const TREE = (): Spec[] => [
   { key: "subagents", kind: "group", label: "Subagents" },
   { key: "s", parent: "subagents", agent: agent("s") },
 ];
+
+/** The title row without the session totals at its right end. */
+function title(pi: FakePi): string { return titleRow(pi).replace(/ {2,}\d+\/\d+ running.*$/, ""); }
 
 void test("the workspace opens over Pi on the alternate screen and restores Pi on esc, ctrl+c and abort", async (t) => {
   timers(t);
@@ -844,7 +847,7 @@ void test("a node that is not an agent shows its details: no source, no polling,
   harness.send(KEY.up);
   await settle();
   const lines = harness.screen();
-  assert.equal((lines[0] ?? "").trimEnd(), "O running", "the title is the node's label and state");
+  assert.equal((lines[0] ?? "").replace(/ {2,}\d+\/\d+ running.*$/, ""), "O running", "the title is the node's label and state");
   assert.match(lines[1] ?? "", /│ details of O\s*$/);
   assert.match(lines[2] ?? "", /│ state running\s*$/);
   assert.equal((lines.at(-2) ?? "").replace(/^.*│/, "").trim(), "", "no status line");
@@ -1164,7 +1167,7 @@ void test("a run's sidebar rows are its /workflow tree rows, its nodes show the 
   harness.send(KEY.down);
   await settle();
   const lines = harness.screen();
-  assert.equal((lines[0] ?? "").trimEnd(), "review running");
+  assert.equal((lines[0] ?? "").replace(/ {2,}\d+\/\d+ running.*$/, ""), "review running");
   const details = lines.slice(1, 9).map((line) => line.slice(line.indexOf("│") + 1).trim());
   assert.deepEqual(details.slice(0, 4), ["Selected phase: review", "Status: running", "agents completed=1 running=1 failed=0 cancelled=0 pending=1", "Agents: 3"]);
   assert.ok(details.some((line) => line.startsWith("Elapsed:")), "the phase's usage");
@@ -2080,4 +2083,79 @@ void test("the hint names a menu with providers, d details on an agent with deta
   pending.send(KEY.tab);
   assert.equal((pending.screen().at(-1) ?? "").trimEnd(), "↑↓ scroll · [ ] agent · a menu · d details · tab focus · enter load · ctrl+shift+f search · s sidebar · ctrl+o tools · esc back");
   await leave(pending);
+});
+
+type Needs = NonNullable<SessionTreeNode["needsPerson"]>;
+function needing(nodes: SessionTreeNode[], needs: Readonly<Record<string, Needs>>): SessionTreeNode[] {
+  return nodes.map((node) => { const needsPerson = needs[node.key]; return needsPerson === undefined ? node : { ...node, needsPerson }; });
+}
+const NEEDY = (): Listed[] => [agent("a", { tokens: 1_000_000, cost: 3 }), agent("b", { depth: 1, running: false, state: "failed", tokens: 200_000, cost: 0.41 }), agent("c", { running: false, state: "completed" }), agent("d", { group: "Subagents" })];
+
+void test("n and N visit the nodes that need a person, wrap, expand hidden ancestors and do nothing without any", async (t) => {
+  timers(t);
+  const nodes = needing(nodesOf(NEEDY()), { "run:build a1b2": "awaiting_input", b: "failed", d: "stalled" });
+  const harness = await open([], { nodes, initialKey: "a" });
+  harness.send("n");
+  await settle();
+  assert.match(title(harness), /^#2\/4 b/, "n goes to the next node that needs a person");
+  harness.send("n");
+  await settle();
+  assert.match(title(harness), /^#4\/4 d/);
+  harness.send("n");
+  await settle();
+  assert.match(title(harness), /^build a1b2 running/, "n wraps round to the first");
+  harness.send("N");
+  await settle();
+  assert.match(title(harness), /^#4\/4 d/, "N wraps back");
+  harness.send("N");
+  await settle();
+  assert.match(title(harness), /^#2\/4 b/, "N goes to the previous one");
+  harness.send(KEY.tab, "n");
+  await settle();
+  assert.match(title(harness), /^#4\/4 d/, "works with the transcript focused");
+  await leave(harness);
+
+  const hidden = await open([], { nodes: needing(nodesOf(NEEDY()), { b: "failed" }), initialKey: "c", state: { selectedKey: "c", row: 0, expansion: [["a", false]], focus: "sidebar", sidebarVisible: true, toolsExpanded: false, detailsShown: false } });
+  assert.equal(sidebarRows(hidden).some((row) => /\bb\b/.test(row)), false, "b is hidden under the collapsed a");
+  hidden.send("n");
+  await settle();
+  assert.match(title(hidden), /^#2\/4 b/);
+  assert.ok(sidebarRows(hidden).some((row) => /\bb\b/.test(row)), "its ancestors were expanded");
+  await leave(hidden);
+
+  const none = await open(NEEDY(), { initialKey: "a" });
+  none.send("n", "N");
+  await settle();
+  assert.match(title(none), /^#1\/4 a/, "no node needs a person: n and N do nothing");
+  assert.doesNotMatch((none.screen().at(-1) ?? ""), /n next/);
+  await leave(none);
+});
+
+void test("the hint shows n next only while some node needs a person", async (t) => {
+  timers(t);
+  const harness = await open([], { nodes: needing(nodesOf(NEEDY()), { b: "failed" }) });
+  assert.match(harness.screen().at(-1) ?? "", /\[ \] agent · n next · /);
+  harness.nodes = nodesOf(NEEDY());
+  await advance(t);
+  await settle();
+  assert.doesNotMatch(harness.screen().at(-1) ?? "", /n next/);
+  await leave(harness);
+});
+
+void test("the title ends with the session totals and drops them first when narrow", async (t) => {
+  timers(t);
+  const listed = (): Listed[] => [agent("a", { tokens: 1000, cost: 3, summary: "s".repeat(40) }), agent("b", { depth: 1, running: false, state: "failed", tokens: 200, cost: 0.41 }), agent("c", { running: false, state: "completed" })];
+  const totals = "1/3 running · 1.2kt · $3.41";
+  for (const columns of [120, 70, 40]) {
+    const harness = await open(listed(), { initialKey: "a", columns });
+    const line = titleRow(harness);
+    assert.ok(visibleWidth(line) <= columns, `fits ${String(columns)} columns`);
+    assert.match(line, /^#1\/3 a /);
+    if (columns === 120) assert.ok(line.trimEnd().endsWith(totals), "the totals end the row");
+    else assert.ok(!line.includes("running ·") && !line.includes("$3.41"), `no totals at ${String(columns)} columns`);
+    await leave(harness);
+  }
+  const bare = await open([agent("a")], { initialKey: "a" });
+  assert.ok(titleRow(bare).trimEnd().endsWith("1/1 running"), "parts without data are left out");
+  await leave(bare);
 });
