@@ -10,7 +10,7 @@ type UiSelect = (title: string, options: string[]) => Promise<string | undefined
 type UiInput = (title: string, placeholder?: string) => Promise<string | undefined>;
 type UiSetStatus = (key: string, text?: string) => void;
 type UiCustom = ExtensionUIContext["custom"];
-export type UiHostCapabilities = { select?: UiSelect; input?: UiInput; setStatus?: UiSetStatus; custom?: UiCustom };
+type UiHostCapabilities = { select?: UiSelect; input?: UiInput; setStatus?: UiSetStatus; custom?: UiCustom };
 function isUiSelect(value: unknown): value is UiSelect { return typeof value === "function"; }
 function isUiInput(value: unknown): value is UiInput { return typeof value === "function"; }
 function isUiSetStatus(value: unknown): value is UiSetStatus { return typeof value === "function"; }
@@ -28,7 +28,7 @@ export function uiHostCapabilities(ui: unknown): UiHostCapabilities | undefined 
   const custom = isUiCustom(customValue) ? customValue.bind(ui) : undefined;
   return { ...(select ? { select } : {}), ...(input ? { input } : {}), ...(setStatus ? { setStatus } : {}), ...(custom ? { custom } : {}) };
 }
-export function tuiRows(tui: unknown): number {
+function tuiRows(tui: unknown): number {
   const rows = object(tui) && object(tui.terminal) ? tui.terminal.rows : undefined;
   return typeof rows === "number" && Number.isFinite(rows) ? rows : 24;
 }
@@ -58,7 +58,7 @@ export function workflowKeyLabel(keybindings: unknown, binding: string, fallback
   return [...new Set(vim ? [...configured, vim] : configured)].join("/");
 }
 
-export interface PiActionUiOptions {
+interface PiActionUiOptions {
   /** Told around each confirmation, as the workflow tools report a blocked run. */
   readonly reportBlocked?: ReportBlocked | undefined;
   /** The external editor command; undefined when none is configured. */
@@ -159,6 +159,9 @@ function editTextInEditor(ctx: ExtensionCommandContext, title: string): Promise<
 /**
  * The ActionUi over Pi's own UI: its dialogs, the workflow-stop status and the working message. In the TUI the checkpoint
  * review, the text editor and the external editor are custom components; elsewhere they fall back to Pi's dialogs.
+ * Pi shows one custom component at a time: a dialog or custom opened while another custom is shown replaces it and afterwards
+ * restores the editor rather than that component, which leaves its promise pending and the session waiting on it. So this
+ * ActionUi runs while no custom is shown: runAgentsWorkspace (src/agents-command.ts) closes the workspace first.
  */
 export function createPiActionUi(ctx: ExtensionCommandContext, options: PiActionUiOptions): ActionUi {
   const capabilities = () => uiHostCapabilities(ctx.ui);

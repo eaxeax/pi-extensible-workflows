@@ -7,7 +7,6 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { ActionUi, AgentsActionProvider, AgentsActionTarget, SubagentPresenter, SubagentsHandle } from "../src/agents-actions-contract.js";
 import { runAgentsWorkspace, type AgentsWorkspaceLoop } from "../src/agents-command.js";
 import type { AgentsWorkspaceExit, AgentsWorkspaceOptions, AgentsWorkspaceState, OpenAgentsWorkspace, SessionTreeNode } from "../src/agents-workspace-contract.js";
-import { getAgentsWorkspaceOpener } from "../src/host-navigator.js";
 import workflowExtension from "../src/host.js";
 import { createLaunchSnapshot, DEFAULT_SETTINGS, RunStore, type AgentRecord } from "../src/index.js";
 import { clearSubagentsHandle, setSubagentsHandle } from "../src/subagent-actions-handle.js";
@@ -27,11 +26,6 @@ const NODE: SessionTreeNode = { key: "run:R", parentKey: undefined, depth: 0, ki
 
 function tick(): Promise<void> { return new Promise((resolve) => { setImmediate(resolve); }); }
 async function settle(): Promise<void> { for (let round = 0; round < 10; round += 1) await tick(); }
-/** Waits (bounded) for `condition`: a real source reads the disk, which takes more than a few turns of the event loop. */
-async function until(condition: () => boolean, what: string): Promise<void> {
-  for (let wait = 0; wait < 1000 && !condition(); wait += 1) await new Promise((resolve) => { setTimeout(resolve, 5); });
-  assert.ok(condition(), what);
-}
 
 /** Offers `offers(target)` now; `perform` runs a label, after it is recorded as `<kind>:<label>`. */
 class FakeProvider implements AgentsActionProvider {
@@ -346,27 +340,4 @@ void test("/agents without a published subagents handle gives the workspace the 
   assert.ok((await providers[0]?.actions({ kind: "run", runId: "run" }))?.some(({ label }) => label === "Model aliases"));
   assert.deepEqual(await providers[0]?.actions({ kind: "subagent", id: "sub-1" }), [], "it owns no subagent");
   assert.deepEqual(notices, []);
-});
-
-void test("the published opener of the /workflow and /subagents dashboards opens the workspace without actions, and not while /agents has it", async () => {
-  const { home, cwd } = fixture();
-  await createRun(home, cwd, [agentRecord("alpha-id", "alpha")]);
-  let leave = (): void => {};
-  const { agents, opened } = host(home, [undefined, () => new Promise((resolve) => { leave = () => { resolve(undefined); }; })]);
-  const open = getAgentsWorkspaceOpener();
-  assert.ok(open);
-  const notices: string[] = [];
-  await executeCommand((_args, ctx) => open(ctx, "run:run:alpha-id"), "", piContext(cwd, notices));
-  assert.equal(opened.length, 1);
-  assert.equal("actions" in (opened[0]?.options ?? {}), false, "no actions until the dashboards are gone");
-  assert.equal(opened[0]?.options.initialKey, "run:run:alpha-id");
-  assert.deepEqual(notices, []);
-
-  const running = executeCommand(agents, "", piContext(cwd, notices));
-  await until(() => opened.length === 2, "/agents to open the workspace");
-  await executeCommand((_args, ctx) => open(ctx, "run:run:alpha-id"), "", piContext(cwd, notices));
-  assert.deepEqual(notices, ["The agents workspace is already open."], "t while /agents has the workspace");
-  assert.equal(opened.length, 2);
-  leave();
-  await running;
 });
