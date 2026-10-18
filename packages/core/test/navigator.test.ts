@@ -88,16 +88,26 @@ void test("/workflow opens the agents workspace on the session's runs in attenti
   }
 });
 
-void test("a opens the selected agent's actions without View transcript, and esc closes them", { skip: !process.env.HERDR_ENV }, async () => {
+void test("a opens the selected run's actions, and on an agent its own actions without View transcript; esc closes them", { skip: !process.env.HERDR_ENV }, async () => {
   const h = TestHarness.create({ prefix: "nav-menu" });
   try {
     await openWorkspace(h);
+    // /workflow opens on the first run's header, as the old dashboard opened on a run's root.
+    h.sendKey("a");
+    await h.waitFor("Run actions", 10_000);
+    const runActions = await viewport(h, (screen) => screen.includes("Copy run ID"));
+    assert.match(runActions, /Copy run ID/, `expected the run's actions:\n${runActions}`);
+    // waitFor reads scrollback, which still holds the menu, so poll the live viewport.
+    h.sendKey("escape");
+    const runClosed = await viewport(h, (screen) => !screen.includes("Run actions"));
+    assert.doesNotMatch(runClosed, /Run actions/, `escape should close the menu:\n${runClosed}`);
+    // ] selects the next agent.
+    h.sendKey("]");
     h.sendKey("a");
     await h.waitFor("Agent actions", 10_000);
     const withActions = await viewport(h, (screen) => screen.includes("Copy agent ID"));
     assert.match(withActions, /Copy agent ID/, `expected the agent's actions:\n${withActions}`);
     assert.doesNotMatch(withActions, /View transcript/);
-    // waitFor reads scrollback, which still holds the menu, so poll the live viewport.
     h.sendKey("escape");
     const closed = await viewport(h, (screen) => !screen.includes("Agent actions"));
     assert.doesNotMatch(closed, /Agent actions/, `escape should close the menu:\n${closed}`);
