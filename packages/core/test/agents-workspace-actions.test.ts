@@ -981,7 +981,7 @@ void test("/subagents: a subagent offers the dashboard's actions and its bulk de
   assert.deepEqual(await menuOf(c.pi), ["Subagent actions", "actions unavailable: inspection of run-x failed"]);
   c.pi.send(KEY.escape);
   select(c.pi, /^#2\/4 run-c/);
-  assert.equal((c.pi.screen().at(-1) ?? "").trimEnd(), "←→/space fold · [ ] agent · a menu · d details · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools · esc back", "the hint with the actions and an agent with details");
+  assert.equal((c.pi.screen().at(-1) ?? "").trimEnd(), "←→/space fold · [ ] agent · n next · a menu · d details · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools · …", "the hint with the actions, n for the failed subagent and an agent with details");
   c.pi.send("d");
   const pane = c.pi.screen().slice(1, 7).map((line) => line.replace(/^.*│ /, "").trimEnd());
   assert.deepEqual(pane, ["Selected subagent: run-c", "ID: run-c", "State: failed", "Tools: (none)", "Duration: 2s", "Error: AGENT_FAILED: boom"], "d shows the /subagents detail rows");
