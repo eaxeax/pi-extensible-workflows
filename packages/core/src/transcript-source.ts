@@ -27,7 +27,7 @@ export type TranscriptSourceStatus = "waiting" | "available" | "unavailable";
 
 export interface TranscriptPoll {
   readonly status: TranscriptSourceStatus;
-  /** The source started over (the path now names another file, or the file shrank): drop every record shown so far. */
+  /** The source started over (the path now names another file, or the file shrank or was rewritten in place): drop every record shown so far. */
   readonly reset: boolean;
   /** After a reset or on the first available poll: the last chunk. Otherwise: complete lines appended since the previous poll. */
   readonly appended: readonly TranscriptRecord[];

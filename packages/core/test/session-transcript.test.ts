@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { appendFileSync, chmodSync, constants, copyFileSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, constants, openSync, writeSync, copyFileSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { openSessionTranscript } from "../src/session-transcript.js";
+import { observeSessionTranscriptReads, openSessionTranscript } from "../src/session-transcript.js";
 import type { TranscriptRecord, TranscriptSource } from "../src/transcript-source.js";
 import type { WorkflowAgentSessionReference } from "../src/types.js";
 
@@ -399,3 +399,183 @@ void test("close makes later calls unavailable", async () => {
   await never.close();
   assert.equal((await never.poll()).status, "unavailable");
 });
+
+void test("a same-size in-place rewrite with the mtime set back is a reset", async () => {
+  const path = join(fixture(), "session.jsonl");
+  writeFileSync(path, `${headerLine("session-1")}\n${message(1, "aaaa")}\n`);
+  const source = openSessionTranscript(reference(path));
+  try {
+    assert.equal((await source.poll()).reset, false);
+    assert.equal((await source.poll()).reset, false);
+    writeFileSync(path, `${headerLine("session-1")}\n${message(1, "bbbb")}\n`);
+    utimesSync(path, new Date(1_000_000), new Date(1_000_000));
+    const poll = await source.poll();
+    assert.equal(poll.reset, true);
+    assert.equal(poll.appended.length, 2);
+  } finally { await source.close(); }
+});
+
+void test("a larger in-place rewrite that changes the sampled bytes is a reset, a plain append is not", async () => {
+  const path = join(fixture(), "session.jsonl");
+  writeFileSync(path, `${headerLine("session-1")}\n${message(1)}\n`);
+  const source = openSessionTranscript(reference(path));
+  try {
+    await source.poll();
+    appendFileSync(path, `${message(2)}\n`);
+    const appended = await source.poll();
+    assert.equal(appended.reset, false);
+    assert.equal(appended.appended.length, 1);
+    writeFileSync(path, `${headerLine("session-1")}\n${message(9)}\n${message(2)}\n${message(3)}\n`);
+    const rewritten = await source.poll();
+    assert.equal(rewritten.reset, true);
+    assert.equal(rewritten.appended.length, 4);
+  } finally { await source.close(); }
+});
+
+void test("a poll of an unchanged file reads nothing", async () => {
+  const path = join(fixture(), "session.jsonl");
+  writeFileSync(path, `${headerLine("session-1")}\n${message(1)}\n`);
+  const source = openSessionTranscript(reference(path));
+  let bytes = 0;
+  try {
+    await source.poll();
+    observeSessionTranscriptReads((count) => { bytes += count; });
+    const poll = await source.poll();
+    assert.equal(poll.reset, false);
+    assert.deepEqual(poll.appended, []);
+    assert.equal(bytes, 0);
+  } finally { observeSessionTranscriptReads(undefined); await source.close(); }
+});
+void test("an unterminated tail rewritten in place while the file grows is a reset, never a joined record", async () => {
+  const path = join(fixture(), "session.jsonl");
+  const head = `${headerLine("session-1")}\n${message(1)}\n`;
+  writeFileSync(path, `${head}{"type":"message","id":"OLD`);
+  const source = openSessionTranscript(reference(path));
+  try {
+    await source.poll();
+    const fd = openSync(path, "r+");
+    try { writeSync(fd, `${message(2)}\n`, Buffer.byteLength(head)); } finally { closeSync(fd); }
+    const poll = await source.poll();
+    assert.equal(poll.reset, true);
+    assert.deepEqual(poll.appended.map((record) => record.kind), ["entry", "entry", "entry"]);
+  } finally { await source.close(); }
+});
+
+void test("a poll after a one-line append reads about the growth, not the file", async () => {
+  const path = join(fixture(), "session.jsonl");
+  const big = "x".repeat(40_000);
+  writeFileSync(path, `${headerLine("session-1")}\n${Array.from({ length: 200 }, (_, index) => message(index, big)).join("\n")}\n`);
+  const source = openSessionTranscript(reference(path), { chunkBytes: 64 * 1024 });
+  let bytes = 0;
+  try {
+    await source.poll();
+    const line = `${message(500)}\n`;
+    appendFileSync(path, line);
+    observeSessionTranscriptReads((count) => { bytes += count; });
+    const poll = await source.poll();
+    assert.equal(poll.appended.length, 1);
+    assert.ok(bytes <= Buffer.byteLength(line) + 2 * (4096 + 256), `read ${String(bytes)} bytes`);
+  } finally { observeSessionTranscriptReads(undefined); await source.close(); }
+});
+
+void test("polls over a growing unterminated line read about the growth each", async () => {
+  const path = join(fixture(), "session.jsonl");
+  writeFileSync(path, `${headerLine("session-1")}\n${message(1)}\n`);
+  const source = openSessionTranscript(reference(path), { chunkBytes: 1024 });
+  let bytes = 0;
+  try {
+    await source.poll();
+    appendFileSync(path, "y".repeat(300_000));
+    await source.poll();
+    for (let round = 0; round < 4; round += 1) {
+      appendFileSync(path, "y".repeat(100));
+      bytes = 0;
+      observeSessionTranscriptReads((count) => { bytes += count; });
+      const poll = await source.poll();
+      observeSessionTranscriptReads(undefined);
+      assert.equal(poll.appended.length, 0);
+      assert.ok(bytes <= 100 + 2 * (4096 + 256) + 64, `read ${String(bytes)} bytes`);
+    }
+    appendFileSync(path, "\n");
+    const done = await source.poll();
+    assert.deepEqual(done.appended.map((record) => record.kind), ["large"]);
+  } finally { observeSessionTranscriptReads(undefined); await source.close(); }
+});
+
+void test("polls over a growing short unterminated tail read about the growth each", async () => {
+  const path = join(fixture(), "session.jsonl");
+  writeFileSync(path, `${headerLine("session-1")}\n`);
+  const source = openSessionTranscript(reference(path), { chunkBytes: 64 * 1024 });
+  try {
+    await source.poll();
+    appendFileSync(path, "y".repeat(30_000));
+    await source.poll();
+    for (let round = 0; round < 3; round += 1) {
+      appendFileSync(path, "y".repeat(100));
+      let bytes = 0;
+      observeSessionTranscriptReads((count) => { bytes += count; });
+      await source.poll();
+      observeSessionTranscriptReads(undefined);
+      assert.ok(bytes <= 100 + 2 * (4096 + 256) + 64, `read ${String(bytes)} bytes`);
+    }
+    appendFileSync(path, "\n");
+    let completion = 0;
+    observeSessionTranscriptReads((count) => { completion += count; });
+    assert.deepEqual((await source.poll()).appended.map((r) => r.kind), ["unreadable"]);
+    assert.ok(completion <= 1 + 2 * (4096 + 256) + 64, `read ${String(completion)} bytes`);
+  } finally { observeSessionTranscriptReads(undefined); await source.close(); }
+});
+
+void test("a first line of chunkBytes bytes is an entry at offset 0 like at any other offset", async () => {
+  const chunkBytes = 200;
+  const base = Buffer.byteLength(JSON.stringify({ type: "session", version: 3, id: "session-1", cwd: "" }));
+  const line = JSON.stringify({ type: "session", version: 3, id: "session-1", cwd: "x".repeat(chunkBytes - base) });
+  assert.equal(Buffer.byteLength(line), chunkBytes);
+  const path = join(fixture(), "session.jsonl");
+  writeFileSync(path, `${line}\n`);
+  const source = openSessionTranscript(reference(path), { chunkBytes });
+  try {
+    const first = await source.poll();
+    assert.deepEqual(first.appended.map((r) => [r.kind, r.offset]), [["entry", 0]]);
+    appendFileSync(path, `${line}\n`);
+    const next = await source.poll();
+    assert.deepEqual(next.appended.map((r) => [r.kind, r.offset]), [["entry", chunkBytes + 1]]);
+  } finally { await source.close(); }
+});
+
+void test("a first line of chunkBytes+1 bytes is a large record at offset 0 like at any other offset", async () => {
+  const chunkBytes = 200;
+  const exact = (text: string): string => { const base = Buffer.byteLength(JSON.stringify({ type: "session", version: 3, id: "session-1", cwd: "" })); return JSON.stringify({ type: "session", version: 3, id: "session-1", cwd: text.repeat(chunkBytes + 1 - base) }); };
+  const line = exact("x");
+  assert.equal(Buffer.byteLength(line), chunkBytes + 1);
+  const path = join(fixture(), "session.jsonl");
+  writeFileSync(path, `${line}\n`);
+  const source = openSessionTranscript(reference(path), { chunkBytes });
+  try {
+    const poll = await source.poll();
+    assert.deepEqual(poll.appended, [{ kind: "large", offset: 0, bytes: chunkBytes + 1 }]);
+    appendFileSync(path, `${line}\n`);
+    assert.deepEqual((await source.poll()).appended, [{ kind: "large", offset: chunkBytes + 2, bytes: chunkBytes + 1 }]);
+  } finally { await source.close(); }
+});
+
+for (const [name, chunkBytes, lineBytes] of [["lines of half a chunk", 1024, 520], ["lines over a chunk", 1024, 1030], ["lines of a large chunk", 65536, 32_800]] as const) {
+  void test(`a poll over many appended ${name} reads the growth plus a constant`, async () => {
+    const path = join(fixture(), "session.jsonl");
+    writeFileSync(path, `${headerLine("session-1")}\n${message(0)}\n`);
+    const source = openSessionTranscript(reference(path), { chunkBytes });
+    try {
+      await source.poll();
+      const text = "z".repeat(lineBytes - Buffer.byteLength(message(0, "")));
+      const lines = Array.from({ length: 200 }, (_, index) => message(index + 1, text));
+      const growth = lines.reduce((sum, line) => sum + Buffer.byteLength(line) + 1, 0);
+      appendFileSync(path, lines.map((line) => `${line}\n`).join(""));
+      let bytes = 0;
+      observeSessionTranscriptReads((count) => { bytes += count; });
+      const poll = await source.poll();
+      observeSessionTranscriptReads(undefined);
+      assert.equal(poll.appended.length, 200);
+      assert.ok(bytes <= growth + 2 * (4096 + 16 * 1024) + 64, `read ${String(bytes)} bytes for ${String(growth)} of growth`);
+    } finally { observeSessionTranscriptReads(undefined); await source.close(); }
+  });
+}
