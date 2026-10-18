@@ -3017,6 +3017,8 @@ test("the subagent widget leaves its frame to the core workflow widget while it 
 
   const core = coreWidgetPi();
   coreWidget(core.pi, true, undefined, "phases", () => []);
+  // A failed assertion must not leave the flag held for the tests after this one.
+  t.after(() => { core.handlers.get("session_shutdown")?.(undefined, undefined); subagentWidget.dispose(); });
   core.handlers.get("session_start")(undefined, subagentWidgetContext().context);
   assert.equal(subagentsInWorkflowWidget(), true);
   t.mock.timers.tick(200);
@@ -3030,10 +3032,9 @@ test("the subagent widget leaves its frame to the core workflow widget while it 
   assert.equal(subagentsInWorkflowWidget(), false);
   t.mock.timers.tick(200);
   assert.match(own.frame()?.join("\n") ?? "", /alpha/, "the subagent frame comes back once the flag is let go, without a new status");
-  subagentWidget.dispose();
 });
 
-test("with backgroundWidget false the core widget never sets the flag and the subagent frame shows", async () => {
+test("with backgroundWidget false the core widget never sets the flag and the subagent frame shows", async (t) => {
   const { default: coreWidget } = await import("../../dist/src/background-widget.js");
   const { subagentsInWorkflowWidget } = await import("../../dist/src/subagent-widget-flag.js");
   const { createSubagentBackgroundWidget } = await import("../../dist/subagents/src/view.js");
@@ -3043,8 +3044,8 @@ test("with backgroundWidget false the core widget never sets the flag and the su
   assert.equal(subagentsInWorkflowWidget(), false);
   const own = subagentWidgetContext();
   const subagentWidget = createSubagentBackgroundWidget();
+  t.after(() => { subagentWidget.dispose(); });
   subagentWidget.start(own.context);
   subagentWidget.update(...backgroundRun("s1", "alpha"));
   assert.match(own.frame()?.join("\n") ?? "", /alpha/);
-  subagentWidget.dispose();
 });
