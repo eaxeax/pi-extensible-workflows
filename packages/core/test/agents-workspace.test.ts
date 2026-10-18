@@ -1160,7 +1160,7 @@ void test("a run's sidebar rows are its /workflow tree rows, its nodes show the 
   assert.match(title(harness), /^#1\/4 Planner completed/);
   // The /workflow rows one level deeper, the first agent selected; the root is a header that names the run, as the sidebar can hold several.
   assert.deepEqual(rows.slice(0, 3), ["  ▾ Workflow · ⠦", "  ▾ plan · ✓", "→   • Planner · ✓"]);
-  assert.deepEqual(sidebarRows(harness), ["  ▾ review flow run  ⠦ 2/4 agents", ...rows.slice(1).map((row) => `${row.slice(0, 2)}  ${row.slice(2)}`)]);
+  assert.deepEqual(sidebarRows(harness), ["  ▾ review flow run  ⠦ 2/4", ...rows.slice(1).map((row) => `${row.slice(0, 2)}  ${row.slice(2)}`)]);
   harness.send(KEY.down);
   await settle();
   const lines = harness.screen();

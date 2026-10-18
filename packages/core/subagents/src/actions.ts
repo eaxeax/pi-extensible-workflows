@@ -315,22 +315,56 @@ export function createSubagentActionProvider({ manager, storageDirectory, clipbo
   };
 }
 
+type Request = Awaited<ReturnType<typeof loadRequest>>;
+/** The request labels read so far, kept across presenters (each /agents refresh builds a new one) per manager and storage. */
+const REQUEST_CACHES = new WeakMap<object, Map<string, Map<string, Request>>>();
+function requestCache(manager: object, storageDirectory: string): Map<string, Request> {
+  const byStorage = REQUEST_CACHES.get(manager) ?? new Map<string, Map<string, Request>>();
+  REQUEST_CACHES.set(manager, byStorage);
+  const cache = byStorage.get(storageDirectory) ?? new Map<string, Request>();
+  byStorage.set(storageDirectory, cache);
+  return cache;
+}
+
 /** The /subagents list names and detail rows of the subagents it can read. */
 export function createSubagentPresenter({ manager, storageDirectory }: Omit<SubagentActionDependencies, "clipboard">, context: ExtensionCommandContext): SubagentPresenter {
+  const cache = requestCache(manager, storageDirectory);
+  const entryOf = (status: SubagentStatus, request: Request): NavigatorEntry => ({ status, ...(request.request === undefined ? {} : { request: request.request }), ...(request.error === undefined ? {} : { requestError: request.error }) });
   return {
     async describe(ids) {
       const results = await Promise.allSettled(ids.map((id) => inspectEntry(manager, storageDirectory, id, context)));
-      // A subagent whose inspection fails keeps its row of the /subagents list (loadEntries): its request's label names it, and its details are what the row tells.
-      //NOTE: one the list no longer has (deleted meanwhile), or every such one when the list cannot be read either, is left out.
-      const listed = results.some((result) => result.status === "rejected") ? await loadEntries(manager, storageDirectory, context).catch((): NavigatorEntry[] => []) : [];
-      const inspected = ids.flatMap((id, index): (readonly [string, Inspection])[] => {
-        const result = results[index];
-        if (result?.status === "fulfilled") return [[id, result.value]];
-        const entry = listed.find(({ status }) => status.id === id);
-        return entry === undefined ? [] : [[id, { entry, record: {} }]];
+      // The session's subagents as the list has them, for twin names and for the status of one that cannot be inspected.
+      //NOTE: when the list cannot be read either, names are among the inspected ones and an uninspectable one is left out.
+      const sessionId = context.sessionManager.getSessionId();
+      // Each refresh lists the session once more, for twin names among all of its subagents.
+      // A failed listing stays undefined, apart from a successful one that is empty.
+      const listed: readonly unknown[] | undefined = await manager.inspect({}, managerContext(context)).then((value): readonly unknown[] => Array.isArray(value) ? value as unknown[] : [], (): undefined => undefined);
+      const statuses = (listed ?? []).flatMap((candidate) => { const status = statusValue(candidate); return status && status.sessionId === sessionId ? [status] : []; });
+      // Forget the requests of subagents the list no longer has.
+      if (listed !== undefined) for (const id of [...cache.keys()]) if (!statuses.some((status) => status.id === id)) cache.delete(id);
+      const inspected = new Map<string, Inspection>();
+      ids.forEach((id, index) => { const result = results[index]; if (result?.status === "fulfilled" && result.value.entry.status.sessionId === sessionId && result.value.entry.status.id === id) inspected.set(id, result.value); });
+      const entries: NavigatorEntry[] = [...inspected.values()].map(({ entry }) => entry);
+      const failed = new Map<string, Inspection>();
+      const uninspected = statuses.filter((status) => !inspected.has(status.id));
+      // Only the labels read cleanly are kept: a read that failed is tried again on the next refresh.
+      const requests = await Promise.all(uninspected.map(async (status): Promise<Request> => {
+        const known = cache.get(status.id);
+        if (known !== undefined) return known;
+        const loaded = await loadRequest(storageDirectory, status.id);
+        if (loaded.error === undefined) cache.set(status.id, loaded);
+        return loaded;
+      }));
+      uninspected.forEach((status, index) => {
+        const entry = entryOf(status, requests[index] ?? {});
+        entries.push(entry);
+        if (ids.includes(status.id)) failed.set(status.id, { entry, record: {} });
       });
-      const names = listNames(inspected.map(([, inspection]) => inspection.entry));
-      return new Map(inspected.map(([id, inspection], index): [string, SubagentPresentation] => [id, { name: names[index] ?? "", details: (styles, now) => detailRows(inspection, styles, now) }]));
+      const names = new Map(listNames(entries).map((name, index) => [entries[index]?.status.id ?? "", name]));
+      return new Map(ids.flatMap((id): [string, SubagentPresentation][] => {
+        const inspection = inspected.get(id) ?? failed.get(id);
+        return inspection === undefined ? [] : [[id, { name: names.get(id) ?? "", details: (styles, now) => detailRows(inspection, styles, now) }]];
+      }));
     },
   };
 }

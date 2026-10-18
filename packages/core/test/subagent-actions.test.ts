@@ -294,7 +294,8 @@ void test("the presenter names subagents as the /subagents list does and gives t
   assert.deepEqual([...described].map(([id, { name }]) => [id, name]), [["run-a", "scout run-a"], ["run-b", "scout run-b"], ["run-c", "run-c"], ["run-red", "red!"]], "a repeated label carries the short ID; an unreadable id is left out");
   assert.deepEqual(described.get("run-a")?.details(PLAIN_WORKFLOW_PROGRESS_STYLES, NOW), ["Selected subagent: scout", "ID: run-a", "State: running", "Model: fixture/model", "Tools: read", `Duration: ${formatWorkflowRuntime(NOW - 1_000)}`]);
   assert.deepEqual(described.get("run-c")?.details(PLAIN_WORKFLOW_PROGRESS_STYLES, NOW), ["Selected subagent: run-c", "ID: run-c", "State: failed", "Tools: (none)", "Duration: 2s", "Error: AGENT_FAILED: boom"]);
-  assert.equal((await presenter.describe(["run-b"])).get("run-b")?.name, "scout", "a label used once is the name");
+  assert.equal((await presenter.describe(["run-b"])).get("run-b")?.name, "scout run-b", "a twin that was not asked for still tells it apart");
+  assert.equal((await presenter.describe(["run-c"])).get("run-c")?.name, "run-c");
 });
 
 void test("the presenter names a subagent whose inspection fails from its request label, as the /subagents list does, and details it with its listed row", async () => {
@@ -312,6 +313,82 @@ void test("the presenter names a subagent whose inspection fails from its reques
   assert.deepEqual(nodes.flatMap(({ agent }) => agent ? [agent.name] : []), ["scout run-a", "run-c", "scout run-b"], "the workspace's sidebar names them so too");
 });
 
+void test("the presenter reads the request labels of ids that fail inspection once, and lists the session once per refresh", async () => {
+  const { manager, directory, context } = fixture({ unreadable: ["run-b"] });
+  let lists = 0;
+  const counted: SubagentManager = { ...manager, async inspect(request, managerContext) { if (request.id === undefined) lists += 1; return manager.inspect(request, managerContext); } };
+  const presenter = createSubagentPresenter({ manager: counted, storageDirectory: directory }, context);
+  assert.equal((await presenter.describe(["run-a", "run-b"])).get("run-b")?.name, "scout run-b");
+  assert.equal(lists, 1);
+  rmSync(join(directory, "run-b"), { recursive: true });
+  const again = await presenter.describe(["run-a", "run-b"]);
+  assert.equal(lists, 2, "one listing per refresh");
+  assert.deepEqual([...again].map(([id, { name }]) => [id, name]), [["run-a", "scout run-a"], ["run-b", "scout run-b"]], "the label read before is not read again");
+});
+
+void test("a new presenter per refresh does not read a request label again", async () => {
+  const { manager, directory, context } = fixture({ unreadable: ["run-b"] });
+  const dependencies = { manager, storageDirectory: directory };
+  assert.equal((await createSubagentPresenter(dependencies, context).describe(["run-a", "run-b"])).get("run-b")?.name, "scout run-b");
+  // A read would now return this label; the cached one is what the next presenter shows.
+  writeFileSync(join(directory, "run-b", "request.json"), JSON.stringify({ prompt: "p", label: "changed", mode: "background" }));
+  const again = await createSubagentPresenter(dependencies, context).describe(["run-a", "run-b"]);
+  assert.deepEqual([...again].map(([id, { name }]) => [id, name]), [["run-a", "scout run-a"], ["run-b", "scout run-b"]], "run-b's label was not read again");
+  rmSync(join(directory, "run-b"), { recursive: true });
+  const gone = await createSubagentPresenter(dependencies, context).describe(["run-a"]);
+  assert.equal(gone.get("run-a")?.name, "scout run-a", "the label of a subagent that is still listed survives");
+});
+
+void test("the request-label cache is pruned by a successful listing, even an empty one, and kept when the listing throws", async () => {
+  const { manager, directory, context } = fixture({ unreadable: ["run-b"] });
+  let mode: "all" | "without-b" | "empty" | "throw" = "all";
+  const switched: SubagentManager = {
+    ...manager,
+    async inspect(request, managerContext) {
+      if (request.id !== undefined || mode === "all") return manager.inspect(request, managerContext);
+      if (mode === "throw") throw new Error("storage unavailable");
+      const listed = await manager.inspect(request, managerContext);
+      return mode === "empty" || !Array.isArray(listed) ? [] : (listed as { id?: string }[]).filter((status) => status.id !== "run-b");
+    },
+  };
+  const dependencies = { manager: switched, storageDirectory: directory };
+  const label = async (): Promise<string | undefined> => (await createSubagentPresenter(dependencies, context).describe(["run-a", "run-b"])).get("run-b")?.name;
+  const rewrite = (value: string): void => { writeFileSync(join(directory, "run-b", "request.json"), JSON.stringify({ prompt: "p", label: value, mode: "background" })); };
+  assert.equal(await label(), "scout run-b");
+  rewrite("second");
+  mode = "throw";
+  await createSubagentPresenter(dependencies, context).describe(["run-a"]);
+  mode = "all";
+  assert.equal(await label(), "scout run-b", "a failed listing keeps the cache: the new label is not read");
+  mode = "without-b";
+  await createSubagentPresenter(dependencies, context).describe(["run-a"]);
+  mode = "all";
+  assert.equal(await label(), "second", "listed without run-b, its label is read again");
+  rewrite("third");
+  mode = "empty";
+  await createSubagentPresenter(dependencies, context).describe(["run-a"]);
+  mode = "all";
+  assert.equal(await label(), "third", "an empty successful listing prunes too");
+});
+
+void test("an inspection that returns another subagent's status is treated as failed: the requested id keeps its own name and listed row", async () => {
+  const { manager, directory, context } = fixture();
+  const swapped: SubagentManager = { ...manager, async inspect(request, managerContext) { return manager.inspect(request.id === "run-a" ? { ...request, id: "run-b" } : request, managerContext); } };
+  const described = await createSubagentPresenter({ manager: swapped, storageDirectory: directory }, context).describe(["run-a", "run-b"]);
+  assert.deepEqual([...described].map(([id, { name }]) => [id, name]), [["run-a", "scout run-a"], ["run-b", "scout run-b"]], "run-a is named from its listed row, not left empty");
+  const details = described.get("run-a")?.details(PLAIN_WORKFLOW_PROGRESS_STYLES, NOW) ?? [];
+  assert.ok(details.includes("ID: run-a") && !details.includes("ID: run-b"), "its details are those of its own listed row");
+});
+
+void test("the presenter names the ids it is given among all of the session's subagents, and still names them when the list cannot be read", async () => {
+  const { manager, directory, context } = fixture();
+  const presenter = createSubagentPresenter({ manager, storageDirectory: directory }, context);
+  assert.deepEqual([...await presenter.describe(["run-a"])].map(([id, { name }]) => [id, name]), [["run-a", "scout run-a"]], "run-b, not asked for, is its twin");
+  const broken: SubagentManager = { ...manager, async inspect(request, managerContext) { if (request.id === undefined) throw new Error("storage unavailable"); return manager.inspect(request, managerContext); } };
+  const fallback = createSubagentPresenter({ manager: broken, storageDirectory: directory }, context);
+  assert.deepEqual([...await fallback.describe(["run-a", "run-c"])].map(([id, { name }]) => [id, name]), [["run-a", "scout"], ["run-c", "run-c"]]);
+});
+
 void test("publishes the subagents handle on start and clears it on shutdown", async () => {
   const { manager, directory, copied } = fixture();
   let shutdown: (() => Promise<void>) | undefined;
@@ -327,7 +404,7 @@ void test("publishes the subagents handle on start and clears it on shutdown", a
   const ui = recordingUi();
   await handle.actions(context).run(subagent("run-b"), "Copy run path", ui);
   assert.deepEqual(copied, [join(directory, "run-b")], "the handle's provider uses the extension's storage and clipboard");
-  assert.equal((await handle.presenter(context).describe(["run-b"])).get("run-b")?.name, "scout");
+  assert.equal((await handle.presenter(context).describe(["run-b"])).get("run-b")?.name, "scout run-b");
   assert.ok(shutdown);
   await shutdown();
   assert.equal(getSubagentsHandle(), undefined);
