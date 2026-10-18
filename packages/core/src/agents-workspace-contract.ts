@@ -1,4 +1,5 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { AgentsActionProvider, AgentsActionTarget } from "./agents-actions-contract.js";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import type { WorkflowProgressStyles } from "./host-view.js";
 import type { TranscriptLiveStream, TranscriptRecord, TranscriptSource } from "./transcript-source.js";
@@ -68,12 +69,18 @@ export interface SessionTreeNode {
    * group's counts and cost). Every other node is its /workflow tree row at `depth`: arrow, indent, ▾/▸/•/◇ icon, label, " · ", state glyph.
    */
   line(styles: WorkflowProgressStyles, selected: boolean, expanded: boolean): string;
-  /** What the right pane shows for a node that is not an agent, as /workflow details it without its enter hints; empty for an agent, which shows its transcript. */
+  /**
+   * What the right pane shows for a node that is not an agent, as /workflow details it without its enter hints. For an
+   * agent, what `d` shows instead of its transcript (/workflow's agent details, the /subagents detail rows); empty when
+   * there is nothing to show.
+   */
   details(styles: WorkflowProgressStyles, now: number): readonly string[];
   /** The title row of a node that is not an agent: its label and state. */
   title(styles: WorkflowProgressStyles): string;
   /** Set only for kind "agent". */
   readonly agent: SessionAgent | undefined;
+  /** What the node's actions apply to; a node without one has no action menu. */
+  readonly target?: AgentsActionTarget;
 }
 
 export interface SessionAgentsSource {
@@ -109,10 +116,40 @@ export interface AgentsWorkspaceOptions {
   /** Opens the reader for an owned agent (openSessionTranscript); not called for an agent that is not owned. */
   readonly openSource: (agent: SessionAgent) => TranscriptSource;
   readonly createView: CreateTranscriptView;
-  /** Agent selected when the workspace opens, its ancestors expanded; the first agent node in sidebar order otherwise. */
+  /** Node selected when the workspace opens, its ancestors expanded; wins over state.selectedKey. The first agent node in sidebar order otherwise, or the first node when there is no agent. */
   readonly initialKey?: string;
   readonly pollIntervalMs?: number;
+  /** The menu of a node with a target asks every provider; without providers there is no menu and `a` does nothing. */
+  readonly actions?: readonly AgentsActionProvider[];
+  /** A workspace that stepped aside for an action opens again as it was. */
+  readonly state?: AgentsWorkspaceState;
+  /** Shown in the status row when the workspace opens (the notices of the action it stepped aside for), until the next key. */
+  readonly notices?: readonly string[];
+  /** The external editor command (SettingsManager getExternalEditorCommand) for the in-place editor actions; undefined when none is configured. */
+  readonly editorCommand?: () => string | undefined;
 }
 
-/** Resolves when the user leaves the workspace and Pi's own TUI is back. */
-export type OpenAgentsWorkspace = (ctx: ExtensionCommandContext, options: AgentsWorkspaceOptions) => Promise<void>;
+/** What the workspace keeps when it steps aside for an action. */
+export interface AgentsWorkspaceState {
+  readonly selectedKey: string | undefined;
+  /** The selection's row among the visible nodes: a selected key that went away gives the selection to the node now at this row. */
+  readonly row: number;
+  /** Every expansion the workspace has recorded, by key. */
+  readonly expansion: readonly (readonly [string, boolean])[];
+  readonly focus: "sidebar" | "transcript";
+  readonly sidebarVisible: boolean;
+  /** Tool output expanded (ctrl+o). */
+  readonly toolsExpanded: boolean;
+  /** `d`: an agent's details shown instead of its transcript. */
+  readonly detailsShown: boolean;
+}
+
+/** The workspace left for an action that needs Pi's dialogs: the caller runs it with Pi's UI and opens the workspace again with `state`. */
+export interface AgentsWorkspaceExit {
+  readonly target: AgentsActionTarget;
+  readonly label: string;
+  readonly state: AgentsWorkspaceState;
+}
+
+/** Resolves when the user leaves the workspace and Pi's own TUI is back: with the chosen action when it needs Pi's dialogs, without one when the user just left. */
+export type OpenAgentsWorkspace = (ctx: ExtensionCommandContext, options: AgentsWorkspaceOptions) => Promise<AgentsWorkspaceExit | undefined>;

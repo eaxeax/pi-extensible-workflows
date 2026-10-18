@@ -569,4 +569,5 @@ export const openAgentsWorkspace: OpenAgentsWorkspace = async (ctx, options) => 
     });
     return { render: (width) => [truncateToWidth("opening agents…", Math.max(1, width), "…")], invalidate() {} };
   }, { overlay: true });
+  return undefined;
 };
