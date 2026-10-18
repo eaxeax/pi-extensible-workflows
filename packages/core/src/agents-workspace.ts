@@ -28,8 +28,35 @@ const ARROWS: readonly string[] = ["↑", "↓", "←", "→"];
 /** As the dashboards: 38% of the width less the separator, 24 to 42 columns, then the separator. */
 function sidebarWidth(columns: number): number { return navigatorSidebarWidth(columns) + SEPARATOR.length; }
 function clean(text: string | undefined): string { return sanitizeDisplayText(text ?? "").replace(/\s+/g, " ").trim(); }
+/** An SGR escape sequence of a styled line, and the foreground or intensity resets that end a dim. */
+// eslint-disable-next-line no-control-regex
+const ANSI_SEQUENCE = /\x1b\[[0-9;]*m/g;
+// eslint-disable-next-line no-control-regex
+const DIM_ENDS = /\x1b\[(?:22;)?39m|\x1b\[22m/g;
 /** A mouse report as the alt screen reads one: SGR, or the legacy six bytes. */
 function isMouse(data: string): boolean { return (data.startsWith("\x1b[<") && /^\d+;\d+;\d+[Mm]$/.test(data.slice(3))) || (data.length === 6 && data.startsWith("\x1b[M")); }
+/** Where a filter text sits in a label (the label's own characters, from..to) */
+interface LabelMatch { readonly label: string; readonly from: number; readonly to: number }
+/** What a filter keeps: `direct` matches, `shown` adds their ancestors, `byLabel` the label match of each direct match whose label holds the text. */
+interface MatchSets { readonly direct: ReadonlySet<string>; readonly shown: ReadonlySet<string>; readonly byLabel: ReadonlyMap<string, LabelMatch> }
+/** Finds lowercase `text` in `label` ignoring case, as a range of the label's own characters even where lowercasing changes a letter's length. */
+function foldFind(label: string, text: string): { readonly from: number; readonly to: number } | undefined {
+  let folded = "";
+  const origin: number[] = [];
+  let index = 0;
+  for (const char of label) {
+    const lower = char.toLowerCase();
+    for (let i = 0; i < lower.length; i++) origin.push(index);
+    folded += lower;
+    index += char.length;
+  }
+  const at = text === "" ? -1 : folded.indexOf(text);
+  if (at < 0) return undefined;
+  const last = at + text.length - 1;
+  const lastStart = origin[last] ?? index;
+  const to = lastStart + (String.fromCodePoint(label.codePointAt(lastStart) ?? 0).length);
+  return { from: origin[at] ?? 0, to };
+}
 /** The alt screen's own scroll and search actions: it acts on them before any input listener. */
 const ALT_SCREEN_ACTIONS = (Object.keys(TUI_KEYBINDINGS) as (keyof typeof TUI_KEYBINDINGS)[]).filter((id) => id.startsWith("tui.altScreen."));
 /**
@@ -221,7 +248,7 @@ class Workspace {
   /** The sidebar filter text; the one-line input under the title is open while `filtering`. */
   private filter: string;
   private filtering = false;
-  private matchCache: { readonly nodes: readonly SessionTreeNode[]; readonly filter: string; readonly result: { readonly direct: ReadonlySet<string>; readonly shown: ReadonlySet<string> } } | undefined;
+  private matchCache: { readonly nodes: readonly SessionTreeNode[]; readonly filter: string; readonly result: MatchSets } | undefined;
   private menu: Menu | undefined;
   /** The status row's notices (options.notices, an in-place action's), until the next key. */
   private notices: Notice[];
@@ -446,7 +473,7 @@ class Workspace {
    * The nodes the filter keeps: `direct` match (label, run name or short id containing the text, case-insensitive, or the state
    * named by a "state:" prefix), `shown` adds their ancestors. Undefined without a filter.
    */
-  private matches(): { readonly direct: ReadonlySet<string>; readonly shown: ReadonlySet<string> } | undefined {
+  private matches(): MatchSets | undefined {
     if (!this.filterActive()) return undefined;
     const cached = this.matchCache;
     if (cached && cached.nodes === this.nodes && cached.filter === this.filter) return cached.result;
@@ -454,25 +481,28 @@ class Workspace {
     this.matchCache = { nodes: this.nodes, filter: this.filter, result };
     return result;
   }
-  private computeMatches(): { readonly direct: ReadonlySet<string>; readonly shown: ReadonlySet<string> } {
+  private computeMatches(): MatchSets {
     const text = this.filter.trim().replace(/\s+/g, " ").toLowerCase();
     const wantedState = text.startsWith("state:") ? text.slice("state:".length).trim() : undefined;
     const direct = new Set<string>();
+    const byLabel = new Map<string, LabelMatch>();
     for (const node of this.nodes) {
       const title = clean(node.title(this.styles)).toLowerCase();
       // A node that is not an agent has its state as the last word of its title; an agent matches by its name, its state by "state:".
       const words = title.split(" ");
       const state = (node.agent?.state ?? words.at(-1) ?? "").toLowerCase();
-      const label = node.agent ? clean(node.agent.name).toLowerCase() : words.slice(0, -1).join(" ");
+      const label = node.agent ? clean(node.agent.name) : clean(node.title(this.styles)).split(" ").slice(0, -1).join(" ");
       const id = (node.key.split(":").at(-1) ?? "").toLowerCase();
-      if (wantedState === undefined ? label.includes(text) || id.includes(text) : state === wantedState) direct.add(node.key);
+      const found = foldFind(label, text);
+      if (wantedState === undefined ? found !== undefined || id.includes(text) : state === wantedState) direct.add(node.key);
+      if (wantedState === undefined && found !== undefined) byLabel.set(node.key, { label, ...found });
     }
     const shown = new Set(direct);
     for (const key of direct) {
       const seen = new Set<string>();
       for (let parent = this.byKey.get(key)?.parentKey; parent !== undefined && !seen.has(parent); parent = this.byKey.get(parent)?.parentKey) { seen.add(parent); shown.add(parent); }
     }
-    return { direct, shown };
+    return { direct, shown, byLabel };
   }
   /** The /workflow tree navigation runs on: the whole sidebar, or only the nodes a filter keeps. */
   private navTree(): WorkflowPhaseTree {
@@ -1044,6 +1074,45 @@ class Workspace {
     return shown.agent.running && shown.agent.activity ? this.styles.dim(clean(shown.agent.activity)) : "";
   }
 
+  private nodeLine(node: SessionTreeNode, matches: MatchSets | undefined): string {
+    const selected = node.key === this.selectedKey;
+    const line = node.line(this.styles, selected, this.isExpanded(node));
+    if (matches === undefined) return line;
+    if (!matches.direct.has(node.key)) return this.dimLine(line);
+    const match = matches.byLabel.get(node.key);
+    return match === undefined ? line : this.emphasize(line, match);
+  }
+  /** Accents the matched part of the node's label where the line draws the label whole (accent shows inside a bold label); a line that splits it stays as it is. */
+  private emphasize(line: string, match: LabelMatch): string {
+    // The visible text of the line (escape sequences dropped, whitespace runs collapsed as the label is), each character with its raw span.
+    let visible = "";
+    const starts: number[] = [];
+    const ends: number[] = [];
+    for (let i = 0; i < line.length;) {
+      ANSI_SEQUENCE.lastIndex = i;
+      const sequence = ANSI_SEQUENCE.exec(line);
+      if (sequence?.index === i) { i += sequence[0].length; continue; }
+      const space = /\s/.test(line[i] ?? "");
+      let end = i + 1;
+      while (space && /\s/.test(line[end] ?? "")) end++;
+      visible += space ? " " : line.charAt(i);
+      starts.push(i);
+      ends.push(end);
+      i = end;
+    }
+    const at = visible.indexOf(match.label);
+    if (at < 0) return line;
+    const from = starts[at + match.from];
+    const to = ends[at + match.to - 1];
+    if (from === undefined || to === undefined || line.slice(from, to).includes("\x1b")) return line;
+    return `${line.slice(0, from)}${this.styles.accent(line.slice(from, to))}${line.slice(to)}`;
+  }
+  /** Dims a line whose inner colours would otherwise end the dim early: it is opened again after each foreground or intensity reset. */
+  private dimLine(line: string): string {
+    const probe = this.styles.dim("\u0000");
+    const open = probe.slice(0, Math.max(0, probe.indexOf("\u0000")));
+    return this.styles.dim(open === "" ? line : line.replace(DIM_ENDS, (reset) => `${reset}${open}`));
+  }
   /**
    * The visible nodes as their rows, as wide as sidebarWidth of the terminal, scrolled to keep the selection in view; a dim rule
    * above every top-level node but the first row shows where one run (or the group) ends and the next begins.
@@ -1060,10 +1129,11 @@ class Workspace {
     this.sidebarTop = Math.max(0, Math.min(this.sidebarTop, rows.length - height));
     const visible = rows.slice(this.sidebarTop, this.sidebarTop + height);
     this.sidebarKeys = visible.map(({ node }) => node?.key);
+    const matches = this.matches();
     return Array.from({ length: height }, (_, index) => {
       const shown = visible[index];
       const node = shown?.node;
-      const text = node ? node.line(this.styles, node.key === this.selectedKey, this.isExpanded(node)) : shown ? this.styles.dim("─".repeat(cell)) : "";
+      const text = node ? this.nodeLine(node, matches) : shown ? this.styles.dim("─".repeat(cell)) : "";
       return truncateToWidth(`${truncateToWidth(text, cell, "…", true)}${this.styles.dim(SEPARATOR)}`, total, "", true);
     });
   }
