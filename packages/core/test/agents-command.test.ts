@@ -56,7 +56,7 @@ function host(home: string, open: () => Promise<void> = async () => {}): { agent
     on(name: string, handler: unknown) { if (name === "session_shutdown") shutdown = handler as typeof shutdown; },
     getThinkingLevel: () => "medium",
     getActiveTools: () => ["workflow"],
-  }), home, undefined, undefined, join(home, "agent"), [], async (ctx, options) => { opened.push({ cwd: ctx.cwd, options }); await open(); });
+  }), home, undefined, undefined, join(home, "agent"), [], async (ctx, options) => { opened.push({ cwd: ctx.cwd, options }); await open(); return undefined; });
   return { agents: commands.get("agents"), workflow: commands.get("workflow"), shutdown, opened };
 }
 function context(cwd: string, mode: string, notices: string[]): object {
