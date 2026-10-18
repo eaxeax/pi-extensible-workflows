@@ -192,7 +192,6 @@ export function actionOptions(manager: SubagentManager, inspection: Inspection, 
     openSystemPrompt: context.mode === "tui" && liveSystemPrompt(manager, inspection.entry.status) !== undefined,
     openResult: context.mode === "tui" && Object.prototype.hasOwnProperty.call(inspection.record, "value") && jsonValue(value),
     standaloneState: inspection.entry.status.state,
-    viewTranscript: context.mode === "tui",
   });
   const runActions = [...(manager.delete !== undefined && inspection.entry.status.state !== "running" ? ["Delete"] : []), ...bulk, ...(context.mode === "tui" ? ["Copy run path"] : [])];
   labels.splice(labels.indexOf("Copy agent ID"), 0, ...runActions);
@@ -286,13 +285,13 @@ const IN_PLACE: ReadonlySet<string> = new Set(["Copy run path", "Copy agent ID",
 /** Listing asks nobody: a registered action's visibility sees this ui, and the action itself gets the ActionUi of its run. */
 const LISTING_UI: AgentAttemptActionUi = { notify() {}, confirm: async () => false, select: async () => undefined, input: async () => undefined };
 
-/** The actions of a subagent (today's /subagents menu without View transcript and Back) and of the Subagents group (the bulk deletions). */
+/** The actions of a subagent (today's /subagents menu without Back) and of the Subagents group (the bulk deletions). */
 export function createSubagentActionProvider({ manager, storageDirectory, clipboard }: SubagentActionDependencies, context: ExtensionCommandContext): AgentsActionProvider {
   const labels = async (target: AgentsActionTarget): Promise<string[]> => {
     if (target.kind === "subagents") return bulkDeleteLabels(manager, await loadEntries(manager, storageDirectory, context));
     if (target.kind !== "subagent") return [];
     const options = actionOptions(manager, await inspectEntry(manager, storageDirectory, target.id, context), context, LISTING_UI);
-    return options.filter((label) => label !== "View transcript" && label !== "Back");
+    return options.filter((label) => label !== "Back");
   };
   return {
     async actions(target) {

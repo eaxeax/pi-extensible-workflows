@@ -167,6 +167,8 @@ class Workspace {
   private busy = false;
   /** The in-place editor stopped the alternate screen and has the terminal. */
   private editing = false;
+  /** An abort arrived while the editor runs: the workspace is left when the editor exits, not before. */
+  private leaveAfterEditor = false;
   private sidebarTop = 0;
   /** The node key of each sidebar row of the last frame, for clicks; undefined for a rule. */
   private sidebarKeys: (string | undefined)[] = [];
@@ -201,6 +203,12 @@ class Workspace {
     alt.addInputListener((data) => this.input(data));
     this.rebuild();
     this.refresh();
+  }
+
+  /** Leaves now, or once the editor exits when it has the terminal. */
+  abort(): void {
+    if (this.editing) this.leaveAfterEditor = true;
+    else this.leave();
   }
 
   /** Throws only what the alt screen's stop threw (a terminal that cannot stop), and only after everything else was let go. */
@@ -255,6 +263,8 @@ class Workspace {
   }
   private key(data: string): TuiInputListenerResult {
     if (isKeyRelease(data)) return undefined;
+    // The editor owns the terminal: no key is the workspace's meanwhile.
+    if (this.editing) return { consume: true };
     // ctrl+c leaves at once, also while the search box or the menu is open or an in-place action runs.
     if (matchesKey(data, "ctrl+c")) { this.leave(); return { consume: true }; }
     if (this.busy) return { consume: true };
@@ -584,7 +594,9 @@ class Workspace {
   /**
    * The external editor takes the terminal from the alternate screen, not from Pi: stopping keeps Pi's screen as it was (no frame
    * of the workspace written into it) and Pi's TUI stays stopped; starting enters the alternate screen again with a full frame.
-   * Once the workspace is left (an abort while the editor runs) both do nothing: Pi has the terminal back.
+   * An abort while the editor runs leaves Pi stopped and the terminal with the editor: the workspace is left when the editor
+   * exits, so starting then does not enter the alternate screen again but disposes the workspace and gives Pi the terminal back.
+   * Once the workspace is left both do nothing.
    */
   private editorTui(): WorkflowTui {
     return {
@@ -595,6 +607,7 @@ class Workspace {
       },
       start: () => {
         if (this.finished || !this.editing) return;
+        if (this.leaveAfterEditor) { this.leave(); return; }
         this.editing = false;
         // A terminal that cannot start again goes back to Pi, which reports why the workspace closed.
         try { this.start(); } catch (error) { this.leave(undefined, error); throw error; }
@@ -877,7 +890,7 @@ export const openAgentsWorkspace: OpenAgentsWorkspace = async (ctx, options) => 
     /** Set before parent.stop(): from then on leaving restarts Pi, exactly once. */
     let stopped = false;
     let left = false;
-    const abort = (): void => { leave(); };
+    const abort = (): void => { if (workspace) workspace.abort(); else leave(); };
     /** `cause`: what closed the workspace (a terminal that cannot start again after the editor), reported as the first error. */
     const leave = (exit?: AgentsWorkspaceExit, cause?: unknown): void => {
       if (left) return;

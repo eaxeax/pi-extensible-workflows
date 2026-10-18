@@ -74,7 +74,7 @@ function openSubagentsWorkspace(manager: SubagentManager, storageDirectory: stri
 
 async function runNavigator(manager: SubagentManager, storageDirectory: string, args: string, context: ExtensionCommandContext, clipboard: (value: string) => Promise<void>, openWorkspace: OpenAgentsWorkspace): Promise<void> {
   if (args.trim()) {
-    context.ui.notify("Subagent slash commands do not accept arguments. Open the picker with /subagents to inspect and control current-session runs.", "warning");
+    context.ui.notify("Subagent slash commands do not accept arguments. Open /subagents to inspect and control current-session runs.", "warning");
     return;
   }
   for (;;) {
@@ -112,7 +112,7 @@ async function runNavigator(manager: SubagentManager, storageDirectory: string, 
 
 export function registerSubagentNavigator(registerCommand: RegisterCommand, manager: SubagentManager, storageDirectory: string, clipboard: (value: string) => Promise<void> = copyToClipboard, openWorkspace: OpenAgentsWorkspace = openAgentsWorkspace): void {
   registerCommand("subagents", {
-    description: "Open the durable subagent picker and inspect run status",
+    description: "Open this session's durable subagents in the agents workspace (a picker outside the TUI)",
     handler: async (args, context) => {
       try {
         await runNavigator(manager, storageDirectory, args, context, clipboard, openWorkspace);

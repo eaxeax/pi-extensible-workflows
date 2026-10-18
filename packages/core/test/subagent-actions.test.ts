@@ -109,7 +109,7 @@ const IN_PLACE = new Set(["Copy branch", "Copy worktree path", "Open prompt in e
 /** The menu as the provider gives it: each label with its inPlace mark. */
 function marked(labels: readonly string[]) { return labels.map((label) => IN_PLACE.has(label) ? { label, inPlace: true } : { label }); }
 
-void test("offers each subagent today's /subagents labels for its state, without View transcript and Back, and marks the in-place ones", async () => {
+void test("offers each subagent today's /subagents labels for its state, without Back, and marks the in-place ones", async () => {
   const { provider } = fixture();
   assert.deepEqual(await provider.actions(subagent("run-a")), marked(["Copy branch", "Copy worktree path", "Open prompt in editor", "Open system prompt in editor", "Steer", "Stop", "Copy run path", "Copy agent ID"]));
   assert.deepEqual(await provider.actions(subagent("run-b")), marked(["Open prompt in editor", "Open result in editor", "Delete", "Copy run path", "Copy agent ID"]));

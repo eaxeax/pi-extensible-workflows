@@ -310,7 +310,7 @@ function workflows(t: TestContext, f: WorkflowFixture, options: CommandOptions =
 }
 const STOP = "status workflow-stop -";
 
-void test("/workflow: every node of a run offers the dashboard's run actions in the TUI, then Model aliases and the bulk deletes; an agent its actions without View transcript; esc closes the menu as Back did", async (t) => {
+void test("/workflow: every node of a run offers the dashboard's run actions in the TUI, then Model aliases and the bulk deletes; an agent its actions; esc closes the menu as Back did", async (t) => {
   timers(t);
   const escaped = escapes(t);
   const startedAt = Date.now();
@@ -335,11 +335,11 @@ void test("/workflow: every node of a run offers the dashboard's run actions in 
     if (node.agent) assert.match(titleOf(c.pi), /^#1\/1 api running/);
     else assert.equal(titleOf(c.pi), node.title(PLAIN_WORKFLOW_PROGRESS_STYLES));
     const offered = node.agent ? dashboardAgent.filter((label) => label !== "Back") : [...dashboardRun, "Model aliases", "Delete all completed", "Delete all failed"];
-    assert.deepEqual(await menuOf(c.pi), [node.agent ? "Agent actions" : "Run actions", ...offered.map((label, row) => `${row === 0 ? "→" : " "} ${label}`)], node.agent ? "the agent's actions without View transcript and Back" : `the run's actions on its ${node.kind}, then Model aliases and the bulk deletes`);
+    assert.deepEqual(await menuOf(c.pi), [node.agent ? "Agent actions" : "Run actions", ...offered.map((label, row) => `${row === 0 ? "→" : " "} ${label}`)], node.agent ? "the agent's actions without Back" : `the run's actions on its ${node.kind}, then Model aliases and the bulk deletes`);
     c.pi.send(KEY.escape);
     assert.deepEqual(menu(c.pi), [], "esc closes the menu, as Back did");
   }
-  assert.deepEqual(c.opened, ["run:build:api"], "selecting the agent shows its transcript, as View transcript did");
+  assert.deepEqual(c.opened, ["run:build:api"], "selecting the agent shows its transcript");
   c.pi.send("d");
   assert.match(c.pi.screen()[1] ?? "", /│ State: running\s*$/, "d shows /workflow's agent details");
   // enter on the run header opens its menu, as the dashboard's enter on the root did.
@@ -950,23 +950,22 @@ function subagents(t: TestContext, s: SubagentFixture, options: CommandOptions =
 }
 const LISTING_UI: AgentAttemptActionUi = { notify() {}, confirm: async () => false, select: async () => undefined, input: async () => undefined };
 /**
- * The labels the /subagents dashboard offered on the subagent `id`, with View transcript and Back. The dashboard also offered
+ * The labels the /subagents dashboard offered on the subagent `id`, with Back. The dashboard also offered
  * Delete all completed and Delete all failed on every subagent; in the workspace they moved to the Subagents group (approved UX).
  */
 async function dashboardLabels(s: SubagentFixture, ctx: ExtensionCommandContext, id: string): Promise<string[]> {
   return actionOptions(s.manager, await inspectEntry(s.manager, s.storageDirectory, id, ctx), ctx, LISTING_UI);
 }
 
-void test("/subagents: a subagent offers the dashboard's actions without View transcript and its bulk deletions, which moved to the group; selecting shows the transcript, d the detail rows; an inspection that fails is shown in the menu", async (t) => {
+void test("/subagents: a subagent offers the dashboard's actions and its bulk deletions, which moved to the group; selecting shows the transcript, d the detail rows; an inspection that fails is shown in the menu", async (t) => {
   timers(t);
   const escaped = escapes(t);
   const s = subagentFixture({ unreadable: ["run-x"] });
   const c = subagents(t, s);
   await shown(c.pi, /^#1\/4 scout run-a running model$/);
   assert.deepEqual(sidebarRows(c.pi), ["  ▾ Subagents  1 running · 1 failed · 2 c…", "→   • scout run-a · ⠦", "    • run-c · ✗", "    • scout run-b · ✓", "    • run-x · ✓"]);
-  assert.deepEqual(c.opened, ["subagent:run-a"], "the selected subagent's transcript, as View transcript showed it");
-  const dashboard = async (id: string): Promise<string[]> => (await dashboardLabels(s, c.pi.ctx, id)).filter((label) => label !== "View transcript" && label !== "Back");
-  assert.equal((await dashboardLabels(s, c.pi.ctx, "run-a"))[0], "View transcript");
+  assert.deepEqual(c.opened, ["subagent:run-a"], "the selected subagent's transcript");
+  const dashboard = async (id: string): Promise<string[]> => (await dashboardLabels(s, c.pi.ctx, id)).filter((label) => label !== "Back");
   for (const [id, title] of [["run-a", /^#1\/4 scout run-a/], ["run-c", /^#2\/4 run-c/], ["run-b", /^#3\/4 scout run-b/]] as const) {
     select(c.pi, title);
     assert.deepEqual(await menuOf(c.pi), ["Subagent actions", ...(await dashboard(id)).map((label, row) => `${row === 0 ? "→" : " "} ${label}`)], id);
