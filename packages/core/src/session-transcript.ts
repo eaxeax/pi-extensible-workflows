@@ -7,12 +7,16 @@ import type { WorkflowAgentSessionReference } from "./types.js";
 const SCAN_BLOCK_BYTES = 64 * 1024;
 /** Pi bounds its own session header scan to 1 MiB (MAX_SESSION_HEADER_SCAN_BYTES). */
 const HEADER_LIMIT_BYTES = 1024 * 1024;
+/** Bytes of the window before the read position that a poll compares to detect a rewrite. */
+const SAMPLE_BYTES = 4096;
+/** Most bytes of the header line that a poll compares to detect a rewrite. */
+const HEADER_SAMPLE_BYTES = 16 * 1024;
 const NEWLINE = 0x0a;
 //NOTE: Windows has neither flag; there the open is a plain read-only open.
 const { O_NONBLOCK = 0, O_NOFOLLOW = 0 } = constants as Partial<typeof constants>;
 const OPEN_FLAGS = constants.O_RDONLY | O_NONBLOCK | O_NOFOLLOW;
 
-interface OpenFile { readonly handle: FileHandle; readonly dev: bigint; readonly ino: bigint; size: number; start: number; end: number }
+interface OpenFile { readonly handle: FileHandle; readonly dev: bigint; readonly ino: bigint; size: number; mtimeNs: bigint; ctimeNs: bigint; sample: Buffer; headerBytes: number; start: number; end: number; scanned: number; pending: Buffer }
 interface Closed { readonly status: "waiting" | "unavailable"; readonly reason?: string }
 
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
@@ -29,6 +33,10 @@ function parseRecord(line: Buffer, offset: number): TranscriptRecord {
   return isRecord(value) ? { kind: "entry", offset, bytes: line.length, value } : { kind: "unreadable", offset, bytes: line.length };
 }
 
+let readObserver: ((bytes: number) => void) | undefined;
+/** Test hook: `observer` receives the byte count of every read the readers make; undefined removes it. */
+export function observeSessionTranscriptReads(observer: ((bytes: number) => void) | undefined): void { readObserver = observer; }
+
 async function readAt(handle: FileHandle, position: number, length: number): Promise<Buffer> {
   const buffer = Buffer.allocUnsafe(length);
   let filled = 0;
@@ -37,6 +45,7 @@ async function readAt(handle: FileHandle, position: number, length: number): Pro
     if (bytesRead === 0) break;
     filled += bytesRead;
   }
+  readObserver?.(filled);
   return buffer.subarray(0, filled);
 }
 /** Position of the first newline in [from, to), read in blocks; -1 when there is none. */
@@ -56,6 +65,12 @@ async function newlineBefore(handle: FileHandle, to: number): Promise<number> {
     if (index !== -1) return position + index;
   }
   return -1;
+}
+
+/** What a later poll compares to see that the file was rewritten in place: the header line (up to HEADER_SAMPLE_BYTES) and the last SAMPLE_BYTES before `scanned`, the read position. */
+async function sampleBefore(handle: FileHandle, scanned: number, headerBytes: number): Promise<Buffer> {
+  const length = Math.min(SAMPLE_BYTES, scanned);
+  return Buffer.concat([await readAt(handle, 0, Math.min(HEADER_SAMPLE_BYTES, headerBytes, scanned)), await readAt(handle, scanned - length, length)]);
 }
 
 /** Opens `path` once and runs the identity checks on that descriptor; on success the descriptor is the only way the file is read. */
@@ -78,7 +93,7 @@ async function openChecked(path: string, sessionId: string): Promise<OpenFile | 
     const header = parseValue(await readAt(handle, 0, headerEnd));
     if (!isRecord(header) || header.type !== "session" || typeof header.id !== "string") return await rejected(unavailable("the file does not start with a pi session header"));
     if (header.id !== sessionId) return await rejected(unavailable("the file belongs to another session"));
-    return { handle, dev: stats.dev, ino: stats.ino, size, start: 0, end: 0 };
+    return { handle, dev: stats.dev, ino: stats.ino, size, mtimeNs: stats.mtimeNs, ctimeNs: stats.ctimeNs, sample: Buffer.alloc(0), headerBytes: headerEnd, start: 0, end: 0, scanned: 0, pending: Buffer.alloc(0) };
   } catch (error) { return await rejected(failure(error)); }
 }
 
@@ -98,7 +113,7 @@ export function openSessionTranscript(reference: WorkflowAgentSessionReference |
     let start = 0;
     for (let index = buffer.indexOf(NEWLINE); index !== -1; index = buffer.indexOf(NEWLINE, start)) {
       const line = buffer.subarray(start, index);
-      records.push(line.length > largeBytes ? { kind: "large", offset: base + start, bytes: line.length } : parseRecord(line, base + start));
+      records.push(line.length > largeBytes || line.length > chunkBytes ? { kind: "large", offset: base + start, bytes: line.length } : parseRecord(line, base + start));
       start = index + 1;
     }
   };
@@ -118,21 +133,32 @@ export function openSessionTranscript(reference: WorkflowAgentSessionReference |
     records.push({ kind: "large", offset: start, bytes: limit - 1 - start });
     return { records, start };
   };
-  /** Complete lines in [from, size); a trailing line without a newline is left for a later poll. */
-  const linesFrom = async (handle: FileHandle, from: number, size: number): Promise<{ records: TranscriptRecord[]; end: number }> => {
+  /**
+   * Complete lines of [from, size) given `pending`, the bytes already read after `from` (the start of a line without a newline yet; empty once that line is longer than a chunk).
+   * Every byte from `scanned` to `size` is read once, so a poll reads the growth plus the bounded rewrite sample, never the whole file.
+   */
+  const linesFrom = async (handle: FileHandle, from: number, scanned: number, pending: Buffer, size: number): Promise<{ records: TranscriptRecord[]; end: number; scanned: number; pending: Buffer }> => {
     const records: TranscriptRecord[] = [];
-    let position = from;
+    let lineStart = from;
+    let held = pending;
+    let position = scanned;
     while (position < size) {
-      const buffer = await readAt(handle, position, Math.min(chunkBytes + 1, size - position));
-      const last = buffer.lastIndexOf(NEWLINE);
-      if (last !== -1) { pushLines(records, buffer.subarray(0, last + 1), position); position += last + 1; continue; }
-      if (buffer.length <= chunkBytes) break;
-      const newline = await newlineAfter(handle, position + buffer.length, size);
-      if (newline === -1) break;
-      records.push({ kind: "large", offset: position, bytes: newline - position });
-      position = newline + 1;
+      const block = await readAt(handle, position, Math.min(SCAN_BLOCK_BYTES, size - position));
+      if (block.length === 0) break;
+      const base = position;
+      position += block.length;
+      let segment = 0;
+      for (let index = block.indexOf(NEWLINE); index !== -1; index = block.indexOf(NEWLINE, segment)) {
+        const newline = base + index;
+        if (newline - lineStart > chunkBytes) records.push({ kind: "large", offset: lineStart, bytes: newline - lineStart });
+        else pushLines(records, Buffer.concat([held, block.subarray(segment, index + 1)]), lineStart);
+        held = Buffer.alloc(0);
+        lineStart = newline + 1;
+        segment = index + 1;
+      }
+      held = position - lineStart > chunkBytes ? Buffer.alloc(0) : Buffer.concat([held, block.subarray(segment)]);
     }
-    return { records, end: position };
+    return { records, end: lineStart, scanned: position, pending: held };
   };
   const drop = async (): Promise<void> => {
     const current = file;
@@ -148,6 +174,10 @@ export function openSessionTranscript(reference: WorkflowAgentSessionReference |
     const chunk = await chunkBefore(opened.handle, end);
     opened.start = chunk.start;
     opened.end = end;
+    // The unterminated tail is read once now; a later poll continues after it.
+    opened.scanned = opened.size;
+    opened.pending = opened.size - end <= chunkBytes ? await readAt(opened.handle, end, opened.size - end) : Buffer.alloc(0);
+    opened.sample = await sampleBefore(opened.handle, opened.scanned, opened.headerBytes);
     return { status: "available", reset, appended: chunk.records, atStart: chunk.start === 0 };
   };
   const poll = async (filePath: string, sessionId: string): Promise<TranscriptPoll> => {
@@ -160,9 +190,27 @@ export function openSessionTranscript(reference: WorkflowAgentSessionReference |
       await drop();
       return openPoll(filePath, sessionId, true);
     }
+    //NOTE: a rewrite that keeps the sampled bytes (the header's first HEADER_SAMPLE_BYTES and the SAMPLE_BYTES before the read position, which cover the end of a held unterminated tail) and grows the file is not detected; neither is a change earlier in a held tail or in the skipped middle of the file.
+    // A changed ctime at an equal size also counts as a rewrite, so chmod, chown and a new link reset the transcript too.
+    const unchanged = descriptor.mtimeNs === current.mtimeNs && descriptor.ctimeNs === current.ctimeNs;
+    const previousSize = current.size;
+    if (size === previousSize && !unchanged) {
+      await drop();
+      return openPoll(filePath, sessionId, true);
+    }
+    if (size > previousSize && !(await sampleBefore(current.handle, current.scanned, current.headerBytes)).equals(current.sample)) {
+      await drop();
+      return openPoll(filePath, sessionId, true);
+    }
     current.size = size;
-    const appended = await linesFrom(current.handle, current.end, size);
+    current.mtimeNs = descriptor.mtimeNs;
+    current.ctimeNs = descriptor.ctimeNs;
+    if (unchanged && size === previousSize) return { status: "available", reset: false, appended: [], atStart: current.start === 0 };
+    const appended = await linesFrom(current.handle, current.end, current.scanned, current.pending, size);
+    current.pending = appended.pending;
+    current.scanned = appended.scanned;
     current.end = appended.end;
+    current.sample = await sampleBefore(current.handle, current.scanned, current.headerBytes);
     return { status: "available", reset: false, appended: appended.records, atStart: current.start === 0 };
   };
 
