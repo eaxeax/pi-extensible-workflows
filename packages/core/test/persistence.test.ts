@@ -708,6 +708,34 @@ void test("reuses named worktrees through durable follow-up bindings without del
   await second.delete(true);
 });
 
+void test("recordedWorktrees lists own and borrowed records whose directory is gone and drops only a binding that cannot be resolved", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-recorded-worktrees-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo);
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const banana = structuralPath("worktree", "named", "banana");
+  const apple = structuralPath("worktree", "named", "apple");
+  const source = new RunStore(repo, "session-a", "source", home);
+  await source.create({ ...run(repo), id: "source", state: "completed" }, snapshot);
+  const borrowed = await source.worktree(banana);
+  const child = new RunStore(repo, "session-a", "child", home);
+  await child.create({ ...run(repo), id: "child", parentRunId: "source", state: "completed" }, snapshot);
+  await child.worktree(banana);
+  const own = await child.worktree(apple);
+  rmSync(borrowed.path, { recursive: true, force: true });
+  rmSync(own.path, { recursive: true, force: true });
+  assert.deepEqual((await child.recordedWorktrees()).map(({ owner }) => owner).sort(), [apple, banana].sort());
+  await assert.rejects(child.worktrees(), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+  const cherry = structuralPath("worktree", "named", "cherry");
+  writeFileSync(join(child.directory, "borrowed-worktrees.json"), JSON.stringify([{ name: "banana", sourceRunId: "source", owner: banana }, { name: "cherry", sourceRunId: "missing-run", owner: cherry }]));
+  assert.deepEqual((await child.recordedWorktrees()).map(({ owner }) => owner).sort(), [apple, banana].sort());
+});
+
 void test("retry named worktrees fail closed when an inherited record disappears", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-stale-worktree-"));
   const repo = join(home, "repo");

@@ -4,12 +4,13 @@ import { attemptValue, statusValue } from "../subagents/src/decode.js";
 import type { AgentsActionTarget, SubagentPresentation, SubagentPresenter } from "./agents-actions-contract.js";
 import type { SessionAgent, SessionAgentsSource, SessionTreeNode } from "./agents-workspace-contract.js";
 import { formatAgentsTimeline, type AgentsTimelineEntry } from "./agents-timeline.js";
+import { worktreeChanges, type WorktreeChanges } from "./agent-worktree.js";
 import { agentLastActivity, agentSilentFor, STALL_MS } from "./agent-activity.js";
 import { formatCost, formatTokens } from "./background-widget.js";
 import { buildWorkflowPhaseModel, buildWorkflowPhaseTree, workflowPhaseTreeInitialExpanded, workflowPhaseTreeVisibleNodes, type WorkflowPhaseTreeNode } from "./host-phases.js";
 import { agentActivityLabel, formatWorkflowNodeDetails, formatWorkflowRuntime, formatWorkflowTreeLine, navigatorAttentionSort, navigatorAttentionSortByState, progressStyleForState, runStateGlyph, type WorkflowProgressStyles } from "./host-view.js";
 import { sameFilesystemPath } from "./paths.js";
-import { listRunIds, RunStore, type PersistedRun } from "./persistence.js";
+import { listRunIds, RunStore, type PersistedRun, type WorktreeReference } from "./persistence.js";
 import { isHardTerminalRunState, SETTLED_AGENT_STATES, type AgentAccounting, type AgentAttemptError, type AgentAttemptSummary, type AgentRecord, type LaunchSnapshot, type ModelSpec, type WorkflowAgentSession } from "./types.js";
 import { errorText, isObject, sanitizeDisplayText } from "./utils.js";
 
@@ -127,10 +128,33 @@ function unavailableGroup(reason: string): SessionTreeNode {
   };
 }
 
+/** The least time between two git reads of one worktree. */
+const WORKTREE_REFRESH_MS = 5000;
+type WorktreeEntry = { changes: WorktreeChanges | undefined; startedAt: number; reading: boolean };
+/** The rows of an agent's worktree in its details: branch, path, then the changes once git has answered. Git runs without blocking, at most once per WORKTREE_REFRESH_MS per worktree; the workspace's next redraw shows its answer. */
+function worktreeRows(reference: WorktreeReference, cache: Map<string, WorktreeEntry>, styles: WorkflowProgressStyles, now: number): string[] {
+  const key = JSON.stringify([reference.path, reference.base]);
+  let entry = cache.get(key);
+  if (entry === undefined) { entry = { changes: undefined, startedAt: Number.NEGATIVE_INFINITY, reading: false }; cache.set(key, entry); }
+  if (!entry.reading && now - entry.startedAt >= WORKTREE_REFRESH_MS) {
+    const current = entry;
+    current.reading = true;
+    current.startedAt = now;
+    void worktreeChanges(reference).then((changes) => { current.changes = changes; }, (error: unknown) => { current.changes = { error: errorText(error) }; }).finally(() => { current.reading = false; });
+  }
+  const changes = entry.changes;
+  const rows = [`branch: ${sanitizeDisplayText(reference.branch)}`, `path: ${sanitizeDisplayText(reference.path)}`];
+  if (changes === undefined) return [...rows, "worktree: reading…"];
+  if ("removed" in changes) return [...rows, "worktree removed"];
+  if ("error" in changes) return [...rows, styles.warning(`worktree unavailable: ${sanitizeDisplayText(changes.error)}`)];
+  return [...rows, ...changes.stat.map(sanitizeDisplayText), ...(changes.uncommitted ? ["uncommitted changes"] : [])];
+}
+
 /** How long a running workflow agent has been silent, when it is quiet or stalled. */
 type Silence = { readonly kind: "quiet" | "stalled"; readonly ms: number };
 
 export function createSessionAgentsSource(context: ExtensionCommandContext, deps: SessionAgentsDependencies, scope: SessionAgentsScope = "all"): SessionAgentsSource {
+  const worktreeCache = new Map<string, WorktreeEntry>();
   const runAgent = (run: PersistedRun, agent: AgentRecord, cache: Map<string, number | undefined>): SessionAgent => {
     const attempt = latestAttempt(agent.attemptDetails);
     const running = !SETTLED_AGENT_STATES.has(agent.state);
@@ -152,7 +176,7 @@ export function createSessionAgentsSource(context: ExtensionCommandContext, deps
     };
   };
   /** The run's /workflow tree, every node in the order /workflow draws them, under a header row for the run. */
-  const runNodes = (run: PersistedRun, snapshot: Readonly<LaunchSnapshot>, waitingFor: string | undefined, now: number, cache: Map<string, number | undefined>): SessionTreeNode[] => {
+  const runNodes = (run: PersistedRun, snapshot: Readonly<LaunchSnapshot>, waitingFor: string | undefined, worktrees: readonly WorktreeReference[], now: number, cache: Map<string, number | undefined>): SessionTreeNode[] => {
     const model = buildWorkflowPhaseModel(run, snapshot);
     const tree = buildWorkflowPhaseTree(model);
     const expanded = workflowPhaseTreeInitialExpanded(tree);
@@ -184,8 +208,11 @@ export function createSessionAgentsSource(context: ExtensionCommandContext, deps
         line: (styles, selected, open) => root
           ? `${headerLine(shown.label, runSummary(run, styles), selected, open, node.children.length > 0, styles)}${waiting && styles.warning(waiting)}`
           : `${formatWorkflowTreeLine(shown, selected, open, styles)}${silence === undefined ? "" : silence.kind === "stalled" ? styles.error(silenceMark(silence)) : styles.warning(silenceMark(silence))}`,
+        // The base rows of a run node are never empty; asking must not start a git read, which only drawing does.
+        hasDetails: () => true,
         details: (styles, now) => {
-          const base = formatWorkflowNodeDetails(shownRun, tree, shown, styles, now, false);
+          const reference = agent?.worktreeOwner === undefined ? undefined : worktrees.find((candidate) => candidate.owner === agent.worktreeOwner);
+          const base = [...formatWorkflowNodeDetails(shownRun, tree, shown, styles, now, false), ...(reference === undefined ? [] : ["", ...worktreeRows(reference, worktreeCache, styles, now)])];
           const unassigned = (root || node.kind === "phase" ? model.unassignedAgents ?? [] : []).map((member) => ({ group: "Unassigned", agent: displayAgent(member) }));
           const timeline = !root && node.kind !== "phase" ? [] : root
             ? agentTimeline([...model.phases.flatMap((phase) => phase.agents.map((member) => ({ group: sanitizeDisplayText(`${phase.name}${phase.occurrence > 1 ? ` #${String(phase.occurrence)}` : ""}`), agent: displayAgent(member) }))), ...unassigned], styles, now)
@@ -211,10 +238,11 @@ export function createSessionAgentsSource(context: ExtensionCommandContext, deps
         const terminalAt = (await store.loadSummary().catch(() => undefined))?.terminalAt;
         const resolvedAt = terminalAt === undefined ? undefined : Date.parse(terminalAt);
         const waitingFor = run.state === "awaiting_input" ? (await store.awaitingCheckpoints().catch(() => []))[0]?.name : undefined;
-        return { loaded: { run: deps.overlayRun(run), snapshot, waitingFor }, resolvedAt: resolvedAt !== undefined && Number.isFinite(resolvedAt) ? resolvedAt : undefined };
+        const worktrees = await store.recordedWorktrees().catch(() => []);
+        return { loaded: { run: deps.overlayRun(run), snapshot, waitingFor, worktrees }, resolvedAt: resolvedAt !== undefined && Number.isFinite(resolvedAt) ? resolvedAt : undefined };
       } catch { return undefined; }
     }));
-    return navigatorAttentionSort(loaded.filter((entry) => entry !== undefined)).flatMap(({ loaded: { run, snapshot, waitingFor } }) => runNodes(run, snapshot, waitingFor, now, cache));
+    return navigatorAttentionSort(loaded.filter((entry) => entry !== undefined)).flatMap(({ loaded: { run, snapshot, waitingFor, worktrees } }) => runNodes(run, snapshot, waitingFor, worktrees, now, cache));
   };
   /** The row of the listed subagent `id`: its key, name and target address that id; `status` gives its state and attempt. */
   const subagent = (manager: SubagentManager, id: string, status: SubagentStatus, owned: boolean, presentation: SubagentPresentation | undefined): SessionTreeNode => {

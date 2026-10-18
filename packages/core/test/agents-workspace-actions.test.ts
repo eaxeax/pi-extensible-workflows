@@ -807,7 +807,7 @@ void test("/workflow: an agent's copies and its prompt, system prompt and result
   const title = /^#1\/1 agent-1 completed/;
   await shown(c.pi, title);
   const mark = c.pi.events.length;
-  assert.deepEqual(labelsOf(await menuOf(c.pi)), ["Copy branch", "Copy worktree path", "Open prompt in editor", "Open system prompt in editor", "Open result in editor", "Copy agent ID"]);
+  assert.deepEqual(labelsOf(await menuOf(c.pi)), ["Copy branch", "Copy worktree path", "Open diff in editor", "Open prompt in editor", "Open system prompt in editor", "Open result in editor", "Copy agent ID"]);
   c.pi.send(KEY.escape);
   for (const [label, notice] of [["Copy branch", "Copied branch."], ["Copy worktree path", "Copied worktree path."], ["Copy agent ID", "Copied agent ID."]] as const) {
     await choose(c.pi, label);

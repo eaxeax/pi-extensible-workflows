@@ -80,6 +80,11 @@ export interface SessionTreeNode {
    * there is nothing to show.
    */
   details(styles: WorkflowProgressStyles, now: number): readonly string[];
+  /**
+   * Whether details() would return rows, without doing any work that details() does while drawing (such as reading git). The workspace
+   * asks it on refresh and on `d`; a node without it is asked through details().length > 0.
+   */
+  hasDetails?(): boolean;
   /** The title row of a node that is not an agent: its label and state. */
   title(styles: WorkflowProgressStyles): string;
   /** Set only for kind "agent". */

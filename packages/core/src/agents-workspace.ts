@@ -400,7 +400,7 @@ class Workspace {
   }
 
   private selectedNode(): SessionTreeNode | undefined { return this.selectedKey === undefined ? undefined : this.byKey.get(this.selectedKey); }
-  private hasDetails(node: SessionTreeNode): boolean { return node.details(this.styles, Date.now()).length > 0; }
+  private hasDetails(node: SessionTreeNode): boolean { return node.hasDetails?.() ?? node.details(this.styles, Date.now()).length > 0; }
   /** The right pane of the selected node's details, scrolled from the top. */
   private detailsPane(): ScrollView { return new ScrollView(this.details, { primary: true, scrollbar: "auto" }); }
   /**

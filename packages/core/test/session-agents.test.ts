@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -841,4 +842,103 @@ void test("a subagent storage failure keeps the run nodes and lists the Subagent
   assert.deepEqual(group.details(PLAIN, 0), ["Subagents", "subagents unavailable: storage broken"]);
   assert.equal(group.line(PLAIN, false, false).includes("unavailable"), true);
   assert.deepEqual(nodes.filter(({ parentKey }) => parentKey === "subagents"), []);
+});
+
+void test("a workflow agent's details read its worktree asynchronously: reading, then branch, path, stat and uncommitted changes; removed; none without a worktree", async () => {
+  const { home, cwd } = fixture();
+  execFileSync("git", ["init", "-q", cwd]);
+  const git = (...args: string[]): string => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
+  git("config", "user.name", "test");
+  git("config", "user.email", "test@example.com");
+  writeFileSync(join(cwd, "a.txt"), "one\n");
+  writeFileSync(join(cwd, "b.txt"), "one\n");
+  git("add", ".");
+  git("commit", "-qm", "base");
+  const store = await createRun(home, cwd, "session", "run-wt", "wf", "completed", [agent("wt", "wt", "completed", [attempt(1, "wt-1")], { worktreeOwner: "owner" }), agent("plain", "plain", "completed", [attempt(1, "plain-1")])]);
+  const { path, branch } = await store.worktree("owner");
+  const base = (await store.worktrees())[0]?.base ?? "";
+  assert.notEqual(base, "");
+  writeFileSync(join(path, "a.txt"), "one\ntwo\n");
+  execFileSync("git", ["-C", path, "-c", "user.name=t", "-c", "user.email=t@e.x", "commit", "-qam", "change"]);
+  writeFileSync(join(path, "b.txt"), "one\nthree\n");
+  const source = createSessionAgentsSource(commandContext(cwd), dependencies(home));
+  const nodes = await source.list();
+  const rows = (key: string): readonly string[] => nodes.find((node) => node.key === key)?.details(PLAIN, Date.now()) ?? [];
+  const first = rows("run:run-wt:wt");
+  assert.ok(first.includes(`branch: ${branch}`));
+  assert.ok(first.includes(`path: ${path}`));
+  assert.ok(first.includes("worktree: reading…"));
+  assert.equal(rows("run:run-wt:plain").some((line) => line.startsWith("worktree") || line.startsWith("branch:")), false);
+  for (let tries = 0; rows("run:run-wt:wt").includes("worktree: reading…") && tries < 200; tries++) await new Promise((resolve) => setTimeout(resolve, 25));
+  const settled = rows("run:run-wt:wt");
+  assert.ok(settled.some((line) => /a\.txt \|/.test(line)), settled.join("\n"));
+  assert.ok(settled.includes("uncommitted changes"));
+  rmSync(path, { recursive: true, force: true });
+  const gone = (await createSessionAgentsSource(commandContext(cwd), dependencies(home)).list()).find((node) => node.key === "run:run-wt:wt");
+  const goneRows = (): readonly string[] => gone?.details(PLAIN, Date.now()) ?? [];
+  for (let tries = 0; goneRows().includes("worktree: reading…") && tries < 200; tries++) await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.ok(goneRows().includes(`branch: ${branch}`));
+  assert.ok(goneRows().includes(`path: ${path}`));
+  assert.ok(goneRows().includes("worktree removed"), goneRows().join("\n"));
+  assert.equal(gone?.hasDetails?.(), true);
+});
+
+void test("a workflow agent's details say why git cannot read its worktree", async () => {
+  const { home, cwd } = fixture();
+  execFileSync("git", ["init", "-q", cwd]);
+  writeFileSync(join(cwd, "a.txt"), "one\n");
+  execFileSync("git", ["-C", cwd, "add", "."]);
+  execFileSync("git", ["-C", cwd, "-c", "user.name=t", "-c", "user.email=t@e.x", "commit", "-qm", "base"]);
+  const store = await createRun(home, cwd, "session", "run-bad", "wf", "completed", [agent("wt", "wt", "completed", [attempt(1, "wt-1")], { worktreeOwner: "owner" })]);
+  const { path } = await store.worktree("owner");
+  // A directory that is no longer a git checkout: git cannot read it.
+  rmSync(join(path, ".git"), { force: true });
+  const source = createSessionAgentsSource(commandContext(cwd), dependencies(home));
+  const nodes = await source.list();
+  const rows = (): readonly string[] => nodes.find((node) => node.key === "run:run-bad:wt")?.details(PLAIN, Date.now()) ?? [];
+  for (let tries = 0; rows().includes("worktree: reading…") && tries < 200; tries++) await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.ok(rows().some((line) => line.startsWith("worktree unavailable: ")), rows().join("\n"));
+});
+
+function gitRepo(cwd: string): void {
+  execFileSync("git", ["init", "-q", cwd]);
+  writeFileSync(join(cwd, "a.txt"), "one\n");
+  execFileSync("git", ["-C", cwd, "add", "."]);
+  execFileSync("git", ["-C", cwd, "-c", "user.name=t", "-c", "user.email=t@e.x", "commit", "-qm", "base"]);
+}
+
+void test("asking whether an agent has details starts no git read; drawing its details does", async () => {
+  const { home, cwd } = fixture();
+  gitRepo(cwd);
+  const store = await createRun(home, cwd, "session", "run-ask", "wf", "completed", [agent("wt", "wt", "completed", [attempt(1, "wt-1")], { worktreeOwner: "owner" })]);
+  await store.worktree("owner");
+  const node = (await createSessionAgentsSource(commandContext(cwd), dependencies(home)).list()).find((entry) => entry.key === "run:run-ask:wt");
+  assert.equal(node?.hasDetails?.(), true);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  // Had asking started git, it would have answered by now and the first drawing would show the stat or the clean state.
+  assert.ok(node.details(PLAIN, Date.now()).includes("worktree: reading…"));
+  for (let tries = 0; node.details(PLAIN, Date.now()).includes("worktree: reading…") && tries < 200; tries++) await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(node.details(PLAIN, Date.now()).includes("worktree: reading…"), false);
+});
+
+void test("a borrowed worktree binding that cannot be resolved loses only its own agents' rows", async () => {
+  const { home, cwd } = fixture();
+  gitRepo(cwd);
+  const banana = "worktree/named/banana";
+  const source = await createRun(home, cwd, "session", "run-src", "wf", "completed", []);
+  await source.worktree(banana);
+  const store = await createRun(home, cwd, "session", "run-child", "wf", "completed", [
+    agent("own", "own", "completed", [attempt(1, "own-1")], { worktreeOwner: "owner" }),
+    agent("borrowed", "borrowed", "completed", [attempt(1, "b-1")], { worktreeOwner: banana }),
+    agent("broken", "broken", "completed", [attempt(1, "x-1")], { worktreeOwner: "worktree/named/cherry" }),
+  ], { parentRunId: "run-src" });
+  await store.worktree("owner");
+  await store.worktree(banana);
+  const bindings = await store.borrowedWorktrees();
+  writeFileSync(join(store.directory, "borrowed-worktrees.json"), JSON.stringify([...bindings, { name: "cherry", sourceRunId: "no-such-run", owner: "worktree/named/cherry" }]));
+  const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home)).list();
+  const branchRow = (key: string): boolean => nodes.find((node) => node.key === key)?.details(PLAIN, Date.now()).some((line) => line.startsWith("branch:")) ?? false;
+  assert.equal(branchRow("run:run-child:own"), true);
+  assert.equal(branchRow("run:run-child:borrowed"), true);
+  assert.equal(branchRow("run:run-child:broken"), false);
 });

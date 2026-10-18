@@ -2112,6 +2112,20 @@ void test("a state's sidebar stays hidden below 80 columns; its tools and d hold
   await leave(details);
 });
 
+void test("an agent's details are read only while drawn: selecting it with its transcript shown asks hasDetails, d reads details", async () => {
+  const counter = { reads: 0 };
+  const reads = (): number => counter.reads;
+  const nodes = tree(TREE()).map((node) => node.key === "b" ? { ...node, hasDetails: () => true, details: () => { counter.reads += 1; return ["Model: gpt-5"]; } } : node);
+  const harness = await open([], { nodes, state: stateOf() });
+  await settle();
+  assert.equal(reads(), 0, "no details() call while the transcript is shown");
+  assert.ok((harness.screen().at(-1) ?? "").includes("d details"), "the hint comes from hasDetails");
+  harness.send("d");
+  await settle();
+  assert.ok(reads() > 0, "d draws the details");
+  await leave(harness);
+});
+
 /** Opens TARGETED at `columns`, presses `keys`, then steps aside for the selected agent's Stop: the state its exit keeps. */
 async function steppedAside(columns: number, ...keys: string[]): Promise<AgentsWorkspaceState> {
   const harness = await open([], { columns, nodes: tree(TARGETED()), actions: [new FakeProvider({ "workflow-agent": steps("Stop") })] });
