@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after } from "node:test";
@@ -545,6 +545,151 @@ void test("the Subagents group's row is a header with its counts and cost, and t
   const busy = await group([row("sub-done", "completed", 0, { finishedAt: 2 }), row("sub-running", "running", 0)]);
   assert.equal(busy.initiallyExpanded, true, "a subagent runs");
   assert.equal(busy.line(PLAIN, false, true), "  ▾ Subagents  1 running · 1 completed");
+});
+
+void test("the Subagents group takes a summary state: running while one runs, else failed if one failed, else done", async () => {
+  const { home, cwd } = fixture();
+  const row = (id: string, state: string): Record<string, unknown> => ({ id, sessionId: "session", state, startedAt: 1, finishedAt: state === "running" ? undefined : 2, attempts: 1, progress: { accounting: ZERO, toolCalls: [] } });
+  const title = async (states: readonly string[]): Promise<string> => {
+    const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => fakeManager(states.map((state, index) => row(`sub-${String(index)}`, state))) })).list();
+    return nodes.find(({ key }) => key === "subagents")?.title(PLAIN) ?? "";
+  };
+  assert.equal(await title(["completed", "failed", "running"]), "Subagents running");
+  assert.equal(await title(["completed", "failed", "stopped"]), "Subagents failed");
+  assert.equal(await title(["stopped", "completed"]), "Subagents completed", "a stopped subagent beside a finished one does not make the group stopped");
+  assert.equal(await title(["stopped"]), "Subagents stopped");
+});
+
+void test("a run that has reached a terminal state is read once: a later list reuses the time it settled", async () => {
+  const { home, cwd } = fixture();
+  const a = await createRun(home, cwd, "session", "run-a", "flow", "completed", [agent("a", "a", "completed", [attempt(1, "a-1")])]);
+  const b = await createRun(home, cwd, "session", "run-b", "flow", "completed", [agent("b", "b", "completed", [attempt(1, "b-1")])]);
+  const order = async (source: ReturnType<typeof createSessionAgentsSource>): Promise<string[]> => (await source.list()).filter(({ kind }) => kind === "run").map(({ key }) => key);
+  setTerminalAt(a, "2026-01-02T00:00:00.000Z");
+  setTerminalAt(b, "2026-01-01T00:00:00.000Z");
+  const source = createSessionAgentsSource(commandContext(cwd), dependencies(home));
+  const first = await order(source);
+  setTerminalAt(a, "2025-01-01T00:00:00.000Z");
+  assert.deepEqual(await order(source), first, "the settled time is not read again");
+  const before = (await source.list()).map(({ key, agent }) => [key, agent?.state]);
+  writeFileSync(join(a.directory, "snapshot.json"), "{ not json");
+  writeFileSync(join(b.directory, "snapshot.json"), "{ not json");
+  assert.deepEqual((await source.list()).map(({ key, agent }) => [key, agent?.state]), before, "a settled run's snapshot is not read again");
+  assert.equal((await createSessionAgentsSource(commandContext(cwd), dependencies(home)).list()).some(({ key }) => key === "run:run-a"), false, "a new source reads the damaged file");
+  assert.notDeepEqual(await order(createSessionAgentsSource(commandContext(cwd), dependencies(home))), first, "a new source reads the file");
+});
+
+void test("a cached settled run still goes through the host's overlay on every list", async () => {
+  const { home, cwd } = fixture();
+  await createRun(home, cwd, "session", "run-a", "flow", "completed", [agent("a", "a", "completed", [attempt(1, "a-1")])]);
+  let label = "first";
+  const overlaid: string[] = [];
+  const source = createSessionAgentsSource(commandContext(cwd), dependencies(home, {
+    overlayRun: (run: PersistedRun) => { overlaid.push(run.id); return { ...run, workflowName: label }; },
+  }));
+  const title = async (): Promise<string | undefined> => (await source.list()).find(({ key }) => key === "run:run-a")?.title(PLAIN);
+  assert.match(await title() ?? "", /first/);
+  label = "second";
+  assert.match(await title() ?? "", /second/, "the cached run shows the overlay of this list, not the first one");
+  assert.deepEqual(overlaid, ["run-a", "run-a"]);
+});
+
+void test("a settled run whose summary.json is older than its state.json or journal.json is read again until the summary is current", async () => {
+  const { home, cwd } = fixture();
+  const a = await createRun(home, cwd, "session", "run-a", "flow", "completed", [agent("a", "a", "completed", [attempt(1, "a-1")])]);
+  const b = await createRun(home, cwd, "session", "run-b", "flow", "completed", [agent("b", "b", "completed", [attempt(1, "b-1")])]);
+  const old = Date.now() / 1000 - 100;
+  utimesSync(join(a.directory, "summary.json"), old, old);
+  setTerminalAt(b, "2026-01-01T00:00:00.000Z");
+  setTerminalAt(a, "2026-01-02T00:00:00.000Z");
+  utimesSync(join(a.directory, "summary.json"), old, old);
+  const source = createSessionAgentsSource(commandContext(cwd), dependencies(home));
+  const order = async (): Promise<string[]> => (await source.list()).filter(({ kind }) => kind === "run").map(({ key }) => key);
+  const stale = await order();
+  setTerminalAt(a, "2025-01-01T00:00:00.000Z");
+  utimesSync(join(a.directory, "summary.json"), old, old);
+  assert.notDeepEqual(await order(), stale, "a stale summary was not cached");
+  const now = Date.now() / 1000 + 10;
+  utimesSync(join(a.directory, "summary.json"), now, now);
+  const current = await order();
+  setTerminalAt(a, "2026-06-01T00:00:00.000Z");
+  utimesSync(join(a.directory, "summary.json"), now, now);
+  assert.deepEqual(await order(), current, "a current summary is cached");
+});
+
+void test("a settled run whose journal.json is newer than its summary.json is not cached, though the summary is newer than state.json", async () => {
+  const { home, cwd } = fixture();
+  const a = await createRun(home, cwd, "session", "run-a", "flow", "completed", [agent("a", "a", "completed", [attempt(1, "a-1")])]);
+  const b = await createRun(home, cwd, "session", "run-b", "flow", "completed", [agent("b", "b", "completed", [attempt(1, "b-1")])]);
+  setTerminalAt(b, "2026-01-01T00:00:00.000Z");
+  setTerminalAt(a, "2026-01-02T00:00:00.000Z");
+  const base = Date.now() / 1000;
+  utimesSync(join(a.directory, "state.json"), base - 30, base - 30);
+  utimesSync(join(a.directory, "summary.json"), base - 20, base - 20);
+  utimesSync(join(a.directory, "journal.json"), base - 10, base - 10);
+  const source = createSessionAgentsSource(commandContext(cwd), dependencies(home));
+  const order = async (): Promise<string[]> => (await source.list()).filter(({ kind }) => kind === "run").map(({ key }) => key);
+  const first = await order();
+  setTerminalAt(a, "2020-01-01T00:00:00.000Z");
+  utimesSync(join(a.directory, "summary.json"), base - 20, base - 20);
+  assert.notDeepEqual(await order(), first, "the stale summary was read again");
+});
+
+void test("a cached settled run is read again when its journal.json changes", async () => {
+  const { home, cwd } = fixture();
+  const a = await createRun(home, cwd, "session", "run-a", "flow", "completed", [agent("a", "a", "completed", [attempt(1, "a-1")])]);
+  const b = await createRun(home, cwd, "session", "run-b", "flow", "completed", [agent("b", "b", "completed", [attempt(1, "b-1")])]);
+  setTerminalAt(b, "2026-01-01T00:00:00.000Z");
+  setTerminalAt(a, "2026-01-02T00:00:00.000Z");
+  const base = Date.now() / 1000;
+  for (const [name, at] of [["state.json", 30], ["journal.json", 20], ["summary.json", 10]] as const) utimesSync(join(a.directory, name), base - at, base - at);
+  const source = createSessionAgentsSource(commandContext(cwd), dependencies(home));
+  const order = async (): Promise<string[]> => (await source.list()).filter(({ kind }) => kind === "run").map(({ key }) => key);
+  const first = await order();
+  setTerminalAt(a, "2020-01-01T00:00:00.000Z");
+  utimesSync(join(a.directory, "summary.json"), base - 10, base - 10);
+  assert.deepEqual(await order(), first, "a current summary is cached");
+  utimesSync(join(a.directory, "journal.json"), base - 5, base - 5);
+  assert.notDeepEqual(await order(), first, "a changed journal.json is read again");
+});
+
+void test("an unchanged state.json of a cached run is not parsed again, a resumed run is read again", async () => {
+  const { home, cwd } = fixture();
+  const store = await createRun(home, cwd, "session", "run-a", "flow", "completed", [agent("a", "a", "completed", [attempt(1, "a-1")])]);
+  const source = createSessionAgentsSource(commandContext(cwd), dependencies(home));
+  const keys = async (): Promise<string[]> => (await source.list()).map(({ key }) => key);
+  const first = await keys();
+  const file = join(store.directory, "state.json");
+  const original = statSync(file);
+  writeFileSync(file, "x".repeat(original.size));
+  utimesSync(file, original.atimeMs / 1000, original.mtimeMs / 1000);
+  assert.deepEqual(await keys(), first, "the damaged file with the same metadata is not parsed");
+  writeFileSync(file, "{ damaged");
+  utimesSync(file, original.atimeMs / 1000, original.mtimeMs / 1000 + 5);
+  assert.notDeepEqual(await keys(), first, "a changed file is read again");
+});
+
+void test("a run resumed after it was cached is read again: state.json is read on every list", async () => {
+  const { home, cwd } = fixture();
+  const store = await createRun(home, cwd, "session", "run-a", "flow", "completed", [agent("a", "a", "completed", [attempt(1, "a-1")])]);
+  const source = createSessionAgentsSource(commandContext(cwd), dependencies(home));
+  const expanded = async (): Promise<boolean | undefined> => (await source.list()).find(({ key }) => key === "run:run-a")?.initiallyExpanded;
+  assert.equal(await expanded(), false);
+  await store.saveState({ ...(await store.load()).run, state: "running" });
+  assert.equal(await expanded(), true);
+});
+
+void test("an agent id that starts like a tree node's key part gets its own key, and no two ids share one", async () => {
+  const { home, cwd } = fixture();
+  await createRun(home, cwd, "session", "run", "flow", "completed", [agent("node:phase/unassigned", "x", "completed", [attempt(1, "x-1")]), agent("~node:phase/unassigned", "y", "completed", [attempt(1, "y-1")]), agent("plain", "z", "completed", [attempt(1, "z-1")])]);
+  const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home)).list();
+  const keys = nodes.map(({ key }) => key);
+  assert.equal(new Set(keys).size, keys.length, keys.join(", "));
+  for (const node of nodes) assert.ok(node.parentKey === undefined || keys.includes(node.parentKey), node.key);
+  assert.deepEqual(nodes.flatMap(({ target }) => target?.kind === "workflow-agent" ? [target.agentId] : []).sort(), ["node:phase/unassigned", "plain", "~node:phase/unassigned"]);
+  const agentNodes = nodes.filter(({ target }) => target?.kind === "workflow-agent");
+  assert.equal(agentNodes.length, 3);
+  for (const node of agentNodes) assert.equal(node.agent?.key, node.key);
 });
 
 void test("the Subagents group's timeline starts and ends at the subagents' status times", async () => {
