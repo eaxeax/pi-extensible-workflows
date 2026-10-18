@@ -3,6 +3,7 @@ import type { SubagentManager, SubagentManagerContext, SubagentStatus } from "..
 import { attemptValue, statusValue } from "../subagents/src/decode.js";
 import type { AgentsActionTarget, SubagentPresentation, SubagentPresenter } from "./agents-actions-contract.js";
 import type { SessionAgent, SessionAgentsSource, SessionTreeNode } from "./agents-workspace-contract.js";
+import { formatAgentsTimeline, type AgentsTimelineEntry } from "./agents-timeline.js";
 import { agentLastActivity, agentSilentFor, STALL_MS } from "./agent-activity.js";
 import { formatCost, formatTokens } from "./background-widget.js";
 import { buildWorkflowPhaseModel, buildWorkflowPhaseTree, workflowPhaseTreeInitialExpanded, workflowPhaseTreeVisibleNodes, type WorkflowPhaseTreeNode } from "./host-phases.js";
@@ -57,6 +58,18 @@ function activityLabel(running: boolean, agent: Parameters<typeof agentActivityL
 function lastActivity(at: number | undefined): { readonly lastActivityAt?: number } { return at === undefined ? {} : { lastActivityAt: at }; }
 /** The tree kind of each /workflow tree node kind. */
 const RUN_NODE_KIND: Readonly<Record<WorkflowPhaseTreeNode["kind"], SessionTreeNode["kind"]>> = { workflow: "run", phase: "phase", operation: "operation", shell: "shell", agent: "agent" };
+/** The width the details' timeline is drawn at; the pane wraps what is wider. */
+const TIMELINE_WIDTH = 64;
+/** The timeline rows of workflow agents under their phase names. */
+function agentTimeline(agents: readonly { readonly group?: string; readonly agent: AgentRecord }[], styles: WorkflowProgressStyles, now: number): string[] {
+  const entries: AgentsTimelineEntry[] = agents.map(({ group, agent }) => ({
+    label: agent.label ?? agent.name, ...(group === undefined ? {} : { group }),
+    startedAt: agent.startedAt,
+    endedAt: agent.startedAt === undefined || agent.durationMs === undefined || !SETTLED_AGENT_STATES.has(agent.state) ? undefined : agent.startedAt + agent.durationMs,
+    state: agent.state,
+  }));
+  return entries.length === 0 ? [] : formatAgentsTimeline(entries, now, TIMELINE_WIDTH, styles);
+}
 /** The title row of a node: its label and state. */
 function nodeTitle(label: string, state: string, styles: WorkflowProgressStyles): string {
   return `${styles.bold(label)} ${progressStyleForState(state, styles)(state)}`;
@@ -140,7 +153,8 @@ export function createSessionAgentsSource(context: ExtensionCommandContext, deps
   };
   /** The run's /workflow tree, every node in the order /workflow draws them, under a header row for the run. */
   const runNodes = (run: PersistedRun, snapshot: Readonly<LaunchSnapshot>, waitingFor: string | undefined, now: number, cache: Map<string, number | undefined>): SessionTreeNode[] => {
-    const tree = buildWorkflowPhaseTree(buildWorkflowPhaseModel(run, snapshot));
+    const model = buildWorkflowPhaseModel(run, snapshot);
+    const tree = buildWorkflowPhaseTree(model);
     const expanded = workflowPhaseTreeInitialExpanded(tree);
     const key = (node: WorkflowPhaseTreeNode): string => node.kind === "workflow" ? `run:${run.id}` : node.kind === "agent" && node.agent ? `run:${run.id}:${node.agent.id}` : `run:${run.id}:node:${node.id}`;
     const shownRun = { workflowName: sanitizeDisplayText(run.workflowName), id: sanitizeDisplayText(run.id) };
@@ -170,7 +184,14 @@ export function createSessionAgentsSource(context: ExtensionCommandContext, deps
         line: (styles, selected, open) => root
           ? `${headerLine(shown.label, runSummary(run, styles), selected, open, node.children.length > 0, styles)}${waiting && styles.warning(waiting)}`
           : `${formatWorkflowTreeLine(shown, selected, open, styles)}${silence === undefined ? "" : silence.kind === "stalled" ? styles.error(silenceMark(silence)) : styles.warning(silenceMark(silence))}`,
-        details: (styles, now) => formatWorkflowNodeDetails(shownRun, tree, shown, styles, now, false),
+        details: (styles, now) => {
+          const base = formatWorkflowNodeDetails(shownRun, tree, shown, styles, now, false);
+          const unassigned = (root || node.kind === "phase" ? model.unassignedAgents ?? [] : []).map((member) => ({ group: "Unassigned", agent: displayAgent(member) }));
+          const timeline = !root && node.kind !== "phase" ? [] : root
+            ? agentTimeline([...model.phases.flatMap((phase) => phase.agents.map((member) => ({ group: sanitizeDisplayText(`${phase.name}${phase.occurrence > 1 ? ` #${String(phase.occurrence)}` : ""}`), agent: displayAgent(member) }))), ...unassigned], styles, now)
+            : agentTimeline(node.phase === undefined ? unassigned.map(({ agent }) => ({ agent })) : node.phase.agents.map((member) => ({ agent: displayAgent(member) })), styles, now);
+          return timeline.length === 0 ? base : [...base, "", ...timeline];
+        },
         title: (styles) => nodeTitle(shown.label, node.state, styles),
         agent: agent && runAgent(run, agent, cache),
         target: agent ? { kind: "workflow-agent", runId: run.id, agentId: agent.id } : runTarget,
@@ -263,6 +284,7 @@ export function createSessionAgentsSource(context: ExtensionCommandContext, deps
     if (first === undefined) return [];
     // Each row is its listed id: its key, name, presentation and target; a presentation for an id not asked for is ignored.
     const children = sorted.map(({ id, status, owned }) => subagent(manager, id, status, owned, requested.has(id) ? presentations?.get(id) : undefined));
+    const childNames = children.map((child) => child.agent?.name);
     // The group takes the state of its first subagent: the one the /subagents order puts first.
     const state = first.status.state;
     const counts = subagentsCounts(sorted.map(({ status }) => status));
@@ -274,7 +296,9 @@ export function createSessionAgentsSource(context: ExtensionCommandContext, deps
       // An idle group starts collapsed.
       initiallyExpanded: sorted.some(({ status }) => status.state === "running"),
       line: (styles, selected, expanded) => headerLine("Subagents", counts, selected, expanded, true, styles),
-      details: (styles) => [styles.bold(styles.accent("Subagents")), counts],
+      details: (styles, now) => [styles.bold(styles.accent("Subagents")), counts, "", ...formatAgentsTimeline(
+        sorted.map(({ id, status }, index): AgentsTimelineEntry => ({ label: childNames[index] ?? id, startedAt: status.startedAt, endedAt: status.finishedAt, state: status.state })),
+        now, TIMELINE_WIDTH, styles)],
       title: (styles) => nodeTitle("Subagents", state, styles),
       agent: undefined,
       target: { kind: "subagents" },
