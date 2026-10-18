@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after } from "node:test";
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager, stripTerminalSequences, TUI_KEYBINDINGS, visibleWidth } from "@earendil-works/pi-tui";
 import type { ActionUi, AgentsAction, AgentsActionProvider, AgentsActionTarget } from "../src/agents-actions-contract.js";
 import type { AgentsWorkspaceState, SessionTreeNode } from "../src/agents-workspace-contract.js";
@@ -2541,6 +2541,147 @@ void test("the filter takes a state: prefix, escapes with esc while open, and ke
   assert.equal(sidebarRows(harness).filter((line) => /gamma/.test(line)).length, 1);
   assert.equal(harness.left, false, "esc closed the filter, not the workspace");
   await leave(harness);
+});
+
+/** A theme that wraps text in visible markers: <dim:...>, <accent:...> and <bold:...>. */
+const markedRows = (harness: FakePi): string[] => harness.screen().filter((line) => /build|alpha|beta|gam|Gam|scout|delta|Subagents/.test(line) && !line.startsWith("/")).map((line) => line.replace(/\s+<di\S*\s*$/, "").trimEnd());
+const MARKED = { fg: (color: string, text: string) => `<${color}:${text}>`, bold: (text: string) => `<bold:${text}>` } as unknown as Theme;
+
+void test("a filter dims the ancestors, emphasizes the matched text once and leaves other matches alone", async (t) => {
+  timers(t);
+  const harness = await open(FILTERED(), { initialKey: "scout", theme: MARKED });
+  const plain = markedRows(harness).join("\n");
+  assert.doesNotMatch(plain, /<dim:(?!─)/, "no filter: nothing is dimmed");
+  harness.send("/", "G", "a", "m");
+  const rows = markedRows(harness);
+  assert.match(rows.find((line) => line.includes("build")) ?? "", /^<dim:.*build.*>/, "the run is shown as an ancestor");
+  assert.match(rows.find((line) => line.includes("alpha")) ?? "", /^<dim:.*alpha/, "so is alpha");
+  const gamma = rows.find((line) => line.includes("gam") && !line.startsWith("#")) ?? "";
+  assert.doesNotMatch(gamma, /<dim:/);
+
+  assert.equal((gamma.match(/<accent:gam>/g) ?? []).length, 1);
+  assert.match(gamma, /<accent:gam>ma/);
+  harness.send(KEY.escape);
+  await leave(harness);
+});
+
+void test("a filter matching a bold header label accents the match and keeps the label bold around it", async (t) => {
+  timers(t);
+  const harness = await open(FILTERED(), { theme: MARKED });
+  harness.send("/", "b", "u", "i");
+  const header = markedRows(harness).find((line) => line.includes("<accent:bui>")) ?? "";
+  assert.ok(header, "the run header shows its match accented");
+  assert.doesNotMatch(header, /<dim:/, "a direct match is not dimmed");
+  assert.match(header, /<accent:bui>ld/, "the text after the match stays in the label");
+  assert.equal((header.match(/<accent:bui>/g) ?? []).length, 1);
+  harness.send(KEY.escape);
+  await leave(harness);
+  const group = await open(FILTERED(), { theme: MARKED });
+  group.send("/", "a", "g", "e", "n");
+  assert.ok(markedRows(group).some((line) => line.includes("Sub<accent:agen>ts")), "the Subagents group label is accented");
+  group.send(KEY.escape);
+  await leave(group);
+});
+
+void test("a filter emphasizes the matched text in the case of the label", async (t) => {
+  timers(t);
+  const harness = await open([agent("Gamma")], { theme: MARKED });
+  harness.send("/", "g", "A", "m");
+  const row = markedRows(harness).find((line) => line.includes("Gam") && !line.startsWith("#")) ?? "";
+  assert.match(row, /<accent:Gam>ma/);
+  assert.equal((row.match(/<accent:Gam>/g) ?? []).length, 1);
+  await leave(harness);
+});
+
+/** The sidebar row that holds the text, not the title or the filter row. */
+const sideRow = (harness: FakePi, text: string): string => harness.screen().find((line) => line.includes(text) && !/^[#/]/.test(line))?.replace(/\s+<di\S*\s*$/, "").trimEnd() ?? "";
+
+void test("a filter maps the match back to the original label where lowercasing changes a letter's length", async (t) => {
+  timers(t);
+  const first = await open([agent("İnspect")], { theme: MARKED });
+  first.send("/", "n", "s", "p");
+  const inspect = sideRow(first, "nsp");
+  assert.match(inspect, /İ<accent:nsp>ect/);
+  await leave(first);
+  const second = await open([agent("xİy")], { theme: MARKED });
+  second.send("/", "y");
+  const row = sideRow(second, "xİ");
+  assert.match(row, /xİ<accent:y>/, "a match after the expanding letter keeps its range");
+  await leave(second);
+});
+
+void test("a filter finds a label whose whitespace was collapsed", async (t) => {
+  timers(t);
+  const harness = await open([agent("ws01", { name: "Gam\t\tma" })], { theme: MARKED });
+  harness.send("/", "m", " ", "m");
+  const row = sideRow(harness, "Ga");
+  assert.match(row, /Ga<accent:m\s+m>a/);
+  await leave(harness);
+});
+
+void test("the selected row keeps its marking when dimmed or emphasized", async (t) => {
+  timers(t);
+  const dimmed = await open(FILTERED(), { initialKey: "alpha", theme: MARKED });
+  dimmed.send("/", "g", "a", "m");
+  const alpha = markedRows(dimmed).find((line) => line.includes("alpha") && !line.startsWith("#")) ?? "";
+  assert.match(alpha, /^<dim:→/, "the dimmed ancestor keeps →");
+  await leave(dimmed);
+  const emphasized = await open(FILTERED(), { initialKey: "gamma", theme: MARKED });
+  emphasized.send("/", "g", "a", "m");
+  const gamma = markedRows(emphasized).find((line) => line.includes("<accent:gam>")) ?? "";
+  assert.match(gamma, /^→/, "the emphasized match keeps →");
+  await leave(emphasized);
+});
+
+// eslint-disable-next-line no-control-regex
+const ESCAPES = /\x1b\[[0-9;]*m/g;
+// eslint-disable-next-line no-control-regex
+const UNDIMMED_AFTER_RESET = /\x1b\[(?:22;)?39m(?!\x1b\[38;2;9;9;9m)[^\s\x1b]/;
+const DIM_OPEN = "\x1b[38;2;9;9;9m";
+const ANSI = {
+  fg: (color: string, text: string) => `${color === "dim" ? DIM_OPEN : "\x1b[38;2;1;2;3m"}${text}\x1b[39m`,
+  bold: (text: string) => `\x1b[1m${text}\x1b[22m`,
+} as unknown as Theme;
+
+void test("a dimmed ancestor stays dim after the coloured parts of its line", async (t) => {
+  timers(t);
+  const harness = await open(FILTERED(), { initialKey: "scout", theme: ANSI });
+  harness.send("/", "g", "a", "m");
+  const index = harness.screen().findIndex((line) => line.includes("build"));
+  assert.ok(index >= 0, "the run header shows");
+  const header = harness.alt().getScreenLines()[index] ?? "";
+  assert.ok(header.includes(`${DIM_OPEN}  ▾ build`), "the run header opens dim before its text");
+  assert.ok(header.includes(`\x1b[39m${DIM_OPEN}`), "the dim colour is back after the coloured state glyph");
+  assert.ok((header.match(ESCAPES) ?? []).length > 4, "the header holds coloured parts of its own");
+  assert.doesNotMatch(header, UNDIMMED_AFTER_RESET, "no text follows a reset without the dim colour");
+  await leave(harness);
+});
+
+void test("a state: match keeps its line", async (t) => {
+  timers(t);
+  const harness = await open(FILTERED(), { theme: MARKED });
+  harness.send("/");
+  for (const char of "state:failed") harness.send(char);
+  const scout = markedRows(harness).find((line) => line.includes("scout")) ?? "";
+  assert.doesNotMatch(scout, /<dim:/);
+  assert.doesNotMatch(scout, /<bold:(?:state|failed|scout)>/);
+  await leave(harness);
+  const byId = await open([agent("id77", { name: "delta" })], { theme: MARKED });
+  byId.send("/", "i", "d", "7", "7");
+  const delta = markedRows(byId).find((line) => line.includes("delta") && !line.startsWith("#")) ?? "";
+  assert.ok(delta, "the row matched by its short id shows");
+  assert.doesNotMatch(delta, /<bold:|<dim:|<accent:delta/, "a short id match keeps its line");
+  await leave(byId);
+});
+
+void test("filtered rows fit the sidebar at 120, 70 and 40 columns", async (t) => {
+  timers(t);
+  for (const columns of [120, 70, 40]) {
+    const harness = await open(FILTERED(), { columns, theme: MARKED });
+    harness.send("/", "a", "l");
+    assert.ok(harness.screen().every((line) => visibleWidth(line) <= columns), `fits ${String(columns)}`);
+    await leave(harness);
+  }
 });
 
 void test("the filter survives a step-aside and fits narrow screens", async (t) => {
