@@ -5,7 +5,7 @@ import type { AgentsWorkspaceExit, AgentsWorkspaceOptions, AgentsWorkspaceState,
 import { formatCost, formatTokens } from "./background-widget.js";
 import { workflowKeyMatches } from "./host-navigator.js";
 import { navigateWorkflowPhaseTree, workflowPhaseTreeVisibleNodes, type WorkflowPhaseTree, type WorkflowPhaseTreeDirection, type WorkflowPhaseTreeNode } from "./host-phases.js";
-import { progressStyleForState, themeWorkflowProgressStyles, type WorkflowProgressStyles } from "./host-view.js";
+import { navigatorSidebarWidth, progressStyleForState, themeWorkflowProgressStyles, type WorkflowProgressStyles } from "./host-view.js";
 import type { TranscriptPoll, TranscriptSource, TranscriptSourceStatus } from "./transcript-source.js";
 import { errorText, sanitizeDisplayText } from "./utils.js";
 import { openArtifactInEditor, type WorkflowTui } from "./workflow-artifacts.js";
@@ -21,8 +21,12 @@ const FILTER_ROWS = 1;
 const MENU_OVERLAY: OverlayOptions = { width: "50%", minWidth: 32, margin: 1 };
 const MENU_TITLES: Readonly<Record<AgentsActionTarget["kind"], string>> = { run: "Run actions", "workflow-agent": "Agent actions", subagent: "Subagent actions", subagents: "Subagents" };
 
+/** How the footer names the keys Pi's bindings spell out. */
+const KEY_NAMES: Readonly<Record<string, string>> = { up: "↑", down: "↓", left: "←", right: "→", escape: "esc" };
+const ARROWS: readonly string[] = ["↑", "↓", "←", "→"];
+
 /** As the dashboards: 38% of the width less the separator, 24 to 42 columns, then the separator. */
-function sidebarWidth(columns: number): number { return Math.min(42, Math.max(24, Math.floor((columns - SEPARATOR.length) * 0.38))) + SEPARATOR.length; }
+function sidebarWidth(columns: number): number { return navigatorSidebarWidth(columns) + SEPARATOR.length; }
 function clean(text: string | undefined): string { return sanitizeDisplayText(text ?? "").replace(/\s+/g, " ").trim(); }
 /** A mouse report as the alt screen reads one: SGR, or the legacy six bytes. */
 function isMouse(data: string): boolean { return (data.startsWith("\x1b[<") && /^\d+;\d+;\d+[Mm]$/.test(data.slice(3))) || (data.length === 6 && data.startsWith("\x1b[M")); }
@@ -1001,13 +1005,20 @@ class Workspace {
     return (this.selectedNode()?.details(this.styles, Date.now()) ?? []).flatMap((line) => wrapTextWithAnsi(line, cell).map((part) => truncateToWidth(part, cell, "")));
   }
   private hintText(): string {
-    const key = (keybinding: Keybinding, fallback: string): string => this.keybindings.getKeys(keybinding)[0] ?? fallback;
+    // The key the user's bindings resolve to, as the footer names it; [ ] n a d s f / and space are fixed keys and named as they are.
+    const key = (keybinding: Keybinding, fallback: string): string => { const name = this.keybindings.getKeys(keybinding)[0] ?? fallback; return KEY_NAMES[name] ?? name; };
+    /** Two keys of one action: "↑↓" when both are arrows, else "a/b". */
+    const pair = (first: Keybinding, second: Keybinding, fallbacks: readonly [string, string]): string => {
+      const [a, b] = [key(first, fallbacks[0]), key(second, fallbacks[1])];
+      return ARROWS.includes(a) && ARROWS.includes(b) ? `${a}${b}` : `${a}/${b}`;
+    };
+    const cancel = key("tui.select.cancel", "escape");
     const pending = (this.shown?.view?.pendingLarge().length ?? 0) > 0;
     const node = this.selectedNode();
-    if (this.filtering) return "enter keep filter · esc clear";
+    if (this.filtering) return `${key("tui.select.confirm", "enter")} keep filter · ${cancel} clear`;
     return [
-      ...(this.filterActive() ? [`/ filter: ${clean(this.filter)} · esc clear`] : []),
-      this.focus === "sidebar" ? "←→/space fold" : "↑↓ scroll",
+      ...(this.filterActive() ? [`/ filter: ${clean(this.filter)} · ${cancel} clear`] : []),
+      this.focus === "sidebar" ? `${pair("tui.editor.cursorLeft", "tui.editor.cursorRight", ["left", "right"])}/space fold` : `${pair("tui.select.up", "tui.select.down", ["up", "down"])} scroll`,
       ...(this.following ? ["f stop following"] : []),
       "[ ] agent",
       ...(this.nodes.some((candidate) => candidate.needsPerson !== undefined) ? ["n next"] : []),
@@ -1018,7 +1029,7 @@ class Workspace {
       `${key("tui.altScreen.search", "ctrl+shift+f")} search`,
       "s sidebar",
       `${key("app.tools.expand", "ctrl+o")} tools`,
-      "esc back",
+      `${cancel} back`,
     ].join(" · ");
   }
   /** The notices first, until the next key; then the shown transcript's state. */

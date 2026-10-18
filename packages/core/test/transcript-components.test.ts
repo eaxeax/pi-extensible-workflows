@@ -382,7 +382,7 @@ void test("blocks made after their records were built open as the others when th
   }
 });
 
-void test("the live message streams after the last record and leaves at message_end", () => {
+void test("the live message streams after the last record and, after message_end, stays until its record is appended", () => {
   const { view, raw, text } = setup();
   view.append([user(100, "QUESTION")]);
   view.live({ type: "message_start", message: { role: "user", content: "NOT-STREAMED" } });
@@ -400,8 +400,36 @@ void test("the live message streams after the last record and leaves at message_
   view.append([user(200, "LATER")]);
   assertOrder(text(), ["QUESTION", "LATER", "PARTIAL ANSWER GROWS MORE"]);
   view.live({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "PARTIAL ANSWER GROWS MORE" }] } });
-  assert.ok(!text().includes("PARTIAL ANSWER"));
-  assertOrder(text(), ["QUESTION", "LATER"]);
+  assertOrder(text(), ["QUESTION", "LATER", "PARTIAL ANSWER GROWS MORE"]);
+  view.append([message(300, { role: "assistant", content: [{ type: "text", text: "THE RECORDED ANSWER" }] })]);
+  assert.ok(!text().includes("PARTIAL ANSWER"), "the record takes the finished message's place");
+  assertOrder(text(), ["QUESTION", "LATER", "THE RECORDED ANSWER"]);
+  assert.equal(count(text(), "THE RECORDED ANSWER"), 1);
+});
+
+void test("a finished message keeps its height until its own record arrives, past tool results and the next message", () => {
+  const { view, text, raw } = setup();
+  view.append([user(100, "QUESTION")]);
+  const stream = (body: string): void => {
+    view.live({ type: "message_start", message: { role: "assistant", content: [] } });
+    view.live({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: body }] } });
+  };
+  stream("FIRST-LIVE");
+  const height = raw().length;
+  view.live({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "FIRST-LIVE" }] } });
+  assert.equal(raw().length, height, "message_end does not shrink the content");
+  view.live({ type: "message_start", message: { role: "toolResult", content: [] } });
+  view.live({ type: "message_end", message: { role: "toolResult", content: [] } });
+  view.append([result(200, "c1", "bash", "TOOL-OUTPUT")]);
+  assert.ok(text().includes("FIRST-LIVE"), "a tool result is not the message's record");
+  stream("SECOND-LIVE");
+  assertOrder(text(), ["QUESTION", "TOOL-OUTPUT", "FIRST-LIVE", "SECOND-LIVE"]);
+  view.append([message(300, { role: "assistant", content: [{ type: "text", text: "FIRST-RECORD" }] })]);
+  assert.ok(!text().includes("FIRST-LIVE"));
+  assertOrder(text(), ["FIRST-RECORD", "SECOND-LIVE"]);
+  view.live({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "SECOND-LIVE" }] } });
+  view.reset();
+  assert.equal(text(), "", "reset drops a finished message too");
 });
 
 void test("a live message without message snapshots appends the deltas", () => {
@@ -500,7 +528,10 @@ void test("a streaming tool call has a tool block before the message ends, and i
   assert.equal(count(text(), "$ ls"), 1);
   assert.ok(text().includes("ls STREAMED-MORE"));
   view.live({ type: "message_end", message: { role: "assistant", content: [] } });
+  assert.ok(text().includes("ls STREAMED-MORE"), "the finished message keeps its tool block until its record arrives");
+  view.append([call(100, "c1", "bash", { command: "ls RECORDED" })]);
   assert.ok(!text().includes("STREAMED"));
+  assert.equal(count(text(), "$ ls"), 1);
 });
 
 void test("a tool without a built-in definition (workflow_result) renders Pi's generic block once, with its arguments and result", () => {

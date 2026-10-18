@@ -1577,6 +1577,7 @@ test("persists failed background subagents for repeatable lookup", async () => {
     assert.equal((await stat(runDirectory)).mode & 0o777, 0o700);
     assert.equal((await stat(join(runDirectory, "request.json"))).mode & 0o777, 0o600);
     assert.deepEqual(JSON.parse(await readFile(join(runDirectory, "request.json"), "utf8")), { prompt: "fail me", mode: "background", label: "failure" });
+    await waitFor(async () => stat(join(runDirectory, "failure.json")).then(() => true, () => false));
     assert.deepEqual(JSON.parse(await readFile(join(runDirectory, "failure.json"), "utf8")), expectedFailure);
 
     const restarted = createSubagentManager(managerDependencies);

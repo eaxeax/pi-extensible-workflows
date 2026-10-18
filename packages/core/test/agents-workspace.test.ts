@@ -4,13 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after } from "node:test";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { KeybindingsManager, stripTerminalSequences, TUI_KEYBINDINGS, visibleWidth } from "@earendil-works/pi-tui";
 import type { ActionUi, AgentsAction, AgentsActionProvider, AgentsActionTarget } from "../src/agents-actions-contract.js";
 import type { AgentsWorkspaceState, SessionTreeNode } from "../src/agents-workspace-contract.js";
 import { createLaunchSnapshot, DEFAULT_SETTINGS, formatWorkflowPhaseDashboard, RunStore, type AgentRecord, type PersistedRun, type RunState } from "../src/index.js";
 import { openAgentsWorkspace } from "../src/agents-workspace.js";
+import { navigatorSidebarWidth } from "../src/host-view.js";
 import { createSessionAgentsSource } from "../src/session-agents.js";
-import { advance, agent, click, entries, entry, ESC, escapes, FakeLive, fakePi, KEY, large, leave, nodesOf, open, opened, paste, polled, polls, rowOf, rule, settle, sidebarColumn, sidebarRows, timers, title as titleRow, topRow, tree, type FakePi, type Listed, type Spec } from "./agents-workspace-harness.js";
+import { advance, agent, KEYBINDINGS, click, entries, entry, ESC, escapes, FakeLive, fakePi, KEY, large, leave, nodesOf, open, opened, paste, polled, polls, rowOf, rule, settle, sidebarColumn, sidebarRows, timers, title as titleRow, topRow, tree, type FakePi, type Listed, type Spec } from "./agents-workspace-harness.js";
 
 const AGENTS = (): Listed[] => [agent("alpha"), agent("beta", { depth: 1, state: "completed", running: false }), agent("scout", { group: "Subagents", state: "failed", running: false })];
 /**
@@ -2667,4 +2668,30 @@ void test("follow only picks among the shown nodes of a filter", async (t) => {
   harness.send("f");
   assert.match(title(harness), /^#1\/3 a .*following/, "b is filtered out");
   await leave(harness);
+});
+
+
+void test("the hint names the keys the user's bindings resolve to", async (t) => {
+  timers(t);
+  const custom = new KeybindingsManager({ ...TUI_KEYBINDINGS, "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" } }, { "tui.select.up": "u", "tui.select.down": "d", "tui.select.cancel": "ctrl+q", "tui.select.confirm": "ctrl+e", "tui.editor.cursorLeft": "h", "tui.editor.cursorRight": "l" }) as unknown as typeof KEYBINDINGS;
+  const harness = await open([agent("alpha")], { keybindings: custom });
+  const hint = (): string => (harness.screen().at(-1) ?? "").trimEnd();
+  assert.match(hint(), /h\/l\/space fold/, "the sidebar's fold pair follows the bindings");
+  harness.send(KEY.tab);
+  assert.equal(hint(), "u/d scroll · [ ] agent · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools · ctrl+q back");
+  harness.send(KEY.tab, "/");
+  assert.equal(hint(), "ctrl+e keep filter · ctrl+q clear");
+  await leave(harness);
+});
+
+void test("the sidebar and transcript split at 80, 120 and 200 columns is the navigator's", async (t) => {
+  timers(t);
+  for (const [columns, sidebar] of [[80, 29], [120, 42], [200, 42]] as const) {
+    assert.equal(navigatorSidebarWidth(columns), sidebar, "the shared helper");
+    const harness = await open([agent("alpha")], { columns, setup: (source) => { source.polls.push(polled(entries(1, 3))); } });
+    const line = harness.screen().find((row) => row.includes("alpha record 1")) ?? "";
+    assert.equal(line.indexOf("│ alpha record 1"), sidebar + 1, `the separator follows ${String(sidebar)} sidebar columns at ${String(columns)}`);
+    assert.equal(visibleWidth(line), columns);
+    await leave(harness);
+  }
 });
