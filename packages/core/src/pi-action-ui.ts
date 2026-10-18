@@ -186,7 +186,8 @@ export function createPiActionUi(ctx: ExtensionCommandContext, options: PiAction
       const command = ctx.mode === "tui" ? options.editorCommand() : undefined;
       if (command === undefined) { notify(`Cannot open ${label}: no external editor is configured.`, "warning"); return; }
       await ctx.ui.custom<undefined>((tui, _theme, _keybindings, done) => {
-        void openArtifactInEditor(tui, command, artifact, label, notify).finally(() => { done(undefined); });
+        const editorTui = { stop: () => { tui.stop(); return true; }, start: () => { tui.start(); }, requestRender: (force?: boolean) => { tui.requestRender(force); } };
+        void openArtifactInEditor(editorTui, command, artifact, label, notify).finally(() => { done(undefined); });
         return { render: () => [], invalidate() {} };
       });
     },

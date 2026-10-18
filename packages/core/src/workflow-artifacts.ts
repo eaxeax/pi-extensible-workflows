@@ -6,7 +6,7 @@ import type { JsonValue } from "./types.js";
 import { errorText } from "./utils.js";
 
 export interface WorkflowArtifact { extension: ".js" | ".json" | ".md" | ".diff"; content: string }
-export type WorkflowTui = { stop(): void; start(): void; requestRender(force?: boolean): void };
+export type WorkflowTui = { /** Reports whether it took the terminal (only false cancels); false means the editor must not start. */ stop(): boolean; start(): void; requestRender(force?: boolean): void };
 
 export function workflowScriptArtifact(script: string): WorkflowArtifact { return { extension: ".js", content: script }; }
 export function workflowPromptArtifact(prompt: string): WorkflowArtifact { return { extension: ".md", content: prompt }; }
@@ -24,12 +24,13 @@ async function spawnWorkflowEditor(command: string, path: string): Promise<numbe
   });
 }
 
-export async function openWorkflowArtifact(tui: WorkflowTui, command: string, artifact: WorkflowArtifact): Promise<number | null> {
+/** The editor's exit code, null when it could not start, undefined when the terminal was not taken (the edit is cancelled). */
+export async function openWorkflowArtifact(tui: WorkflowTui, command: string, artifact: WorkflowArtifact): Promise<number | null | undefined> {
   const directory = await mkdtemp(join(tmpdir(), "pi-workflow-editor-"));
   const path = join(directory, `artifact${artifact.extension}`);
   try {
     await writeFile(path, artifact.content, { encoding: "utf8", mode: 0o600 });
-    tui.stop();
+    if (!tui.stop()) return undefined;
     try { return await spawnWorkflowEditor(command, path); }
     finally { tui.start(); tui.requestRender(true); }
   } finally { await rm(directory, { recursive: true, force: true }); }
@@ -40,6 +41,6 @@ export async function openArtifactInEditor(tui: WorkflowTui, command: string | u
   if (!command) { notify(`Cannot open ${label}: no external editor is configured.`, "warning"); return; }
   try {
     const exitCode = await openWorkflowArtifact(tui, command, artifact);
-    if (exitCode !== 0) notify(`Cannot open ${label}: external editor ${exitCode === null ? "could not be started" : `exited with code ${String(exitCode)}`}.`, "warning");
+    if (exitCode !== undefined && exitCode !== 0) notify(`Cannot open ${label}: external editor ${exitCode === null ? "could not be started" : `exited with code ${String(exitCode)}`}.`, "warning");
   } catch (error) { notify(`Cannot open ${label}: ${errorText(error)}`, "warning"); }
 }
