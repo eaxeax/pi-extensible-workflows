@@ -1161,7 +1161,7 @@ void test("the shortcut scrolls the widget through a tree too tall to show", () 
 
   const resting = draw();
   assert.ok(resting.length <= 10, `the frame keeps its budget, got ${resting.length}`);
-  assert.ok(resting.some((line) => line.includes("more")), "and says how much is hidden");
+  assert.ok(resting.some((line) => /more|… \d+ phases?/.test(line)), "and says how much is hidden");
 
   // `↓` is left alone until the shortcut says otherwise.
   host.setEditorText("");
@@ -1479,4 +1479,645 @@ void test("marks hidden rows when run headers exceed the body budget", () => {
   assert.ok(frame.some((line) => line.includes("more")), "hidden headers are accounted for");
   assert.ok(!frame.some((line) => line.includes("flow-8")), "not every header is claimed to fit");
   host.shutdown();
+});
+
+/** Draws the current widget at a given width, colours stripped. */
+const drawAt = (host, width) => host.widgets.at(-1)(host.tui, theme).render(width).map(plain);
+
+function agent(id, name, state, extra = {}) {
+  return {
+    id,
+    name,
+    state,
+    attempts: 1,
+    startedAt: Date.now() - 5_000,
+    durationMs: 1_000,
+    tools: [],
+    model: { model: "m" },
+    accounting: { input: 1, output: 1, cacheRead: 0, cost: 0.001 },
+    ...extra,
+  };
+}
+
+function startRuns(runs) {
+  const root = mkdtempSync(join(tmpdir(), "widget-attention-"));
+  const host = harness();
+  host.start();
+  for (const run of runs) {
+    const directory = writeRun(join(root, run.id), runState(run));
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: run.id, runDirectory: directory, sessionId: "session-1" });
+  }
+  return host;
+}
+
+function silentAgent(id, name) {
+  return agent(id, name, "running", { lastEventAt: Date.now() - 4 * 60_000, attemptDetails: [] });
+}
+
+void test("quiet and stalled agents outrank everything when rows are folded, and the title counts them", () => {
+  const completed = Array.from({ length: 12 }, (_, i) => agent(`d${String(i)}`, `done-${String(i)}`, "completed"));
+  const host = startRuns([{
+    id: "run-1",
+    workflowName: "big",
+    phaseHistory: [{ phase: "early", afterAgent: 0 }, { phase: "late", afterAgent: 12 }],
+    agents: [...completed, silentAgent("q1", "asker"), { ...silentAgent("q2", "dead"), lastEventAt: Date.now() - 11 * 60_000 }],
+  }]);
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(host, width);
+    assert.ok(frame.length <= 10);
+    assert.ok(frame.every((line) => visibleWidth(line) <= width), `fits ${String(width)}`);
+  }
+  const frame = drawAt(host, 120);
+  assert.match(frame[0], /^╭ Workflow · ⚠ 2 quiet /);
+  assert.ok(frame.some((line) => line.includes("asker")), "the quiet agent is kept");
+  assert.ok(frame.some((line) => line.includes("dead")), "the stalled agent is kept");
+  host.shutdown();
+});
+
+void test("the title names runs, checkpoints waiting and quiet agents, only the non-zero parts", () => {
+  const host = startRuns([
+    { id: "run-1", workflowName: "one", agents: [silentAgent("q1", "asker")] },
+    { id: "run-2", workflowName: "two", agents: [] },
+  ]);
+  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, {
+    runId: "run-2", runDirectory: undefined, sessionId: "session-1", name: "ok?", state: "awaiting",
+  });
+  assert.match(drawAt(host, 120)[0], /^╭ Workflows · 2 runs · ⚠ 1 quiet /, "invalid event leaves waiting out");
+  host.shutdown();
+});
+
+void test("waiting checkpoints are counted in the title", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-waiting-"));
+  const host = harness();
+  host.start();
+  const directory = writeRun(join(root, "run-1"), runState({ agents: [silentAgent("q1", "asker")] }));
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, {
+    runId: "run-1", runDirectory: directory, sessionId: "session-1", name: "ok?", state: "awaiting",
+  });
+  assert.match(drawAt(host, 120)[0], /^╭ Workflow · ◆ 1 waiting · ⚠ 1 quiet /);
+  host.shutdown();
+});
+
+void test("the run row drops the running tag, keeps other tags, and shows phase and progress", () => {
+  const host = startRuns([{
+    id: "run-1",
+    workflowName: "build",
+    phase: "review",
+    agents: [agent("a", "x", "completed"), agent("b", "y", "completed"), agent("c", "z", "completed"), agent("d", "w", "running"), agent("e", "v", "queued")],
+  }]);
+  const header = drawAt(host, 120).find((line) => line.includes("build"));
+  assert.ok(header);
+  assert.doesNotMatch(header, /\[running\]/);
+  assert.match(header, /build · review · 3\/5/);
+  host.shutdown();
+
+  const paused = startRuns([{ id: "run-1", workflowName: "build", state: "paused", agents: [] }]);
+  assert.match(drawAt(paused, 120).find((line) => line.includes("build")), /\[paused\] build/);
+  paused.shutdown();
+});
+
+void test("the short run id shows only when two shown runs share a name", () => {
+  const same = startRuns([
+    { id: "aaaaaaaa-1111", workflowName: "twin", agents: [] },
+    { id: "bbbbbbbb-2222", workflowName: "twin", agents: [] },
+  ]);
+  const frame = drawAt(same, 120).join("\n");
+  assert.match(frame, /twin aaaaaaaa/);
+  assert.match(frame, /twin bbbbbbbb/);
+  assert.doesNotMatch(frame, /aaaaaaaa-/);
+  same.shutdown();
+
+  const distinct = startRuns([
+    { id: "aaaaaaaa-1111", workflowName: "one", agents: [] },
+    { id: "bbbbbbbb-2222", workflowName: "two", agents: [] },
+  ]);
+  assert.doesNotMatch(drawAt(distinct, 120).join("\n"), /aaaaaaaa|bbbbbbbb/);
+  distinct.shutdown();
+});
+
+void test("nested agents draw their prefix with aligned stems at every depth", () => {
+  const host = startRuns([{
+    id: "run-1",
+    phaseHistory: [{ phase: "p", afterAgent: 0 }, { phase: "q", afterAgent: 5 }],
+    agents: [
+      agent("a", "root", "running"),
+      agent("b", "child", "running", { parentId: "a" }),
+      agent("c", "grand", "running", { parentId: "b" }),
+      agent("d", "sibling", "running", { parentId: "a" }),
+      agent("e", "other", "running"),
+    ],
+  }]);
+  const lines = drawAt(host, 120).map((line) => line.slice(2));
+  const at = (name) => lines.find((line) => line.includes(name));
+  assert.match(at("root"), /^ {2}│ ├─ /);
+  assert.match(at("child"), /^ {2}│ │ ├─ /);
+  assert.match(at("grand"), /^ {2}│ │ │ ╰─ /);
+  assert.match(at("sibling"), /^ {2}│ │ ╰─ /);
+  host.shutdown();
+});
+
+void test("hidden rows are marked where they were folded, inside their run", () => {
+  const many = (prefix, count, state) => Array.from({ length: count }, (_, i) => agent(`${prefix}${String(i)}`, `${prefix}-${String(i)}`, state));
+  const host = startRuns([{
+    id: "run-1",
+    workflowName: "flow",
+    phaseHistory: [{ phase: "build", afterAgent: 0 }, { phase: "plan", afterAgent: 7 }],
+    agents: [...many("b", 3, "completed"), ...many("l", 4, "running"), ...many("p", 2, "completed")],
+  }]);
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(host, width);
+    assert.ok(frame.length <= 10);
+    assert.ok(frame.every((line) => visibleWidth(line) <= width), `fits ${String(width)}`);
+  }
+  const frame = drawAt(host, 120);
+  const text = frame.join("\n");
+  assert.ok(frame.some((line) => /╰─ ✓ plan.*\(2 agents\)/.test(line)), `plan is folded in place: ${text}`);
+  assert.ok(frame.some((line) => /^│ {3}│ … 3 done/.test(line)), `agents fold at their place: ${text}`);
+  assert.ok(!frame.some((line) => /more run/.test(line)), "no bottom marker when the only run fits");
+  host.shutdown();
+});
+
+void test("hidden phases of a shown run fold into one marker, per run", () => {
+  const host = startRuns([
+    { id: "run-1", workflowName: "a", phaseHistory: [1, 2, 3, 4].map((n) => ({ phase: `ph${String(n)}`, afterAgent: 0 })), agents: [] },
+    { id: "run-2", workflowName: "b", phaseHistory: [1, 2, 3, 4].map((n) => ({ phase: `qh${String(n)}`, afterAgent: 0 })), agents: [] },
+  ]);
+  const frame = drawAt(host, 120);
+  assert.ok(frame.length <= 10);
+  assert.ok(frame.some((line) => /… \d phases?/.test(line)), frame.join("\n"));
+  for (const name of ["a", "b"]) assert.ok(frame.some((line) => new RegExp(`^│ \\S ${name} · `).test(line)), `run ${name} keeps its header: ${frame.join("\n")}`);
+  host.shutdown();
+});
+
+void test("whole runs that do not fit keep the bottom marker", () => {
+  const host = startRuns(Array.from({ length: 9 }, (_, i) => ({ id: `run-${String(i)}`, workflowName: `flow-${String(i)}`, agents: [] })));
+  const frame = drawAt(host, 120);
+  assert.ok(frame.length <= 10);
+  assert.match(frame.at(-2), /… \d+ more runs?/);
+  host.shutdown();
+});
+
+const many2 = (prefix, count, state) => Array.from({ length: count }, (_, i) => agent(`${prefix}${String(i)}`, `${prefix}-${String(i)}`, state));
+
+void test("a lone hidden phase keeps its row with its state and count, last or in the middle", () => {
+  const host = startRuns([{
+    id: "run-1",
+    workflowName: "flow",
+    phaseHistory: [{ phase: "plan", afterAgent: 0 }, { phase: "build", afterAgent: 2 }, { phase: "mid", afterAgent: 4 }, { phase: "tail", afterAgent: 7 }],
+    agents: [...many2("p", 2, "completed"), ...many2("b", 2, "running"), ...many2("m", 3, "completed"), ...many2("t", 6, "running")],
+  }]);
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(host, width);
+    assert.ok(frame.length <= 10);
+    assert.ok(frame.every((line) => visibleWidth(line) <= width), `fits ${String(width)}`);
+  }
+  const text = drawAt(host, 120).join("\n");
+  assert.match(text, /├─ ✓ plan.*\(2 agents\)/);
+  assert.match(text, /├─ ✓ mid.*\(3 agents\)/);
+  assert.doesNotMatch(text, /… 1 phase/);
+  host.shutdown();
+});
+
+void test("a single hidden agent shows as itself, and several hidden in one phase share one marker", () => {
+  const host = startRuns([{
+    id: "run-1",
+    workflowName: "flow",
+    phaseHistory: [{ phase: "a", afterAgent: 0 }, { phase: "b", afterAgent: 3 }],
+    agents: [agent("x0", "x0", "completed"), agent("x1", "x1", "running"), agent("x2", "x2", "completed"), ...many2("y", 5, "running")],
+  }]);
+  const text = drawAt(host, 120).join("\n");
+  assert.ok(!/… 1 (done|more)/.test(text), text);
+  const lines = text.split("\n");
+  const phaseB = lines.findIndex((line) => /\sb\s/.test(line) && line.includes("╰─"));
+  assert.ok(phaseB >= 0, text);
+  assert.equal(lines.slice(phaseB).filter((line) => /… \d+ (done|more)/.test(line)).length, 1, text);
+  host.shutdown();
+});
+
+void test("hidden children are counted at the child's depth", () => {
+  const host = startRuns([{
+    id: "run-1",
+    workflowName: "flow",
+    agents: [
+      agent("a", "root", "running"),
+      ...Array.from({ length: 9 }, (_, i) => agent(`k${String(i)}`, `kid${String(i)}`, "completed", { parentId: "a" })),
+      agent("z", "live", "running", { parentId: "a" }),
+    ],
+  }]);
+  const frame = drawAt(host, 120);
+  assert.ok(frame.some((line) => /^│ {7}… \d+ done/.test(line)), frame.join("\n"));
+  assert.ok(frame.every((line) => visibleWidth(line) <= 120));
+  host.shutdown();
+});
+
+void test("children and grandchildren of a last root draw blank stems", () => {
+  const host = startRuns([{
+    id: "run-1",
+    agents: [
+      agent("a", "first", "running"),
+      agent("b", "root", "running"),
+      agent("c", "kid", "running", { parentId: "b" }),
+      agent("d", "grand", "running", { parentId: "c" }),
+      agent("e", "grand2", "running", { parentId: "c" }),
+    ],
+  }]);
+  const lines = drawAt(host, 120).map((line) => line.slice(2));
+  const at = (name) => lines.find((line) => line.includes(name));
+  assert.match(at("root"), /^ {4}╰─ .*root/);
+  assert.match(at("kid"), /^ {6}╰─ .*kid/);
+  assert.match(at("grand "), /^ {8}├─ .*grand/);
+  assert.match(at("grand2"), /^ {8}╰─ .*grand2/);
+  host.shutdown();
+});
+
+void test("every run with quiet agents keeps its header and one quiet agent", () => {
+  const host = startRuns(["a", "b"].map((n) => ({
+    id: `run-${n}`,
+    workflowName: `flow-${n}`,
+    agents: Array.from({ length: 6 }, (_, i) => silentAgent(`${n}${String(i)}`, `${n}-quiet-${String(i)}`)),
+  })));
+  const text = drawAt(host, 120).join("\n");
+  for (const n of ["a", "b"]) {
+    assert.match(text, new RegExp(`flow-${n}`));
+    assert.match(text, new RegExp(`${n}-quiet-0`));
+  }
+  host.shutdown();
+});
+
+void test("the short id follows the runs that are shown, and a narrow title keeps the attention counts", () => {
+  const host = startRuns([
+    { id: "aaaaaaaa-1", workflowName: "twin", agents: [silentAgent("q", "asker")] },
+    ...Array.from({ length: 8 }, (_, i) => ({ id: `zz${String(i)}-1`, workflowName: `other-${String(i)}`, agents: [] })),
+    { id: "bbbbbbbb-2", workflowName: "twin", agents: [] },
+  ]);
+  const text = drawAt(host, 120).join("\n");
+  assert.doesNotMatch(text, /aaaaaaaa/, "the twin is folded away, so no id");
+  const title = drawAt(host, 30)[0];
+  assert.match(title, /⚠ 1 quiet/);
+  assert.ok(visibleWidth(title) <= 30);
+  host.shutdown();
+});
+
+void test("folded phases of two runs each get their own marker", () => {
+  const host = startRuns([
+    { id: "run-1", workflowName: "alpha", phaseHistory: [1, 2, 3, 4, 5, 6, 7, 8].map((n) => ({ phase: `ph${String(n)}`, afterAgent: 0 })), agents: [] },
+    { id: "run-2", workflowName: "beta", phaseHistory: [1, 2, 3, 4, 5, 6, 7, 8].map((n) => ({ phase: `qh${String(n)}`, afterAgent: 0 })), agents: [] },
+  ]);
+  const frame = drawAt(host, 120);
+  const alpha = frame.findIndex((line) => line.includes("alpha"));
+  const beta = frame.findIndex((line) => line.includes("beta"));
+  assert.ok(alpha >= 0 && beta > alpha, frame.join("\n"));
+  assert.ok(frame.slice(alpha + 1, beta).some((line) => /… \d+ phases/.test(line)), "marker under alpha");
+  assert.ok(frame.slice(beta + 1).some((line) => /… \d+ phases/.test(line)), "marker under beta");
+  host.shutdown();
+});
+
+void test("hidden children of two parents get one marker under each parent, with their own counts", () => {
+  const kids = (parent, count) => Array.from({ length: count }, (_, i) => agent(`${parent}${String(i)}`, `kid${parent}${String(i)}`, "completed", { parentId: parent }));
+  const host = startRuns([{
+    id: "run-1",
+    workflowName: "flow",
+    agents: [agent("A", "rootA", "running"), ...kids("A", 4), agent("B", "rootB", "running"), ...kids("B", 4), agent("C", "rootC", "running")],
+  }]);
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(host, width);
+    assert.ok(frame.length <= 10);
+    assert.ok(frame.every((line) => visibleWidth(line) <= width), `fits ${String(width)}`);
+  }
+  const frame = drawAt(host, 120);
+  const text = frame.join("\n");
+  const a = frame.findIndex((line) => line.includes("rootA"));
+  const b = frame.findIndex((line) => line.includes("rootB"));
+  const c = frame.findIndex((line) => line.includes("rootC"));
+  assert.ok(a >= 0 && b > a && c > b, text);
+  const stands = (from, to, name) => frame.slice(from + 1, to).reduce((sum, line) => {
+    if (line.includes(`kid${name}`)) return sum + 1;
+    const marker = /… (\d+) (?:done|more)/.exec(line);
+    return sum + (marker ? Number(marker[1]) : 0);
+  }, 0);
+  assert.equal(stands(a, b, "A"), 4, text);
+  assert.equal(stands(b, c, "B"), 4, text);
+  assert.ok(frame.slice(b + 1, c).some((line) => /… \d+ done/.test(line)), `rootB has its own marker: ${text}`);
+  host.shutdown();
+});
+
+void test("a quiet grandchild keeps the parent that spawned it, and hidden rows after it are not counted above it", () => {
+  const host = startRuns([{
+    id: "run-1",
+    workflowName: "flow",
+    agents: [
+      agent("r", "root", "running"),
+      ...Array.from({ length: 8 }, (_, i) => agent(`k${String(i)}`, `kid${String(i)}`, "completed", { parentId: "r" })),
+      agent("p", "parentx", "completed", { parentId: "r" }),
+      { ...silentAgent("q", "quietkid"), parentId: "p" },
+      ...Array.from({ length: 6 }, (_, i) => agent(`s${String(i)}`, `after${String(i)}`, "completed", { parentId: "r" })),
+    ],
+  }]);
+  const frame = drawAt(host, 120);
+  const text = frame.join("\n");
+  const p = frame.findIndex((line) => line.includes("parentx"));
+  const q = frame.findIndex((line) => line.includes("quietkid"));
+  assert.ok(p >= 0 && q > p, text);
+  const above = frame.slice(0, p).reduce((sum, line) => sum + Number(/… (\d+) done/.exec(line)?.[1] ?? 0) + (/kid\d/.test(line) ? 1 : 0), 0);
+  assert.equal(above, 8, `only the rows before the parent: ${text}`);
+  host.shutdown();
+});
+
+void test("the run row counts every settled agent, and an empty run shows 0/0", () => {
+  const host = startRuns([{
+    id: "run-1",
+    workflowName: "mix",
+    agents: [agent("a", "x", "completed"), agent("b", "y", "failed"), agent("c", "z", "cancelled"), agent("d", "w", "running")],
+  }]);
+  assert.match(drawAt(host, 120).find((line) => line.includes("mix")), /mix · (.* · )?3\/4/);
+  host.shutdown();
+  const empty = startRuns([{ id: "run-1", workflowName: "none", agents: [] }]);
+  assert.match(drawAt(empty, 120).find((line) => line.includes("none")), /none · (.* · )?0\/0/);
+  empty.shutdown();
+});
+
+void test("a folded stretch that ends a list closes it with the last-branch glyph", () => {
+  const host = startRuns([{
+    id: "run-1",
+    workflowName: "flow",
+    phaseHistory: [1, 2, 3, 4, 5, 6, 7, 8].map((n) => ({ phase: `ph${String(n)}`, afterAgent: 0 })),
+    agents: [],
+  }]);
+  const frame = drawAt(host, 120);
+  const marker = frame.find((line) => /… \d+ phases/.test(line));
+  assert.ok(marker, frame.join("\n"));
+  assert.match(marker, /╰─ … \d+ phases/);
+  host.shutdown();
+});
+
+void test("folded agents with folded children are all accounted for by a marker", () => {
+  const kids = (parent, count, state) => Array.from({ length: count }, (_, i) => agent(`${parent}k${String(i)}`, `${parent}-kid${String(i)}`, state, { parentId: parent }));
+  const host = startRuns([{
+    id: "run-1",
+    workflowName: "flow",
+    phaseHistory: [{ phase: "a", afterAgent: 0 }, { phase: "b", afterAgent: 1 }],
+    agents: [
+      agent("live", "live", "running"),
+      agent("rootA", "rootA", "completed"), ...kids("rootA", 3, "completed"),
+      agent("rootB", "rootB", "running"), ...kids("rootB", 5, "completed"),
+      agent("rootC", "rootC", "completed"),
+    ],
+  }]);
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(host, width);
+    assert.ok(frame.length <= 10);
+    assert.ok(frame.every((line) => visibleWidth(line) <= width), `fits ${String(width)}`);
+  }
+  const frame = drawAt(host, 120);
+  const text = frame.join("\n");
+  assert.ok(!/rootA-kid/.test(text), text);
+  const shown = frame.filter((line) => /root[ABC]\b/.test(line)).length;
+  const counted = frame.reduce((sum, line) => sum + Number(/… (\d+) (?:done|more)/.exec(line)?.[1] ?? 0), 0);
+  assert.equal(shown + counted, 11, text);
+  host.shutdown();
+});
+
+void test("folded cancelled agents read as done, like the run row counts them", () => {
+  const host = startRuns([{
+    id: "run-1",
+    workflowName: "flow",
+    agents: [
+      agent("r1", "first", "running"),
+      ...Array.from({ length: 10 }, (_, i) => agent(`c${String(i)}`, `c-${String(i)}`, "cancelled")),
+      agent("r2", "last", "running"),
+    ],
+  }]);
+  const text = drawAt(host, 120).join("\n");
+  assert.match(text, /… 8 done/, text);
+  assert.doesNotMatch(text, /… \d+ more\b(?! run)/, text);
+  host.shutdown();
+});
+
+void test("folded failed agents also read as done once settled", () => {
+  const host = startRuns([{
+    id: "run-1",
+    workflowName: "flow",
+    agents: [
+      agent("r1", "first", "running"),
+      ...Array.from({ length: 10 }, (_, i) => agent(`f${String(i)}`, `f-${String(i)}`, "failed")),
+      silentAgent("r2", "last"),
+    ],
+  }]);
+  const frame = drawAt(host, 120);
+  const text = frame.join("\n");
+  assert.ok(frame.every((line) => visibleWidth(line) <= 120));
+  assert.match(text, /… \d+ done/, text);
+  assert.doesNotMatch(text, /… \d+ more\b(?! run)/, text);
+  host.shutdown();
+});
+
+void test("a hidden agent alone in its stretch gives way, so the frame stays within its rows", () => {
+  const agents = [];
+  for (let i = 0; i < 5; i += 1) {
+    agents.push(silentAgent(`q${String(i)}`, `q-${String(i)}`));
+    if (i < 4) agents.push(agent(`x${String(i)}`, `x-${String(i)}`, "completed"));
+  }
+  const host = startRuns([
+    { id: "run-alpha", workflowName: "alpha", agents },
+    { id: "run-beta", workflowName: "beta", agents: [] },
+  ]);
+  for (const width of [120, 100, 70, 40]) {
+    const frame = drawAt(host, width);
+    assert.ok(frame.length <= 10, `${String(width)}: ${String(frame.length)} lines\n${frame.join("\n")}`);
+    assert.ok(frame.every((line) => visibleWidth(line) <= width));
+    assert.match(frame.join("\n"), /alpha/);
+    assert.match(frame.join("\n"), /beta/);
+  }
+  host.shutdown();
+});
+
+void test("when markers are trimmed every run header is kept and the frame fits", () => {
+  const runs = Array.from({ length: 2 }, (_, r) => ({
+    id: `run-${String(r)}`,
+    workflowName: `flow${String(r)}`,
+    agents: [
+      silentAgent(`a${String(r)}`, "asker"),
+      ...Array.from({ length: 3 }, (_, i) => agent(`d${String(r)}${String(i)}`, `d-${String(i)}`, "completed")),
+      silentAgent(`b${String(r)}`, "asker2"),
+    ],
+  }));
+  const host = startRuns(runs);
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(host, width);
+    const text = frame.join("\n");
+    assert.ok(frame.length <= 10, `${String(width)}: ${String(frame.length)} lines\n${text}`);
+    assert.ok(frame.every((line) => visibleWidth(line) <= width));
+    for (let r = 0; r < 2; r += 1) assert.match(text, new RegExp(`flow${String(r)}`), text);
+  }
+  host.shutdown();
+});
+
+void test("a waiting checkpoint is kept with its run header while the title counts it", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-waiting-kept-"));
+  const host = harness();
+  host.start();
+  const directory = writeRun(join(root, "run-1"), runState({
+    agents: Array.from({ length: 10 }, (_, i) => silentAgent(`q${String(i)}`, `q-${String(i)}`)),
+  }));
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, {
+    runId: "run-1", runDirectory: directory, sessionId: "session-1", name: "ok?", state: "awaiting",
+  });
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(host, width);
+    assert.ok(frame.length <= 10);
+    assert.match(frame[0], /◆ 1 waiting/);
+    assert.match(frame.join("\n"), /◆ waiting/, frame.join("\n"));
+  }
+  host.shutdown();
+});
+
+void test("four runs with folded detail keep every header within the rows", () => {
+  const runs = Array.from({ length: 4 }, (_, r) => ({
+    id: `run-${String(r)}`,
+    workflowName: `flow${String(r)}`,
+    agents: [
+      agent(`a${String(r)}`, "first", "completed"),
+      agent(`b${String(r)}`, "second", "running"),
+      agent(`c${String(r)}`, "third", "completed"),
+      agent(`d${String(r)}`, "fourth", "completed"),
+    ],
+  }));
+  const host = startRuns(runs);
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(host, width);
+    const text = frame.join("\n");
+    assert.ok(frame.length <= 10, `${String(width)}: ${String(frame.length)} lines\n${text}`);
+    assert.ok(frame.every((line) => visibleWidth(line) <= width));
+    for (let r = 0; r < 4; r += 1) assert.match(text, new RegExp(`flow${String(r)}`), text);
+    assert.doesNotMatch(text, /more runs?/, text);
+    assert.match(text, /… \d+ (done|phases)/, `a folded marker remains\n${text}`);
+  }
+  host.shutdown();
+});
+
+function assertFits(frame, width, label = "") {
+  const text = frame.join("\n");
+  assert.ok(frame.length <= 10, `${label}${String(width)}: ${String(frame.length)} lines\n${text}`);
+  assert.ok(frame.every((line) => visibleWidth(line) <= width), `${label}fits ${String(width)}`);
+}
+
+void test("quiet agents among completed ones stay, and no completed agent shows while one is hidden", () => {
+  for (const phaseHistory of [undefined, [{ phase: "work", afterAgent: 0 }]]) {
+    const agents = Array.from({ length: 11 }, (_, i) => i % 2 === 0 ? silentAgent(`q${String(i)}`, `q${String(i)}`) : agent(`x${String(i)}`, `x${String(i)}`, "completed"));
+    const host = startRuns([{ id: "run-1", workflowName: "mix", ...(phaseHistory ? { phaseHistory } : {}), agents }]);
+    for (const width of [120, 70, 40]) {
+      const frame = drawAt(host, width);
+      assertFits(frame, width);
+      const text = frame.map(plain).join("\n");
+      if (width === 120) {
+        for (let i = 0; i < 11; i += 2) assert.match(text, new RegExp(`q${String(i)}\\b`), text);
+      }
+      assert.doesNotMatch(text, /✓ x\d/, text);
+    }
+    host.shutdown();
+  }
+});
+
+void test("alone hidden agents never push the frame over its budget", () => {
+  const alpha = { id: "run-a", workflowName: "alpha", agents: Array.from({ length: 9 }, (_, i) => i % 2 === 0 ? silentAgent(`q${String(i)}`, `q${String(i)}`) : agent(`x${String(i)}`, `x${String(i)}`, "completed")) };
+  const host = startRuns([alpha, { id: "run-b", workflowName: "beta" }]);
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(host, width);
+    assertFits(frame, width);
+    assert.match(frame.join("\n"), /beta/);
+  }
+  host.shutdown();
+});
+
+void test("eight run headers and a waiting checkpoint: the waiting row or its mark stays with the header", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-waiting-eight-"));
+  const host = harness();
+  host.start();
+  for (let index = 0; index < 8; index += 1) {
+    const id = `run-${String(index)}`;
+    const directory = writeRun(join(root, id), { ...runState(), id, workflowName: `flow-${String(index)}` });
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: id, runDirectory: directory, sessionId: "session-1" });
+  }
+  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, { runId: "run-3", runDirectory: join(root, "run-3"), sessionId: "session-1", state: "awaiting", name: "ok?" });
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(host, width);
+    assertFits(frame, width);
+    assert.match(frame[0], /◆ 1 waiting/);
+    const line = frame.map(plain).find((item) => item.includes("flow-3"));
+    assert.ok(line !== undefined, "run-3 header is shown");
+    assert.match(line, /◆ waiting/, frame.join("\n"));
+  }
+  host.shutdown();
+});
+
+void test("a run with a waiting checkpoint is never the one folded into the more-runs count", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-waiting-ten-"));
+  const host = harness();
+  host.start();
+  for (let index = 0; index < 10; index += 1) {
+    const id = `run-${String(index)}`;
+    const directory = writeRun(join(root, id), { ...runState(), id, workflowName: `flow-${String(index)}` });
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: id, runDirectory: directory, sessionId: "session-1" });
+  }
+  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, { runId: "run-9", runDirectory: join(root, "run-9"), sessionId: "session-1", state: "awaiting", name: "ok?" });
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(host, width);
+    assertFits(frame, width);
+    const text = frame.map(plain).join("\n");
+    assert.match(frame[0], /◆ 1 waiting/);
+    const line = frame.map(plain).find((item) => item.includes("flow-9"));
+    assert.ok(line !== undefined, `run-9 header is shown at ${String(width)}:\n${text}`);
+    assert.match(line, /◆ waiting/, text);
+    assert.match(text, /… \d+ more runs/, text);
+  }
+  host.shutdown();
+});
+
+void test("when more runs wait than the body holds, the more-runs count says how many of them wait", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-waiting-all-"));
+  const host = harness();
+  host.start();
+  for (let index = 0; index < 10; index += 1) {
+    const id = `run-${String(index)}`;
+    const directory = writeRun(join(root, id), { ...runState(), id, workflowName: `flow-${String(index)}` });
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: id, runDirectory: directory, sessionId: "session-1" });
+    host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, { runId: id, runDirectory: directory, sessionId: "session-1", state: "awaiting", name: "ok?" });
+  }
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(host, width);
+    assertFits(frame, width);
+    const body = frame.slice(1, -1).map(plain);
+    assert.match(frame[0], /◆ 10 waiting/);
+    const headers = body.filter((line) => /flow-\d/.test(line));
+    assert.ok(headers.length > 0 && headers.every((line) => line.includes("◆ waiting")), body.join("\n"));
+    assert.match(body.at(-1), new RegExp(`… ${String(10 - headers.length)} more runs · ◆ ${String(10 - headers.length)} waiting`), body.join("\n"));
+  }
+  host.shutdown();
+});
+
+void test("quiet agents of several runs keep the phase they hang from, and the more-runs count has its own row", () => {
+  const mix = (prefix, count) => Array.from({ length: count }, (_, i) => i % 2 === 0
+    ? silentAgent(`${prefix}q${String(i)}`, `${prefix}q${String(i)}`)
+    : agent(`${prefix}x${String(i)}`, `${prefix}x${String(i)}`, "completed"));
+  for (const [runs, size] of [[3, 7], [5, 3], [4, 5]]) {
+    const host = startRuns(Array.from({ length: runs }, (_, r) => ({ id: `run-${String(r)}`, workflowName: `m${String(r)}`, agents: mix(`r${String(r)}`, size) })));
+    for (const width of [120, 70, 40]) {
+      const frame = drawAt(host, width);
+      assertFits(frame, width, `${String(runs)} runs: `);
+      const body = frame.slice(1, -1);
+      const text = body.join("\n");
+      assert.doesNotMatch(text, /✓ r\dx/, text);
+      assert.match(text, /… \d+ more runs?/, text);
+      // Every shown agent sits under a shown phase of its own run.
+      let phase = false;
+      for (const line of body) {
+        if (/^│ \S/.test(line)) phase = false;
+        else if (/^│ {3}[├╰]─/.test(line)) phase = true;
+        else if (/⚠ r\dq/.test(line)) assert.ok(phase, `${line} has its phase\n${text}`);
+      }
+    }
+    host.shutdown();
+  }
 });
