@@ -18,7 +18,7 @@ import { loadCodemodeToolsSetting, preflight, resolveAgentResourcePolicy, static
 import { beginWorkflowExtensionLoading, loadingRegistry, resetWorkflowRegistryIfIdle, retainWorkflowRegistry, type WorkflowRegistryApi } from "./registry.js";
 import { agentHandleTurnPath, agentIdentityPath, agentWorktree, encoded, executeShellCommand, persistActiveAgentAttempt, persistAgentAttempts, readShellResult, runWorkflow, shellIdentityPath, toolIdentityPath } from "./execution.js";
 import { prepareScriptToolLoadout, scriptTool, scriptToolContext, scriptToolValue, validateScriptToolReferences } from "./script-tools.js";
-import backgroundWidget, { type BackgroundWidgetAPI } from "./background-widget.js";
+import backgroundWidget, { type AgentsOpener, type BackgroundWidgetAPI } from "./background-widget.js";
 import { showChangelogNotice } from "./changelog.js";
 import { createTrajectoryRunLoader, createTrajectoryRunMetadataLoader, createTrajectorySubagentLoader, createTrajectorySubagentMetadataLoader, createTrajectoryTranscriptLoader, trajectoryRunUsage, type TrajectoryActionRequest, type TrajectoryActionResult, type TrajectorySubagent } from "./trajectory.js";
 import { getTrajectoryHost, type TrajectoryPublisherProvider } from "./trajectory-host-handle.js";
@@ -307,6 +307,27 @@ async function inspectStaticAgentConfigurations(executor: WorkflowAgentExecutor,
   if (signal.aborted) throw new WorkflowError("CANCELLED", "Workflow launch cancelled");
 }
 
+/**
+ * The background widget's way into /agents. The workspace needs a genuine command
+ * context, which the widget's own session context is not, so the opener uses the
+ * widget's context when it is one, else the last command context a workspace was
+ * opened with in the same session (`lastCommand`). Without either, it cannot open.
+ */
+export function widgetAgentsOpener(open: (ctx: ExtensionCommandContext, key: string) => Promise<void>, lastCommand: () => ExtensionCommandContext | undefined): AgentsOpener {
+  const resolve = (ctx: ExtensionContext): ExtensionCommandContext | undefined => {
+    if (ctx.mode !== "tui" || !ctx.hasUI) return undefined;
+    if (typeof (ctx as Partial<ExtensionCommandContext>).waitForIdle === "function") return ctx as ExtensionCommandContext;
+    const last = lastCommand();
+    // Pi invalidates a command context when its session is replaced; touching one then throws, and that is "not usable".
+    try {
+      return last !== undefined && last.sessionManager.getSessionId() === ctx.sessionManager.getSessionId() ? last : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  return { available: (ctx) => resolve(ctx) !== undefined, open: (ctx, key) => { const command = resolve(ctx); if (command) void open(command, key).catch(() => {}); } };
+}
+
 export default function workflowExtension(pi: WorkflowExtensionAPI, home?: string, clipboard = copyToClipboard, transport: AgentTransport = localAgentTransport, agentDir?: string, additionalSkillPaths: readonly string[] = [], openWorkspace: OpenAgentsWorkspace = openAgentsWorkspace) {
   beginWorkflowExtensionLoading();
   const registry = loadingRegistry();
@@ -327,7 +348,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     // Registered at load, before Pi resolves --model and restores the session model. Project aliases need project trust, which is unknown here.
     registerAliasVirtualModels(pi, Object.keys(globalSettings.modelAliases ?? {}), workflowSettingsPath(extensionAgentDir));
   } catch { /* Keep the optional UI enabled; the launch path reports settings errors. */ }
-  const backgroundWidgetController = backgroundWidget(pi, backgroundWidgetEnabled);
+  let lastCommandContext: ExtensionCommandContext | undefined;
+  const backgroundWidgetController = backgroundWidget(pi, backgroundWidgetEnabled, widgetAgentsOpener((ctx, key) => openAgents(ctx, key), () => lastCommandContext));
   const codemodeTools = loadCodemodeToolsSetting(extensionAgentDir);
   const logBridge = (store: RunStore, lifecycle: RunLifecycle, workflowName: string) => async (message: string) => {
     const timestamp = Date.now();
@@ -1502,6 +1524,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
   const runAgents = (ctx: ExtensionCommandContext, scope: SessionAgentsScope, loop: Pick<AgentsWorkspaceLoop, "providers" | "initialKey" | "hasContent" | "onEmpty">): Promise<void> => {
     const editorCommand = (): string | undefined => SettingsManager.create(ctx.cwd, extensionAgentDir, { projectTrusted: projectTrusted(ctx) }).getExternalEditorCommand();
     const agents = createSessionAgentsSource(ctx, { home, overlayRun: withLiveActivities, liveAgent: (runId, agentId) => liveAgents.get(runId, agentId)?.session, subagents: getSubagentManager, subagentPresenter: () => getSubagentsHandle()?.presenter(ctx) }, scope);
+    lastCommandContext = ctx;
+    // Kept after the command returns: the widget opens the workspace with it until the session ends or changes; a context Pi has invalidated is detected by the opener.
     return runAgentsWorkspace(ctx, {
       open: openWorkspace,
       options: { agents, openSource: (agent) => openSessionTranscript(agent.session), createView: createTranscriptView, editorCommand },
@@ -1517,18 +1541,23 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
   });
   const navigatorDependencies: WorkflowNavigatorDependencies = { pi, home, clipboard, extensionAgentDir, runs, terminalRunStates, hardTerminalRunStates: HARD_TERMINAL_RUN_STATES, ensureSessionLease, coordinateRunMutation, answerCheckpoint, recovery, stopWorkflowRun, moveForegroundToBackground: deliveryController.moveForegroundToBackground, isForegroundAttached: deliveryController.isForegroundAttached, liveAgents, registry, projectTrusted, resumeHostContext, resumeSelectedWorkflow, reportBlocked: reportWorkflowBlocked, trajectoryProvider, setNavigatorOpen: (open) => { if (open) backgroundWidgetController.suspend(); else backgroundWidgetController.resume(); }, openWorkflowsWorkspace: (ctx, loop) => runAgents(ctx, "workflows", loop) };
   registerWorkflowNavigator(navigatorDependencies);
+  /** The /agents workspace over every agent of the session, selecting `initialKey` when given. */
+  const openAgents = async (ctx: ExtensionCommandContext, initialKey?: string): Promise<void> => {
+    // As /workflow: the session's runs are listed and changed only by the Pi that holds this session's lease.
+    try { await ensureSessionLease(ctx.cwd, ctx.sessionManager.getSessionId()); }
+    catch (error) { ctx.ui.notify(`Cannot open the agents workspace: ${errorText(error)}`, "warning"); return; }
+    // The subagents extension publishes its actions when it is loaded; without it there is no Subagents group either.
+    const subagents = getSubagentsHandle();
+    await runAgents(ctx, "all", { providers: [createWorkflowActionProvider(navigatorDependencies, ctx), ...(subagents ? [subagents.actions(ctx)] : [])], ...(initialKey === undefined ? {} : { initialKey }), ...everyAgent(ctx) });
+  };
   pi.registerCommand("agents", {
     description: "Open the agents of this Pi session with their transcripts",
     handler: async (_args, ctx) => {
       if (ctx.mode !== "tui") { ctx.ui.notify("/agents needs the TUI.", "warning"); return; }
-      // As /workflow: the session's runs are listed and changed only by the Pi that holds this session's lease.
-      try { await ensureSessionLease(ctx.cwd, ctx.sessionManager.getSessionId()); }
-      catch (error) { ctx.ui.notify(`Cannot open the agents workspace: ${errorText(error)}`, "warning"); return; }
-      // The subagents extension publishes its actions when it is loaded; without it there is no Subagents group either.
-      const subagents = getSubagentsHandle();
-      await runAgents(ctx, "all", { providers: [createWorkflowActionProvider(navigatorDependencies, ctx), ...(subagents ? [subagents.actions(ctx)] : [])], ...everyAgent(ctx) });
+      await openAgents(ctx);
     },
   });
+  pi.on("session_shutdown", () => { lastCommandContext = undefined; });
   pi.on("session_shutdown", async () => {
     try {
       await Promise.all([...runs.entries()].map(async ([runId, run]) => {

@@ -141,7 +141,7 @@ function harness(sessionId = "session-1", options = {}) {
     },
   };
 
-  const controller = widget(pi, options.backgroundWidget ?? true);
+  const controller = widget(pi, options.backgroundWidget ?? true, options.opener);
   return {
     context,
     controller,
@@ -1175,7 +1175,7 @@ void test("the shortcut scrolls the widget through a tree too tall to show", () 
   const scrolled = draw();
   assert.notDeepEqual(scrolled, resting, "the window moved");
   assert.ok(scrolled.length <= 10, "still within budget");
-  assert.match(scrolled[0], /↑\/↓ to scroll · Esc to exit/, "the keys are named while scrolling");
+  assert.match(scrolled[0], /↑↓ move · ←→ fold · esc exit/, "the keys are named while scrolling");
 
   // Escape gives the keyboard back, and the arrow with it.
   assert.equal(host.key("\u001b"), true, "escape is taken");
@@ -1269,7 +1269,7 @@ void test("scrolling is visibly a mode: coloured rules, a scrollbar and a way ou
   [...host.shortcuts.values()][0].handler();
   const scrolling = draw();
   assert.ok(scrolling[0].startsWith("\u001b[33m╭"), "scrolling recolours the rules");
-  assert.match(plain(scrolling[0]), /↑\/↓ to scroll · Esc to exit/, "and names the way out");
+  assert.match(plain(scrolling[0]), /↑↓ move · ←→ fold · esc exit/, "and names the way out");
   assert.ok(scrolling.some((line) => line.includes("█")), "the thumb shows where the window sits");
   assert.ok(scrolling.some((line) => line.includes("░")), "against the track it moves along");
 
@@ -2120,4 +2120,254 @@ void test("quiet agents of several runs keep the phase they hang from, and the m
     }
     host.shutdown();
   }
+});
+
+function tallRun(id = "run-1") {
+  return runState({
+    id,
+    agents: [{
+      id: "a1", name: "scout", state: "running", startedAt: Date.now(), tools: [],
+      model: { model: "fixture-model" }, accounting: { input: 1, output: 1, cacheRead: 0, cost: 0 },
+    }],
+    phaseHistory: Array.from({ length: 10 }, (_, index) => ({ phase: `p${String(index)}`, afterAgent: index === 0 ? 0 : 1 })),
+  });
+}
+
+function scrollHost(opener) {
+  __navigationForTests.enabled = true;
+  const root = mkdtempSync(join(tmpdir(), "widget-cursor-"));
+  const host = harness("session-1", { opener: opener ?? { available: () => true, open: () => {} } });
+  host.start();
+  const directory = writeRun(join(root, "run-1"), tallRun());
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  const draw = () => host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
+  // The row on the theme's selection background.
+  const cursorLine = () => host.widgets.at(-1)(host.tui, { ...theme, fg: (_c, text) => text }).render(WIDTH).find((line) => line.includes("\u0001"))?.replaceAll("\u0001", "") ?? "";
+  return { host, draw, cursorLine };
+}
+
+void test("Alt+O reaches the widget before an editor that binds it, in both encodings, only while the hint shows", () => {
+  const { host, draw } = scrollHost();
+  assert.match(draw()[0], /Alt\+O to scroll/);
+  // The harness runs terminal-input listeners first, as Pi does; an editor like
+  // pi-vim's would only see what they leave.
+  assert.equal(host.key("\u001bo"), true, "legacy Alt+O is taken");
+  assert.match(draw()[0], /enter open/);
+  assert.equal(host.key("\u001b"), true);
+  assert.equal(host.key("\u001b[111;3u"), true, "and so is the kitty form");
+  assert.match(draw()[0], /enter open/);
+  host.key("q");
+  // The registered shortcut finds scroll mode on and leaves it alone only when asked.
+  host.shutdown();
+
+  const fits = harness();
+  fits.start();
+  const root = mkdtempSync(join(tmpdir(), "widget-alt-o-fit-"));
+  fits.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: writeRun(join(root, "run-1"), runState()), sessionId: "session-1" });
+  assert.equal(fits.key("\u001bo"), false, "without the hint the key passes through");
+  fits.shutdown();
+});
+
+void test("the cursor moves with j/k and the arrows and the window follows it", () => {
+  const { host, draw, cursorLine } = scrollHost();
+  host.key("\u001bo");
+  assert.match(cursorLine(), /smoke/, "starts on the run row");
+  host.key("j");
+  assert.match(cursorLine(), /p0/);
+  host.key("\u001b[1;1:1B");
+  assert.match(cursorLine(), /scout/);
+  host.key("k");
+  assert.match(cursorLine(), /p0/);
+  for (let press = 0; press < 30; press += 1) host.key("j");
+  assert.match(cursorLine(), /p9/, "stops on the last row");
+  assert.ok(draw().some((line) => /p9/.test(line)), "and the window shows it");
+  for (let press = 0; press < 30; press += 1) host.key("k");
+  assert.match(cursorLine(), /smoke/);
+  for (const line of draw()) assert.ok(visibleWidth(line) <= WIDTH);
+  host.shutdown();
+});
+
+void test("left and right fold and unfold the row's run or phase", () => {
+  const { host, draw } = scrollHost();
+  host.key("\u001bo");
+  host.key("j");
+  assert.ok(draw().some((line) => /scout/.test(line)));
+  host.key("h");
+  assert.ok(!draw().some((line) => /scout/.test(line)), "the phase's agent is folded away");
+  host.key("\u001b[1;1:1C");
+  assert.ok(draw().some((line) => /scout/.test(line)), "and unfolded again");
+  host.key("k");
+  host.key("\u001b[1;1:1D");
+  assert.ok(!draw().some((line) => /p0/.test(line)), "folding the run hides its phases");
+  host.key("l");
+  assert.ok(draw().some((line) => /p0/.test(line)));
+  host.shutdown();
+});
+
+void test("enter opens the workspace on the node under the cursor and leaves scroll mode", () => {
+  const opened = [];
+  const { host, draw } = scrollHost({ available: () => true, open: (_context, key) => { opened.push(key); } });
+  host.key("\u001bo");
+  host.key("\r");
+  assert.deepEqual(opened, ["run:run-1"]);
+  assert.match(draw()[0], /Alt\+O to scroll/, "scroll mode is left");
+  host.key("\u001bo");
+  host.key("j");
+  host.key("\r");
+  host.key("\u001bo");
+  host.key("j");
+  host.key("j");
+  host.key("\r");
+  assert.deepEqual(opened, ["run:run-1", "run:run-1:node:phase/p0%231", "run:run-1:a1"]);
+  host.shutdown();
+});
+
+void test("enter does nothing when the context cannot open the workspace", () => {
+  const opened = [];
+  const { host, draw } = scrollHost({ available: () => false, open: (_context, key) => { opened.push(key); } });
+  host.key("\u001bo");
+  assert.equal(host.key("\r"), true);
+  assert.deepEqual(opened, []);
+  assert.match(draw()[0], /esc exit/, "still in scroll mode");
+  assert.doesNotMatch(draw()[0], /enter open/, "and the hint does not promise what cannot happen");
+  host.shutdown();
+});
+
+void test("a repeated phase name opens the occurrence the workspace numbers, declared phases included", () => {
+  const opened = [];
+  __navigationForTests.enabled = true;
+  const root = mkdtempSync(join(tmpdir(), "widget-repeat-"));
+  const host = harness("session-1", { opener: { available: () => true, open: (_context, key) => { opened.push(key); } } });
+  host.start();
+  const names = ["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p0"];
+  const directory = writeRun(join(root, "run-1"), runState({ agents: [], phaseHistory: names.map((phase) => ({ phase, afterAgent: 0 })) }));
+  // Declared at launch: a phase that never ran counts toward the numbering.
+  writeFileSync(join(directory, "snapshot.json"), JSON.stringify({ phases: ["p0", "p0", "p0"] }));
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  host.key("\u001bo");
+  for (let press = 0; press < 30; press += 1) host.key("j");
+  host.key("\r");
+  host.key("\u001bo");
+  host.key("j");
+  host.key("\r");
+  assert.deepEqual(opened, ["run:run-1:node:phase/p0%232", "run:run-1:node:phase/p0%231"]);
+  host.shutdown();
+});
+
+void test("a blank phase name in the history has no target and does not shift the next phase's node", () => {
+  const opened = [];
+  __navigationForTests.enabled = true;
+  const root = mkdtempSync(join(tmpdir(), "widget-blank-"));
+  const host = harness("session-1", { opener: { available: () => true, open: (_context, key) => { opened.push(key); } } });
+  host.start();
+  const names = [" ", "q0", "q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8"];
+  const directory = writeRun(join(root, "run-1"), runState({ agents: [], phaseHistory: names.map((phase) => ({ phase, afterAgent: 0 })) }));
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  host.key("\u001bo");
+  host.key("j");
+  host.key("\r");
+  assert.deepEqual(opened, [], "the blank row has no target");
+  host.key("j");
+  host.key("\r");
+  assert.deepEqual(opened, ["run:run-1:node:phase/q0%231"]);
+  host.shutdown();
+});
+
+void test("a fractional afterAgent in the history does not shift the next phases' targets", () => {
+  const opened = [];
+  __navigationForTests.enabled = true;
+  const root = mkdtempSync(join(tmpdir(), "widget-fraction-"));
+  const host = harness("session-1", { opener: { available: () => true, open: (_context, key) => { opened.push(key); } } });
+  host.start();
+  const history = Array.from({ length: 10 }, (_, index) => ({ phase: `p${String(index)}`, afterAgent: index === 1 ? 0.5 : 0 }));
+  const directory = writeRun(join(root, "run-1"), runState({ agents: [], phaseHistory: history }));
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  host.key("\u001bo");
+  host.key("j");
+  host.key("j");
+  host.key("\r");
+  assert.deepEqual(opened, [], "the p1 row has no node");
+  host.key("j");
+  host.key("\r");
+  assert.deepEqual(opened, ["run:run-1:node:phase/p2%231"]);
+  host.shutdown();
+});
+
+void test("left and right on rows that cannot fold are taken and scroll mode stays", () => {
+  const { host, draw, cursorLine } = scrollHost();
+  host.key("\u001bo");
+  host.key("j");
+  host.key("j");
+  assert.match(cursorLine(), /scout/);
+  assert.equal(host.key("\u001b[D"), true, "left on an agent is taken");
+  assert.match(cursorLine(), /p0/, "the cursor goes to the phase it hangs from");
+  assert.ok(!draw().some((line) => /scout/.test(line)), "which is folded");
+  assert.match(draw()[0], /enter open/);
+  host.key("j");
+  assert.match(cursorLine(), /p1/);
+  assert.equal(host.key("h"), true, "left on a phase with no agents folds its run");
+  assert.match(cursorLine(), /smoke/);
+  assert.equal(host.key("h"), true, "left on a folded run with nothing above is a no-op");
+  assert.equal(host.key("l"), true);
+  assert.equal(host.key("\u001b[C"), true);
+  assert.match(draw()[0], /enter open/, "scroll mode stays");
+  host.shutdown();
+});
+
+void test("the registered shortcut leaves scroll mode on when the listener has entered it", () => {
+  const { host, draw } = scrollHost();
+  host.key("\u001bo");
+  [...host.shortcuts.values()][0].handler();
+  assert.match(draw()[0], /enter open/, "not toggled off, not entered twice");
+  host.shutdown();
+});
+
+void test("agents before the first phase open the unassigned node, and a lone current phase opens that phase", () => {
+  __navigationForTests.enabled = true;
+  const root = mkdtempSync(join(tmpdir(), "widget-unphased-"));
+  const names = Array.from({ length: 9 }, (_, index) => `p${String(index)}`);
+  const opened = [];
+  const first = harness("session-1", { opener: { available: () => true, open: (_context, key) => { opened.push(key); } } });
+  first.start();
+  const agentRecord = { id: "a1", name: "scout", state: "running", startedAt: Date.now(), tools: [], model: { model: "fixture-model" }, accounting: { input: 1, output: 1, cacheRead: 0, cost: 0 } };
+  const before = writeRun(join(root, "run-1"), runState({ agents: [agentRecord], phaseHistory: names.map((phase) => ({ phase, afterAgent: 1 })) }));
+  first.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: before, sessionId: "session-1" });
+  first.key("\u001bo");
+  first.key("j");
+  first.key("\r");
+  assert.deepEqual(opened, ["run:run-1:node:phase/unassigned"]);
+  first.shutdown();
+
+  const second = harness("session-1", { opener: { available: () => true, open: (_context, key) => { opened.push(key); } } });
+  second.start();
+  const only = writeRun(join(root, "run-2"), runState({ id: "run-2", phase: "llm", phaseHistory: [], agents: Array.from({ length: 12 }, (_, index) => ({ ...agentRecord, id: `b${String(index)}`, name: `w${String(index)}` })) }));
+  second.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-2", runDirectory: only, sessionId: "session-1" });
+  second.key("\u001bo");
+  second.key("j");
+  second.key("\r");
+  assert.equal(opened[1], "run:run-2:node:phase/llm%231");
+  second.shutdown();
+});
+
+void test("a pi-vim-like editor that swallows Alt+O never sees it while the hint shows, and the shortcut does not enter twice", () => {
+  const { host, draw } = scrollHost();
+  const seen = [];
+  const editorKey = (data) => { if (data === "\u001bo") { seen.push(data); return true; } return false; };
+  const press = (data) => host.key(data) || editorKey(data);
+  press("\u001bo");
+  assert.deepEqual(seen, [], "the editor never saw the key");
+  assert.match(draw()[0], /esc exit/);
+  [...host.shortcuts.values()][0].handler();
+  assert.match(draw()[0], /esc exit/, "the registered shortcut found scroll mode already on");
+  press("q");
+  host.shutdown();
+  // Without the hint the key belongs to the editor.
+  const fits = harness();
+  fits.start();
+  const root = mkdtempSync(join(tmpdir(), "widget-vim-fit-"));
+  fits.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: writeRun(join(root, "run-1"), runState()), sessionId: "session-1" });
+  const reached = [];
+  assert.equal(fits.key("\u001bo") || (reached.push("o"), editorKey("\u001bo")), true);
+  assert.deepEqual(reached, ["o"]);
+  fits.shutdown();
 });

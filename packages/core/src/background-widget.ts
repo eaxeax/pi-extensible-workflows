@@ -20,6 +20,7 @@ import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-c
 import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentRecord, AgentState, RunRecord, RunState } from "./types.js";
 import { listRunIds, RunStore } from "./persistence.js";
+import { buildWorkflowPhaseModel, workflowPhaseTreePath } from "./host-phases.js";
 import { agentSilentFor, QUIET_MS, STALL_MS } from "./agent-activity.js";
 
 export { QUIET_MS };
@@ -360,6 +361,42 @@ function agentTokens(agent: AgentRecord): number {
   return accounting.input + accounting.output;
 }
 
+/** The phases a run declared at launch, read once per run directory. */
+const declaredPhases = new Map<string, readonly string[]>();
+function launchPhases(directory: string): readonly string[] {
+  const known = declaredPhases.get(directory);
+  if (known) return known;
+  let phases: readonly string[] = [];
+  try {
+    const snapshot: unknown = JSON.parse(readFileSync(join(directory, "snapshot.json"), "utf8"));
+    if (object(snapshot) && Array.isArray(snapshot.phases)) phases = snapshot.phases.filter((phase): phase is string => typeof phase === "string");
+  } catch {
+    // A run without a readable snapshot has no declared phases to number against.
+  }
+  declaredPhases.set(directory, phases);
+  return phases;
+}
+
+/**
+ * The workspace's tree-node id of each observed phase, in the order the run
+ * entered them: the same model and path the /workflow tree is built from, so
+ * a phase is named exactly as the workspace names it.
+ */
+function phaseNodeIds(run: Run): { history: (string | undefined)[]; unphased?: string } | undefined {
+  try {
+    const model = buildWorkflowPhaseModel({ state: run.state ?? "running", agents: run.agents ?? [], ...(run.phase === undefined ? {} : { phase: run.phase }), ...(run.phaseHistory === undefined ? {} : { phaseHistory: run.phaseHistory }), ...(run.activeShellsByPhase === undefined ? {} : { activeShellsByPhase: run.activeShellsByPhase }) }, launchPhases(run.directory));
+    const ids = model.phases.filter((phase) => phase.observed && phase.id !== "preflight").map((phase) => workflowPhaseTreePath("phase", phase.id, []));
+    // The model skips blank names and non-integer positions; the history index of each entry keeps its place, a skipped one has no node.
+    let next = 0;
+    const history = (run.phaseHistory ?? []).map((entry) => entry.phase.trim() === "" || !Number.isSafeInteger(entry.afterAgent) ? undefined : ids[next++]);
+    // Agents before the first phase hang from the workspace's unassigned node; with no history the model files them under the current phase.
+    const unphased = model.unassignedAgents?.length ? workflowPhaseTreePath("phase", "unassigned", []) : (run.phaseHistory ?? []).length === 0 ? ids[0] : undefined;
+    return { history, ...(unphased === undefined ? {} : { unphased }) };
+  } catch {
+    return undefined;
+  }
+}
+
 /** Phase names in the order they opened, with the agents that ran in each. */
 type PhaseSlice = { phase: string; agents: readonly AgentRecord[]; phaseIndex?: number };
 
@@ -441,6 +478,37 @@ interface Row {
     | { kind: "agent"; phase: string; prefix: string; settled: boolean; last: boolean };
   /** For rows inside a phase, the key of that phase's row. */
   phase?: string;
+  /** The key of the /agents workspace node this row stands for; Enter opens the workspace there. */
+  open?: string;
+}
+
+/** Cursor and folds of scroll mode, as the frame needs them. */
+interface Navigation {
+  cursor: string | undefined;
+  /** Where the cursor was, for when its row is gone. */
+  index: number;
+  folded: ReadonlySet<string>;
+}
+
+/** What the frame reports back to the key handler. */
+interface FrameReport {
+  rows: number;
+  /** Rows of the whole tree, folded or not: what the scroll gate is measured against. */
+  total: number;
+  /** The rows drawn in scroll mode (folded ones left out), in order. */
+  list: { key: string | undefined; open: string | undefined; foldable: boolean; parent: string | undefined }[];
+  cursor: number;
+  offset: number;
+}
+
+/**
+ * Opens the /agents workspace from the widget. `available` says whether the
+ * widget's context can (the TUI, with a command context); `open` does it on
+ * the node with the given key.
+ */
+export interface AgentsOpener {
+  available(context: ExtensionContext): boolean;
+  open(context: ExtensionContext, key: string): void;
 }
 
 /**
@@ -707,7 +775,7 @@ function collapseRows(rows: readonly Row[], budget: number, paint: Paint, offset
 }
 
 /** The whole widget frame, or undefined when nothing is running. */
-function renderFrame(runs: readonly Run[], now: number, width: number, offset = 0, theme?: Theme, scrolling = false, sizeOut: { rows: number } = { rows: 0 }): string[] | undefined {
+function renderFrame(runs: readonly Run[], now: number, width: number, startOffset = 0, theme?: Theme, scrolling = false, sizeOut: FrameReport = { rows: 0, total: 0, list: [], cursor: 0, offset: 0 }, nav: Navigation = { cursor: undefined, index: 0, folded: new Set() }, canOpen = false): string[] | undefined {
   // Only live background runs.
   //
   // A finished run leaves its own receipt in the transcript, so holding it
@@ -759,6 +827,7 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
       // tokens and cost: the name still says which run, however narrow the frame.
       ...(run.waiting ? { flagged: `${paint(ROLE.warn, "◆ waiting")} · ${elapsed}` } : {}),
       right: `${stats ? `${stats} · ` : ""}${elapsed}`,
+      open: runKey,
     });
 
     // A checkpoint is the one thing here that a person has to act on, and it
@@ -768,6 +837,8 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
       rows.push({
         rank: 2,
         waiting: true,
+        key: `${runKey}/waiting`,
+        open: runKey,
         parent: runKey,
         run: runKey,
         text: `  ${paint(ROLE.warn, "◆")} waiting: ${run.waiting.name}`,
@@ -776,7 +847,12 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
     }
 
     const slices = phaseSlices(run);
+    // Targets are only followed while scrolling, so the phase model is not rebuilt on every repaint.
+    const phaseIds = scrolling ? phaseNodeIds(run) : undefined;
     slices.forEach((slice, index) => {
+      // A phase the workspace has no node for has no target; unphased agents fall back to the run when the model has no node for them.
+      const nodeId = slice.phaseIndex === undefined ? phaseIds?.unphased : phaseIds?.history[slice.phaseIndex];
+      const target = nodeId !== undefined ? `${runKey}:node:${nodeId}` : slice.phaseIndex === undefined ? runKey : undefined;
       const last = index === slices.length - 1;
       const liveAgents = slice.agents.some(
         (agent) => isAgentLive(agent.state),
@@ -796,6 +872,7 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
       rows.push({
         rank: liveAgents || failed ? 1 : 0,
         key: phaseKey,
+        ...(target === undefined ? {} : { open: target }),
         parent: runKey,
         run: runKey,
         fold: { kind: "phase", lead: last ? "╰─" : "├─", agents: slice.agents.length },
@@ -811,6 +888,8 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
       if (shell) {
         rows.push({
           rank: 1,
+          key: `${phaseKey}/shell`,
+          ...(target === undefined ? {} : { open: target }),
           parent: phaseKey,
           run: runKey,
           phase: phaseKey,
@@ -862,7 +941,8 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
           run: runKey,
           phase: phaseKey,
           fold: { kind: "agent", phase: phaseKey, prefix, settled: SETTLED_AGENT_STATES.has(agent.state), last: lastAgent },
-          ...(kids.length > 0 ? { key: agentKey } : {}),
+          key: agentKey,
+          open: `${runKey}:${agent.id}`,
           text: `${prefix}${lastAgent ? "╰─" : "├─"} ${
 
             silent === undefined
@@ -896,6 +976,27 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
 
   // The rules change colour while scrolling, so it is obvious at a glance that
   // the arrows are going here and not to the editor.
+  // Folded rows are left out in scroll mode; a row is folded when any row it hangs from is.
+  const byKey = new Map(rows.flatMap((row) => row.key === undefined ? [] : [[row.key, row] as const]));
+  const foldable = new Set(rows.flatMap((row) => row.parent === undefined ? [] : [row.parent]));
+  const hiddenByFold = (row: Row): boolean => {
+    //NOTE: parent keys come from rows drawn earlier, so the chain cannot loop.
+    for (let at = row.parent; at !== undefined; at = byKey.get(at)?.parent) if (nav.folded.has(at)) return true;
+    return false;
+  };
+  const tree = scrolling && nav.folded.size > 0 ? rows.filter((row) => !hiddenByFold(row)) : rows;
+  let offset = startOffset;
+  if (scrolling) {
+    sizeOut.list = tree.map((row) => ({ key: row.key, open: row.open, foldable: row.key !== undefined && foldable.has(row.key), parent: row.parent }));
+    const found = sizeOut.list.findIndex((item) => item.key === nav.cursor && nav.cursor !== undefined);
+    const at = Math.max(0, Math.min(found >= 0 ? found : nav.index, tree.length - 1));
+    sizeOut.cursor = at;
+    // The window follows the cursor: one row of it is the count of what lies past.
+    const span = MAX_ROWS - 3;
+    const limit = maxOffset(tree.length, MAX_ROWS - 2);
+    offset = limit === 0 ? 0 : Math.min(limit, Math.max(0, Math.min(Math.max(offset, at - span + 1), at)));
+    sizeOut.offset = offset;
+  }
   const accent = (text: string): string => paint(scrolling ? ROLE.warn : ROLE.live, text);
   const attention = [
     ...(waiting > 0 ? [`◆ ${String(waiting)} waiting`] : []),
@@ -908,16 +1009,29 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
   const room = Math.max(1, width - 8);
   const fullTitle = visibleLength(withCount) <= room ? withCount : withoutCount;
   const title = visibleLength(fullTitle) > room ? truncate(fullTitle, room) : fullTitle;
-  sizeOut.rows = rows.length;
-  const collapsed = collapse(rows, MAX_ROWS - 2, paint, offset, scrolling);
+  sizeOut.rows = tree.length;
+  sizeOut.total = rows.length;
+  const collapsed = collapse(tree, MAX_ROWS - 2, paint, offset, scrolling);
   const shownNames = new Map<string, number>();
   for (const row of collapsed) if (row.named) shownNames.set(row.named.name, (shownNames.get(row.named.name) ?? 0) + 1);
-  const body = collapsed.map((row) => (row.named && (shownNames.get(row.named.name) ?? 0) > 1 ? { ...row, text: row.named.withId } : row));
+  const cursorKey = scrolling ? sizeOut.list[sizeOut.cursor]?.key : undefined;
+  // The row under the cursor is drawn on the theme's selection background.
+  // Resets inside the row's own colours would end the background early, so it is set again after each.
+  const cursorText = (text: string): string => {
+    if (!theme) return text;
+    const [open = "", close = ""] = theme.bg("selectedBg", "\u0000").split("\u0000");
+    const kept = text.replaceAll("\u001b[0m", `\u001b[0m${open}`).replaceAll("\u001b[49m", `\u001b[49m${open}`);
+    return `${open}${kept}${close}`;
+  };
+  const body = collapsed.map((row) => {
+    const named = row.named && (shownNames.get(row.named.name) ?? 0) > 1 ? { ...row, text: row.named.withId } : row;
+    return cursorKey !== undefined && row.key === cursorKey ? { ...named, text: cursorText(named.text) } : named;
+  });
 
   // A scrollbar on the right rule, drawn only when there is more tree than
   // frame. Without it the window's position is a guess: three rows of a
   // twenty-row tree look the same near the top as near the bottom.
-  const total = rows.length;
+  const total = tree.length;
   const shown = body.length;
   const scrollbar = (index: number): string | undefined => {
     if (!scrolling || total <= shown) return undefined;
@@ -943,9 +1057,9 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
 
   // Only advertise navigation when it can reveal hidden rows: a hint for keys
   // that do nothing is worse than no hint.
-  const hint = !__navigationForTests.enabled || maxOffset(total, MAX_ROWS - 2) === 0
+  const hint = !__navigationForTests.enabled || (!scrolling && maxOffset(total, MAX_ROWS - 2) === 0)
     ? ""
-    : scrolling ? "↑/↓ to scroll · Esc to exit" : "Alt+O to scroll";
+    : scrolling ? `↑↓ move · ←→ fold · ${canOpen ? "enter open · " : ""}esc exit` : "Alt+O to scroll";
   return drawFrame(title, hint, body, width, paint, accent, scrollbar);
 }
 
@@ -1171,7 +1285,7 @@ export function renderReceipt(data: Receipt, expanded: boolean, theme: Theme): s
 
 export interface BackgroundWidgetController { suspend(): void; resume(): void }
 
-export default function widget(pi: BackgroundWidgetAPI, enabled = true): BackgroundWidgetController {
+export default function widget(pi: BackgroundWidgetAPI, enabled = true, opener?: AgentsOpener): BackgroundWidgetController {
   if (!enabled || typeof pi.registerEntryRenderer !== "function" || typeof pi.registerShortcut !== "function" || !pi.events || typeof pi.events.on !== "function") return { suspend() {}, resume() {} };
   const eventBus = pi.events;
   const subscribe = (name: string, handler: (event: unknown) => void): (() => void) => eventBus.on?.(name, handler) ?? (() => {});
@@ -1201,7 +1315,10 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true): Backgro
   /** How far the window has been scrolled down the tree. */
   let offset = 0;
   /** Rows the tree had in the last frame, so scrolling cannot run off its end. */
-  const size = { rows: 0 };
+  const size: FrameReport = { rows: 0, total: 0, list: [], cursor: 0, offset: 0 };
+  /** The row under the cursor, and the rows folded shut, in scroll mode. */
+  let cursorKey: string | undefined;
+  const foldedKeys = new Set<string>();
   /**
    * The TUI the widget was last built against, kept only to ask whether
    * something else currently owns the keyboard.
@@ -1252,8 +1369,11 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true): Backgro
   const resetNavigation = (): void => {
     focused = false;
     offset = 0;
+    cursorKey = undefined;
+    foldedKeys.clear();
     rowCount = 0;
     size.rows = 0;
+    size.list = [];
     host = undefined;
   };
   const stopAnimationTimer = (): void => {
@@ -1277,37 +1397,79 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true): Backgro
     inputUnsubscribe = undefined;
     resetNavigation();
   };
+  const enterScroll = (): void => {
+    focused = true;
+    offset = 0;
+    cursorKey = undefined;
+    foldedKeys.clear();
+    size.cursor = 0;
+    requestRender?.();
+  };
+  const leaveScroll = (): void => {
+    focused = false;
+    offset = 0;
+    cursorKey = undefined;
+    foldedKeys.clear();
+    size.cursor = 0;
+  };
+  /** Whether the hint is on screen: the tree is taller than the frame and navigation is on. */
+  const canScroll = (): boolean => showing && __navigationForTests.enabled && maxOffset(rowCount, MAX_ROWS - 2) > 0;
+  const moveCursor = (delta: number): void => {
+    const next = Math.max(0, Math.min(size.list.length - 1, size.cursor + delta));
+    cursorKey = size.list[next]?.key;
+    size.cursor = next;
+    requestRender?.();
+  };
   const handleInput = (data: string): { consume?: boolean } | undefined => {
-    if (!showing || !focused) return undefined;
-    if (somethingElseHasTheKeyboard()) {
-      focused = false;
-      offset = 0;
-      return undefined;
+    if (!showing) return undefined;
+    if (!focused) {
+      // Taken here, ahead of the editor, because an editor that binds Alt+O itself
+      // never hands it on; only while the hint promises it.
+      if (!matchesKey(data, "alt+o") || isKeyRelease(data) || !canScroll() || somethingElseHasTheKeyboard()) return undefined;
+      enterScroll();
+      return { consume: true };
     }
-    if (maxOffset(rowCount, MAX_ROWS - 2) === 0) {
-      focused = false;
-      offset = 0;
+    if (somethingElseHasTheKeyboard() || !canScroll()) {
+      leaveScroll();
       return undefined;
     }
     if (isKeyRelease(data)) return { consume: true };
-    if (matchesKey(data, Key.up)) {
-      offset = Math.max(0, offset - 1);
-      requestRender?.();
+    if (matchesKey(data, "alt+o")) return { consume: true };
+    const item = size.list[size.cursor];
+    if (matchesKey(data, Key.up) || data === "k") { moveCursor(-1); return { consume: true }; }
+    if (matchesKey(data, Key.down) || data === "j") { moveCursor(1); return { consume: true }; }
+    // Keys the hint promises are always taken: a row that cannot fold folds the
+    // row it hangs from and the cursor goes there; with nothing to fold they do nothing.
+    if (matchesKey(data, Key.left) || data === "h") {
+      const own = item?.key !== undefined && item.foldable && !foldedKeys.has(item.key);
+      const target = own ? item.key : item?.parent;
+      if (target !== undefined) {
+        foldedKeys.add(target);
+        const at = size.list.findIndex((entry) => entry.key === target);
+        if (at >= 0) { cursorKey = target; size.cursor = at; }
+        requestRender?.();
+      }
       return { consume: true };
     }
-    if (matchesKey(data, Key.down)) {
-      offset = Math.min(maxOffset(rowCount, MAX_ROWS - 2), offset + 1);
+    if (matchesKey(data, Key.right) || data === "l") {
+      if (item?.key !== undefined && foldedKeys.delete(item.key)) requestRender?.();
+      return { consume: true };
+    }
+    if (matchesKey(data, Key.enter)) {
+      // Nothing to open here: the key does nothing and the cursor stays.
+      if (context === undefined || item?.open === undefined || !opener?.available(context)) return { consume: true };
+      const target = context;
+      leaveScroll();
       requestRender?.();
+      opener.open(target, item.open);
       return { consume: true };
     }
     if (matchesKey(data, Key.escape) || data === "q") {
-      focused = false;
-      offset = 0;
+      leaveScroll();
       requestRender?.();
       return { consume: true };
     }
-    focused = false;
-    offset = 0;
+    leaveScroll();
     return undefined;
   };
   const installInput = (): void => {
@@ -1428,7 +1590,7 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true): Backgro
                 // gave. A pane narrower than the floor gets a cut frame; it does
                 // not get a crash, and pi-tui treats an over-wide line as fatal.
                 const usable = Math.max(20, width);
-                const frame = renderFrame([...runs.values()], Date.now(), usable, focused ? offset : 0, theme, focused, size);
+                const frame = renderFrame([...runs.values()], Date.now(), usable, focused ? offset : 0, theme, focused, size, { cursor: cursorKey, index: size.cursor, folded: foldedKeys }, context !== undefined && opener?.available(context) === true);
                 if (frame === undefined) {
                   renderFailed = true;
                   inputUnsubscribe?.();
@@ -1438,8 +1600,10 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true): Backgro
                 }
                 // The keys track the body rows exactly, so they say how far the
                 // cursor may travel — the lid and the floor are not rows to land on.
-                rowCount = size.rows;
-                offset = Math.min(offset, maxOffset(rowCount, MAX_ROWS - 2));
+                // Folded rows leave the count of the tree, but the mode stays: the
+                // shortcut gate is measured against the whole tree.
+                rowCount = size.total;
+                if (focused) { offset = size.offset; cursorKey = size.list[size.cursor]?.key; }
                 return frame.map((line) =>
                   visibleLength(line) > width ? truncate(line, width) : line,
                 );
@@ -1609,6 +1773,7 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true): Backgro
     hide();
     context = undefined;
     runs.clear();
+    declaredPhases.clear();
     seen.clear();
     receipted.clear();
     awaitingDedicatedReceipt.clear();
@@ -1643,6 +1808,7 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true): Backgro
     hide();
     failureEvents.clear();
     runs.clear();
+    declaredPhases.clear();
     seen.clear();
     receipted.clear();
     awaitingDedicatedReceipt.clear();
@@ -1670,14 +1836,13 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true): Backgro
   if (__navigationForTests.enabled) registerShortcut(FOCUS_SHORTCUT, {
     description: "Scroll the workflow widget",
     handler: () => {
-      if (!showing || maxOffset(rowCount, MAX_ROWS - 2) === 0) {
-        focused = false;
-        offset = 0;
+      // The listener may have entered already; the key is not taken twice.
+      if (!canScroll()) {
+        leaveScroll();
+        requestRender?.();
         return;
       }
-      focused = !focused;
-      offset = 0;
-      requestRender?.();
+      if (!focused) enterScroll();
     },
   });
 
