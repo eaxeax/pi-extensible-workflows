@@ -7,7 +7,8 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { ActionUi, AgentsActionTarget } from "../src/agents-actions-contract.js";
 import { formatWorkflowRuntime, PLAIN_WORKFLOW_PROGRESS_STYLES, registerWorkflowExtension, resetWorkflowRegistry, type AgentAttemptSummary, type PreparedAgentSession } from "../src/index.js";
 import { getSubagentsHandle } from "../src/subagent-actions-handle.js";
-import { createSubagentActionProvider, createSubagentPresenter } from "../subagents/src/actions.js";
+import { createSessionAgentsSource } from "../src/session-agents.js";
+import { createSubagentActionProvider, createSubagentPresenter, listNames, loadEntries } from "../subagents/src/actions.js";
 import type { SubagentAttemptActionData, SubagentManager, SubagentManagerContext } from "../subagents/src/contracts.js";
 import { registerSubagentsExtension } from "../subagents/src/index.js";
 
@@ -58,9 +59,9 @@ const PREPARED = { cwd: "/repo", model: { provider: "fixture", model: "model" },
 type ManagerCall = readonly [string, unknown, SubagentManagerContext];
 /**
  * The session's runs: run-a running (label scout, a worktree, a live system prompt), run-b completed (label scout, a
- * result), run-c failed (no request file), and a run of another session the provider never lists.
+ * result), run-c failed (no request file), and a run of another session the provider never lists; an `unreadable` id is listed but cannot be inspected.
  */
-function fixture(options: { readonly delete?: boolean; readonly retry?: unknown; readonly failDelete?: string; readonly clipboardError?: string } = {}) {
+function fixture(options: { readonly delete?: boolean; readonly retry?: unknown; readonly failDelete?: string; readonly clipboardError?: string; readonly unreadable?: readonly string[] } = {}) {
   const directory = storage({ "run-a": { prompt: "PROMPT A", label: "scout", mode: "background" }, "run-b": { prompt: "PROMPT B", label: "scout", mode: "background" } });
   const statuses = new Map<string, Record<string, unknown>>([
     ["run-a", { id: "run-a", sessionId: SESSION, state: "running", startedAt: 1_000, attempts: 1, attemptDetails: [ATTEMPT], worktree: { path: "/repo/worktree-a", branch: "subagent/run-a" } }],
@@ -79,6 +80,7 @@ function fixture(options: { readonly delete?: boolean; readonly retry?: unknown;
     async run() { throw new Error("unexpected run"); },
     async inspect(request) {
       if (request.id === undefined) return [...statuses.values()];
+      if (options.unreadable?.includes(request.id)) throw new Error(`inspection of ${request.id} failed`);
       return known(request.id);
     },
     async steer(request, context) { calls.push(["steer", request, context]); return { id: request.id, accepted: true }; },
@@ -293,6 +295,21 @@ void test("the presenter names subagents as the /subagents list does and gives t
   assert.deepEqual(described.get("run-a")?.details(PLAIN_WORKFLOW_PROGRESS_STYLES, NOW), ["Selected subagent: scout", "ID: run-a", "State: running", "Model: fixture/model", "Tools: read", `Duration: ${formatWorkflowRuntime(NOW - 1_000)}`]);
   assert.deepEqual(described.get("run-c")?.details(PLAIN_WORKFLOW_PROGRESS_STYLES, NOW), ["Selected subagent: run-c", "ID: run-c", "State: failed", "Tools: (none)", "Duration: 2s", "Error: AGENT_FAILED: boom"]);
   assert.equal((await presenter.describe(["run-b"])).get("run-b")?.name, "scout", "a label used once is the name");
+});
+
+void test("the presenter names a subagent whose inspection fails from its request label, as the /subagents list does, and details it with its listed row", async () => {
+  const { manager, directory, context } = fixture({ unreadable: ["run-b", "run-c"] });
+  const presenter = createSubagentPresenter({ manager, storageDirectory: directory }, context);
+  const described = await presenter.describe(["run-a", "run-b", "run-c", "run-missing"]);
+  const names = [...described].map(([id, { name }]) => [id, name]);
+  assert.deepEqual(names, [["run-a", "scout run-a"], ["run-b", "scout run-b"], ["run-c", "run-c"]], "its twin still carries the short ID; an id neither inspected nor listed is left out");
+  const listed = await loadEntries(manager, directory, context);
+  const listNamed = new Map(listNames(listed).map((name, index) => [listed[index]?.status.id, name]));
+  assert.deepEqual(names, names.map(([id]) => [id, listNamed.get(id)]), "the names of the /subagents list");
+  assert.deepEqual(described.get("run-b")?.details(PLAIN_WORKFLOW_PROGRESS_STYLES, NOW), ["Selected subagent: scout", "ID: run-b", "State: completed", "Tools: (none)", "Duration: 1s"], "what its listed row still tells");
+  assert.deepEqual(described.get("run-c")?.details(PLAIN_WORKFLOW_PROGRESS_STYLES, NOW), ["Selected subagent: run-c", "ID: run-c", "State: failed", "Tools: (none)", "Duration: 2s", "Error: AGENT_FAILED: boom"]);
+  const nodes = await createSessionAgentsSource(context, { home: undefined, overlayRun: (run) => run, liveAgent: () => undefined, subagents: () => manager, subagentPresenter: () => presenter }, "subagents").list();
+  assert.deepEqual(nodes.flatMap(({ agent }) => agent ? [agent.name] : []), ["scout run-a", "run-c", "scout run-b"], "the workspace's sidebar names them so too");
 });
 
 void test("publishes the subagents handle on start and clears it on shutdown", async () => {

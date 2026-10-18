@@ -15,13 +15,14 @@ import { workflowPromptArtifact, workflowResultArtifact, workflowScriptArtifact 
 /**
  * The actions /workflow offers on a run and on a workflow agent: their labels per run
  * state and mode, and what each one does. The /agents workspace runs them through createWorkflowActionProvider, the
- * /workflow picker and dashboards through the functions below; everything they ask of the person goes through an ActionUi.
+ * /workflow picker and its dashboard outside the TUI through the functions below; everything they ask of the person goes
+ * through an ActionUi.
  */
 export type WorkflowActionDependencies = Pick<WorkflowNavigatorDependencies, "home" | "clipboard" | "extensionAgentDir" | "runs" | "terminalRunStates" | "hardTerminalRunStates" | "answerCheckpoint" | "recovery" | "stopWorkflowRun" | "moveForegroundToBackground" | "isForegroundAttached" | "liveAgents" | "registry" | "projectTrusted" | "resumeHostContext" | "resumeSelectedWorkflow" | "coordinateRunMutation">;
 export type ReportBlocked = (active: boolean, label?: string) => void;
 export type WorkflowStoredRun = { store: RunStore; loaded: { run: PersistedRun; snapshot: Readonly<LaunchSnapshot> }; resolvedAt: number | undefined };
-/** What the /workflow dashboard does after an action: show the run again, go back to the picker, or close (a stop from the TUI dashboard). */
-export type WorkflowActionOutcome = "dashboard" | "picker" | "stopped";
+/** What the /workflow dashboard does after an action: show the run again or go back to the picker. */
+type WorkflowActionOutcome = "dashboard" | "picker";
 type RunDependencies = ReadonlyMap<string, readonly string[]>;
 type ManualDeletionPlan = { ordered: readonly WorkflowStoredRun[]; skipped: readonly { entry: WorkflowStoredRun; dependentIds: readonly string[] }[] };
 
@@ -98,7 +99,7 @@ export async function loadWorkflowStores(deps: Pick<WorkflowActionDependencies, 
 }
 
 /** A run as its actions see it: the live run, its labels in menu order with the command each one runs, the copies and the checkpoint reviews. */
-export type WorkflowRunView = {
+type WorkflowRunView = {
   readonly store: RunStore;
   readonly run: PersistedRun;
   readonly snapshot: Readonly<LaunchSnapshot>;
@@ -192,15 +193,14 @@ export function visibleAgentAttemptActions(deps: Pick<WorkflowActionDependencies
   const context = agentAttemptActionContext(deps, view, agent, VISIBILITY_UI);
   return context ? visibleRegisteredAgentAttemptActions(deps.registry.agentAttemptActions(), context) : [];
 }
-/** The agent's labels in menu order, Back last; View transcript first when `viewTranscript`. */
-export function agentActionOptions(deps: WorkflowActionDependencies, ctx: ExtensionCommandContext, view: WorkflowRunView, agent: AgentRecord, viewTranscript: boolean): string[] {
+/** The agent's labels in menu order, Back last. */
+export function agentActionOptions(deps: WorkflowActionDependencies, ctx: ExtensionCommandContext, view: WorkflowRunView, agent: AgentRecord): string[] {
   return agentActionLabels({
     extensionLabels: visibleAgentAttemptActions(deps, view, agent).map(([, action]) => action.label),
     hasWorktree: agentWorktree(view, agent) !== undefined,
     openPrompt: ctx.mode === "tui" && agent.prompt !== undefined,
     openSystemPrompt: ctx.mode === "tui" && agent.systemPrompt !== undefined,
     openResult: ctx.mode === "tui" && view.agentResults.has(agent.id),
-    viewTranscript,
   });
 }
 /** Runs one of the agent's labels other than View transcript and Back; a label it does not know does nothing. */
@@ -280,7 +280,7 @@ async function runAction(deps: WorkflowActionDependencies, ctx: ExtensionCommand
       ui.status(`Stopping workflow ${workflowName}...`);
       await deps.stopWorkflowRun(run.store.runId);
       ui.status(`Workflow ${run.store.runId} stopped.`);
-      ui.notify(`Stopped workflow ${run.store.runId}.`, "info"); return "stopped";
+      ui.notify(`Stopped workflow ${run.store.runId}.`, "info"); return "dashboard";
     }
     if (action && runId) ui.notify(`Cannot ${action} workflow ${runId}: the run is no longer available.`, "warning");
     else ui.notify("Workflow action is no longer available.", "warning");
@@ -467,7 +467,7 @@ export function createWorkflowActionProvider(deps: WorkflowActionDependencies, c
       const view = await loadView(target.runId);
       const agent = view?.run.agents.find((candidate) => candidate.id === target.agentId);
       if (!view || !agent) return undefined;
-      return { labels: agentActionOptions(deps, ctx, view, agent, false).filter((label) => label !== "Back"), perform: (label, ui) => runAgentAction(deps, ui, view, agent, label) };
+      return { labels: agentActionOptions(deps, ctx, view, agent).filter((label) => label !== "Back"), perform: (label, ui) => runAgentAction(deps, ui, view, agent, label) };
     }
     return undefined;
   };

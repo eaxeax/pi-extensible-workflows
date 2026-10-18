@@ -25,7 +25,7 @@ The extension activates only when Herdr is available. It registers workflow atte
 | Open live session in Herdr pane | The latest attempt has a transferable live session and fully inspectable mode is off. | Suspends local ownership at a turn boundary, opens the same session in Herdr, and returns ownership after handback. |
 | Open session in Herdr pane | The latest attempt is completed, failed, or cancelled and has a persisted session reference. | Opens the existing session in a separate Herdr pane for inspection without taking workflow ownership. |
 
-Open `/workflow`, select a run, then select the agent attempt to see the applicable action.
+Open `/workflow`, select the agent in its run, and press `a` to see the applicable action; outside the TUI, select the run, then `Agents...` and the agent.
 
 ## Fully inspectable mode
 

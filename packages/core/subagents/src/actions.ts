@@ -1,14 +1,14 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { getAgentDir, SettingsManager, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { ActionUi, AgentsAction, AgentsActionProvider, AgentsActionTarget, SubagentPresentation, SubagentPresenter } from "../../src/agents-actions-contract.js";
-import { agentActionLabels, deepFreeze, errorText, formatAgentDetail, formatAgentError, jsonValue, loadingRegistry, navigatorAttentionSortByState, openArtifactInEditor, sanitizeDisplayText, visibleStandaloneAgentAttemptActions, workflowPromptArtifact, workflowResultArtifact, type AgentAttemptActionUi, type AgentAttemptSummary, type AgentDetailPresentation, type StandaloneAgentAttemptActionContext, type WorkflowArtifact, type WorkflowProgressStyles, type WorkflowTui } from "../../src/index.js";
+import { agentActionLabels, deepFreeze, errorText, formatAgentDetail, formatAgentError, jsonValue, loadingRegistry, navigatorAttentionSortByState, sanitizeDisplayText, visibleStandaloneAgentAttemptActions, workflowPromptArtifact, workflowResultArtifact, type AgentAttemptActionUi, type AgentAttemptSummary, type AgentDetailPresentation, type StandaloneAgentAttemptActionContext, type WorkflowProgressStyles } from "../../src/index.js";
 import { normalizeSubagentRunRequest, type SubagentManager, type SubagentManagerContext, type SubagentProgress, type SubagentRunRequest, type SubagentStatus } from "./contracts.js";
 import { attemptValue, statusValue } from "./decode.js";
 
 /**
- * The /subagents actions: the rules the /subagents dashboard and picker
- * (navigator.ts) and the /agents workspace share. Whatever they ask of the person goes through the ActionUi they are
+ * The /subagents actions: the rules the /subagents picker (navigator.ts) and the
+ * agents workspace /subagents and /agents open share. Whatever they ask of the person goes through the ActionUi they are
  * given; nothing here calls ctx.ui.
  */
 
@@ -19,7 +19,7 @@ export type NavigatorEntry = {
   readonly request?: SubagentRunRequest;
   readonly requestError?: string;
 };
-export type Inspection = { readonly entry: NavigatorEntry; readonly record: Record<string, unknown> };
+type Inspection = { readonly entry: NavigatorEntry; readonly record: Record<string, unknown> };
 /** What the actions ask of the person; the /agents workspace hands its whole ActionUi. */
 export type SubagentActionUi = Pick<ActionUi, "notify" | "confirm" | "select" | "input" | "editText" | "openArtifact" | "setWorkingMessage">;
 
@@ -50,7 +50,7 @@ async function loadRequest(storageDirectory: string, id: string): Promise<{ requ
 }
 
 const ATTENTION_ORDER: Readonly<Record<SubagentStatus["state"], number>> = { running: 0, failed: 1, stopped: 2, completed: 3 };
-export function attentionSort(entries: readonly NavigatorEntry[]): NavigatorEntry[] {
+function attentionSort(entries: readonly NavigatorEntry[]): NavigatorEntry[] {
   return navigatorAttentionSortByState(entries, (entry) => entry.status.state, (entry) => entry.status.finishedAt, ATTENTION_ORDER);
 }
 
@@ -126,9 +126,8 @@ function detailPresentation(inspection: Inspection): AgentDetailPresentation {
     ...(error === undefined ? {} : { error: { code: displayText(error.code, 256), message: displayText(error.message) } }),
   };
 }
-export type DetailMenu = "hint" | { readonly options: readonly string[]; readonly index: number } | undefined;
-/** Details of the selected run in the order of a /workflow agent: fields, hint, error, then the action menu. The prompt and result open in the editor. */
-export function detailRows(inspection: Inspection, styles: WorkflowProgressStyles, now: number, menu?: DetailMenu): string[] {
+/** Details of the selected run in the order of a /workflow agent: fields, then the error. The prompt and result open in the editor. */
+export function detailRows(inspection: Inspection, styles: WorkflowProgressStyles, now: number): string[] {
   const { entry } = inspection;
   const presentation = detailPresentation(inspection);
   return [
@@ -136,9 +135,7 @@ export function detailRows(inspection: Inspection, styles: WorkflowProgressStyle
     `ID: ${displayText(entry.status.id, 256)}`,
     ...formatAgentDetail(presentation, styles, entry.status.finishedAt ?? now, { includeError: false }),
     ...(entry.requestError === undefined ? [] : [styles.warning(`Request unavailable: ${displayText(entry.requestError)}`)]),
-    ...(menu === "hint" ? [styles.muted("enter agent actions")] : []),
     ...(presentation.error === undefined ? [] : [formatAgentError(presentation.error, styles)]),
-    ...(typeof menu === "object" ? [styles.bold("Agent actions"), ...menu.options.map((option, index) => index === menu.index ? `→ ${styles.accent(option)}` : `  ${option}`)] : []),
   ];
 }
 
@@ -222,19 +219,14 @@ function retryResult(value: unknown): { readonly id: string; readonly state: "ru
   const record = objectValue(value);
   return record && typeof record.id === "string" && record.id.trim() && record.state === "running" ? { id: record.id, state: "running" } : undefined;
 }
-/** The dashboard's external editor: the configured command, with openArtifactInEditor's notices. */
-export async function openNavigatorArtifact(context: ExtensionCommandContext, tui: WorkflowTui, artifact: WorkflowArtifact, label: string, notify: (message: string, level: "warning") => void): Promise<void> {
-  const command = SettingsManager.create(context.cwd, getAgentDir(), { projectTrusted: context.isProjectTrusted() }).getExternalEditorCommand();
-  await openArtifactInEditor(tui, command, artifact, label, notify);
-}
-export async function steerSubagent(manager: SubagentManager, storageDirectory: string, id: string, context: ExtensionCommandContext, message: string, ui: Pick<ActionUi, "notify">): Promise<void> {
+async function steerSubagent(manager: SubagentManager, storageDirectory: string, id: string, context: ExtensionCommandContext, message: string, ui: Pick<ActionUi, "notify">): Promise<void> {
   const current = await inspectEntry(manager, storageDirectory, id, context);
   if (current.entry.status.state !== "running") throw new Error(`Subagent ${id} is no longer running`);
   await manager.steer({ id, message }, managerContext(context));
   ui.notify(`Steered subagent ${id}.`, "info");
 }
-/** `unchanged` leaves the menu where it was, as /workflow does after an editor or copy action: the user declined, or the action does not touch the run. */
-export type ActionOutcome = "stay" | "unchanged" | "deleted" | { readonly retryId: string };
+/** What the picker does next: inspect the run again, go back to the list once it is gone, or show the new run of a Retry. */
+type ActionOutcome = "stay" | "deleted" | { readonly retryId: string };
 export async function performAction(manager: SubagentManager, storageDirectory: string, id: string, action: string, context: ExtensionCommandContext, ui: SubagentActionUi, clipboard: (value: string) => Promise<void>): Promise<ActionOutcome> {
   const fresh = await inspectEntry(manager, storageDirectory, id, context);
   const available = actionOptions(manager, fresh, context, ui);
@@ -246,27 +238,27 @@ export async function performAction(manager: SubagentManager, storageDirectory: 
     await registered[1].runStandalone(actionContext);
     return "stay";
   }
-  if (action === "Copy agent ID") { await clipboard(fresh.entry.status.id); ui.notify("Copied agent ID.", "info"); return "unchanged"; }
-  if (action === "Copy run path") { await clipboard(join(storageDirectory, fresh.entry.status.id)); ui.notify("Copied run path.", "info"); return "unchanged"; }
+  if (action === "Copy agent ID") { await clipboard(fresh.entry.status.id); ui.notify("Copied agent ID.", "info"); return "stay"; }
+  if (action === "Copy run path") { await clipboard(join(storageDirectory, fresh.entry.status.id)); ui.notify("Copied run path.", "info"); return "stay"; }
   if (action === "Delete" && manager.delete !== undefined) {
-    if (!await ui.confirm("Delete subagent?", `Delete ${entryName(fresh.entry)} (${fresh.entry.status.id}) and its record? This cannot be undone.`)) return "unchanged";
+    if (!await ui.confirm("Delete subagent?", `Delete ${entryName(fresh.entry)} (${fresh.entry.status.id}) and its record? This cannot be undone.`)) return "stay";
     await manager.delete({ id: fresh.entry.status.id }, managerContext(context));
     ui.notify(`Deleted subagent ${fresh.entry.status.id}.`, "info");
     return "deleted";
   }
-  if (action === "Copy branch" && fresh.entry.status.worktree) { await clipboard(fresh.entry.status.worktree.branch); ui.notify("Copied branch.", "info"); return "unchanged"; }
-  if (action === "Copy worktree path" && fresh.entry.status.worktree) { await clipboard(fresh.entry.status.worktree.path); ui.notify("Copied worktree path.", "info"); return "unchanged"; }
-  if (action === "Open prompt in editor" && fresh.entry.request?.prompt !== undefined) { await ui.openArtifact(workflowPromptArtifact(fresh.entry.request.prompt), "agent prompt"); return "unchanged"; }
-  if (action === "Open system prompt in editor") { const systemPrompt = liveSystemPrompt(manager, fresh.entry.status); if (systemPrompt !== undefined) { await ui.openArtifact(workflowPromptArtifact(systemPrompt), "agent system prompt"); return "unchanged"; } }
-  if (action === "Open result in editor" && Object.prototype.hasOwnProperty.call(fresh.record, "value") && jsonValue(fresh.record.value)) { await ui.openArtifact(workflowResultArtifact(fresh.record.value), "agent result"); return "unchanged"; }
+  if (action === "Copy branch" && fresh.entry.status.worktree) { await clipboard(fresh.entry.status.worktree.branch); ui.notify("Copied branch.", "info"); return "stay"; }
+  if (action === "Copy worktree path" && fresh.entry.status.worktree) { await clipboard(fresh.entry.status.worktree.path); ui.notify("Copied worktree path.", "info"); return "stay"; }
+  if (action === "Open prompt in editor" && fresh.entry.request?.prompt !== undefined) { await ui.openArtifact(workflowPromptArtifact(fresh.entry.request.prompt), "agent prompt"); return "stay"; }
+  if (action === "Open system prompt in editor") { const systemPrompt = liveSystemPrompt(manager, fresh.entry.status); if (systemPrompt !== undefined) { await ui.openArtifact(workflowPromptArtifact(systemPrompt), "agent system prompt"); return "stay"; } }
+  if (action === "Open result in editor" && Object.prototype.hasOwnProperty.call(fresh.record, "value") && jsonValue(fresh.record.value)) { await ui.openArtifact(workflowResultArtifact(fresh.record.value), "agent result"); return "stay"; }
   if (action === "Steer") {
     const message = await ui.editText("Steer subagent");
-    if (message === undefined) return "unchanged";
+    if (message === undefined) return "stay";
     await steerSubagent(manager, storageDirectory, id, context, message, ui);
     return "stay";
   }
   if (action === "Stop") {
-    if (!await ui.confirm("Stop subagent?", `Stop subagent ${entryName(fresh.entry)} (${fresh.entry.status.id})? This cannot be undone.`)) return "unchanged";
+    if (!await ui.confirm("Stop subagent?", `Stop subagent ${entryName(fresh.entry)} (${fresh.entry.status.id})? This cannot be undone.`)) return "stay";
     const current = await inspectEntry(manager, storageDirectory, id, context);
     if (current.entry.status.state !== "running") throw new Error(`Subagent ${id} is no longer running`);
     await manager.stop({ id }, managerContext(context));
@@ -284,7 +276,7 @@ export async function performAction(manager: SubagentManager, storageDirectory: 
   return "stay";
 }
 
-export interface SubagentActionDependencies {
+interface SubagentActionDependencies {
   readonly manager: SubagentManager;
   readonly storageDirectory: string;
   readonly clipboard: (value: string) => Promise<void>;
@@ -324,14 +316,19 @@ export function createSubagentActionProvider({ manager, storageDirectory, clipbo
   };
 }
 
-/** The /subagents list names and detail rows of the subagents it can inspect. */
+/** The /subagents list names and detail rows of the subagents it can read. */
 export function createSubagentPresenter({ manager, storageDirectory }: Omit<SubagentActionDependencies, "clipboard">, context: ExtensionCommandContext): SubagentPresenter {
   return {
     async describe(ids) {
       const results = await Promise.allSettled(ids.map((id) => inspectEntry(manager, storageDirectory, id, context)));
-      const inspected = ids.flatMap((id, index) => {
+      // A subagent whose inspection fails keeps its row of the /subagents list (loadEntries): its request's label names it, and its details are what the row tells.
+      //NOTE: one the list no longer has (deleted meanwhile), or every such one when the list cannot be read either, is left out.
+      const listed = results.some((result) => result.status === "rejected") ? await loadEntries(manager, storageDirectory, context).catch((): NavigatorEntry[] => []) : [];
+      const inspected = ids.flatMap((id, index): (readonly [string, Inspection])[] => {
         const result = results[index];
-        return result?.status === "fulfilled" ? [[id, result.value] as const] : [];
+        if (result?.status === "fulfilled") return [[id, result.value]];
+        const entry = listed.find(({ status }) => status.id === id);
+        return entry === undefined ? [] : [[id, { entry, record: {} }]];
       });
       const names = listNames(inspected.map(([, inspection]) => inspection.entry));
       return new Map(inspected.map(([id, inspection], index): [string, SubagentPresentation] => [id, { name: names[index] ?? "", details: (styles, now) => detailRows(inspection, styles, now) }]));

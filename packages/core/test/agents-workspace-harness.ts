@@ -210,7 +210,7 @@ export interface PendingCustom {
  * Pi as the workspace sees it: a parent TUI that records its calls, on a fake terminal, and a command context whose dialogs,
  * custom, notify, status and working message are recorded. As Pi, it shows one custom component at a time: its confirm, select,
  * input or custom called while another custom is pending would replace that component and leave its promise pending forever
- * (the invariant above createInlineConfirm in src/host-navigator.ts), so such a call is noted in `violations` and throws.
+ * (the invariant on createPiActionUi in src/pi-action-ui.ts), so such a call is noted in `violations` and throws.
  */
 export interface FakePi {
   readonly terminal: FakeTerminal;

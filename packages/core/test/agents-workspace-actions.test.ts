@@ -320,21 +320,21 @@ void test("/workflow: every node of a run offers the dashboard's run actions in 
   await createRun(f, "broken", "failed");
   const c = workflows(t, f, { initialKey: "run:build" });
   await shown(c.pi, /^build-name build running$/);
-  // What the /workflow TUI dashboard offered on this run (its actions, then Back) and on its agent (with View transcript and Back).
+  // What the /workflow TUI dashboard offered on this run (its actions, then Back) and on its agent (then Back).
   const view = await loadWorkflowRunView(f.deps, c.pi.ctx, build);
   const dashboardRun = [...view.actions.keys()];
   const api = view.run.agents[0];
   assert.ok(api);
-  const dashboardAgent = agentActionOptions(f.deps, c.pi.ctx, view, api, true);
+  const dashboardAgent = agentActionOptions(f.deps, c.pi.ctx, view, api);
   assert.deepEqual(dashboardRun, ["Pause", "Stop", "Open script in editor", "Copy run path", "Copy run ID"]);
-  assert.deepEqual(dashboardAgent, ["View transcript", "Open prompt in editor", "Copy agent ID", "Back"]);
+  assert.deepEqual(dashboardAgent, ["Open prompt in editor", "Copy agent ID", "Back"]);
   const nodes = (await createSessionAgentsSource(c.pi.ctx, { home: f.home, overlayRun: (run) => f.deps.liveAgents.overlay(run), liveAgent: () => undefined, subagents: () => undefined }, "workflows").list()).filter((node) => node.key.startsWith("run:build"));
   assert.deepEqual(nodes.map(({ kind }) => kind), ["run", "phase", "shell", "operation", "operation", "agent"], "a run header, a phase, a shell, operation scopes and an agent");
   for (const [index, node] of nodes.entries()) {
     if (index > 0) c.pi.send(KEY.down);
     if (node.agent) assert.match(titleOf(c.pi), /^#1\/1 api running/);
     else assert.equal(titleOf(c.pi), node.title(PLAIN_WORKFLOW_PROGRESS_STYLES));
-    const offered = node.agent ? dashboardAgent.filter((label) => label !== "View transcript" && label !== "Back") : [...dashboardRun, "Model aliases", "Delete all completed", "Delete all failed"];
+    const offered = node.agent ? dashboardAgent.filter((label) => label !== "Back") : [...dashboardRun, "Model aliases", "Delete all completed", "Delete all failed"];
     assert.deepEqual(await menuOf(c.pi), [node.agent ? "Agent actions" : "Run actions", ...offered.map((label, row) => `${row === 0 ? "→" : " "} ${label}`)], node.agent ? "the agent's actions without View transcript and Back" : `the run's actions on its ${node.kind}, then Model aliases and the bulk deletes`);
     c.pi.send(KEY.escape);
     assert.deepEqual(menu(c.pi), [], "esc closes the menu, as Back did");
