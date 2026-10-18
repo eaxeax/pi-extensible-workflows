@@ -81,11 +81,13 @@ export class FakeSource implements TranscriptSource {
   readonly earlier: Earlier[] = [];
   /** Rejects every loadEarlier while set. */
   failEarlier: Error | undefined;
+  /** Holds every loadEarlier until it resolves. */
+  earlierGate: Promise<void> | undefined;
   overlapped = false;
   private active = 0;
   constructor(readonly key: string) {}
   poll(): Promise<TranscriptPoll> { return this.run("poll", () => { const next = this.polls.shift(); if (next instanceof Error) throw next; return next ?? polled([]); }); }
-  loadEarlier(): Promise<Earlier> { return this.run("loadEarlier", () => { if (this.failEarlier) throw this.failEarlier; return this.earlier.shift() ?? { records: [], atStart: true }; }); }
+  async loadEarlier(): Promise<Earlier> { return await this.run("loadEarlier", async () => { if (this.earlierGate) await this.earlierGate; if (this.failEarlier) throw this.failEarlier; return this.earlier.shift() ?? { records: [], atStart: true }; }); }
   loadRecord(record: { readonly offset: number; readonly bytes: number }): Promise<TranscriptRecord> { return this.run(`loadRecord:${String(record.offset)}`, () => entry(record.offset, `full ${String(record.offset)}`)); }
   close(): Promise<void> { return this.run("close", () => undefined); }
   count(name: string): number { return this.calls.filter((call) => call === name).length; }

@@ -457,7 +457,7 @@ void test("external artifact failures restore the TUI and remove temporary copie
   const openedPath = join(home, "opened-path");
   writeFileSync(editorPath, "#!/bin/sh\nprintf '%s' \"$2\" > \"$1\"\nexit 7\n", { encoding: "utf8", mode: 0o755 });
   const events: string[] = [];
-  const tui = { stop() { events.push("stop"); }, start() { events.push("start"); }, requestRender() { events.push("render"); } };
+  const tui = { stop() { events.push("stop"); return true; }, start() { events.push("start"); }, requestRender() { events.push("render"); } };
   const exitCode = await openWorkflowArtifact(tui, `${editorPath} ${openedPath}`, { extension: ".md", content: "read-only" });
   assert.equal(exitCode, 7);
   const opened = readFileSync(openedPath, "utf8");

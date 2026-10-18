@@ -168,8 +168,9 @@ void test("openArtifact reports a missing editor and otherwise runs the editor o
   const opened = piContext("tui", undefined, {});
   opened.recorded.tui.stop = () => { events.push("stop"); };
   opened.recorded.tui.start = () => { events.push("start"); };
+  opened.recorded.tui.requestRender = () => { events.push("render"); };
   await createPiActionUi(opened.ctx, { editorCommand: () => "true" }).openArtifact(artifact, "workflow script");
-  assert.deepEqual(events, ["stop", "start"]);
+  assert.deepEqual(events, ["stop", "start", "render"]);
   assert.deepEqual(opened.recorded.notices, []);
   assert.equal(opened.recorded.customs.length, 1);
   const failed = piContext("tui");

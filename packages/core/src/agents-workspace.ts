@@ -78,16 +78,49 @@ function navigationTree(nodes: readonly SessionTreeNode[]): WorkflowPhaseTree {
 /** The transcript's primary scroll view: reports each layout, and keeps the lines in view when an earlier chunk is placed above them. */
 class TranscriptScroll extends ScrollView {
   private kept = 0;
+  private laidContent = 0;
+  private pendingFromEnd: number | undefined;
+  private restoredAt: string | undefined;
+  private atStart = false;
   constructor(content: Component, private readonly laidOut: () => void) { super(content, { follow: "end", primary: true, scrollbar: "auto" }); }
   /** Rows added above the lines in view; applied at the next layout, once the content height counts them. */
   keep(rows: number): void { this.kept += rows; }
+  /** How many rows lie below the lines in view; 0 at the tail. */
+  get fromEnd(): number { return this.isFollowingEnd ? 0 : Math.max(0, this.laidContent - this.viewportHeight - this.scrollTop); }
+  /** Scrolls to `rows` above the tail once the content reaches that far (the transcript loads after it opens, the tail chunk first); until then it stays at the top so earlier chunks keep loading. */
+  restoreFromEnd(rows: number): void { if (rows > 0) { this.pendingFromEnd = rows; this.restoredAt = undefined; } }
+  /** The earliest record is loaded: a place above it is clamped to the top. */
+  reachedStart(): void { this.atStart = true; }
+  /** Nothing more will load above: a saved place beyond the laid-out content is dropped, the view stays clamped at the top. */
+  giveUpRestore(): void {
+    this.atStart = true;
+    if (this.laidContent > 0) this.pendingFromEnd = undefined;
+  }
+  /** The content was replaced: a saved place no longer applies. */
+  cancelRestore(): void { this.pendingFromEnd = undefined; this.restoredAt = undefined; }
   override updateLayout(contentHeight: number, viewportHeight: number, requestRender: () => void): void {
     super.updateLayout(contentHeight, viewportHeight, requestRender);
+    this.laidContent = contentHeight;
     const rows = this.kept;
     this.kept = 0;
-    if (rows !== 0 && !this.isFollowingEnd) this.scrollTo(this.scrollTop + rows, { disableFollow: true });
+    // A place beyond the content is applied once per content height: with nothing new to show, later layouts leave the user's scrolling alone.
+    if (this.pendingFromEnd !== undefined && contentHeight > 0 && `${String(contentHeight)}x${String(viewportHeight)}` !== this.restoredAt) {
+      const target = contentHeight - viewportHeight - this.pendingFromEnd;
+      this.restoredAt = `${String(contentHeight)}x${String(viewportHeight)}`;
+      this.scrollTo(Math.max(0, target), { disableFollow: true });
+      if (target >= 0 || this.atStart) this.pendingFromEnd = undefined;
+    } else if (rows !== 0 && !this.isFollowingEnd) this.scrollTo(this.scrollTop + rows, { disableFollow: true });
     this.laidOut();
   }
+}
+
+/** Where a transcript was scrolled to when the workspace stepped aside: the agent's identity and the rows below the lines in view. */
+interface TranscriptPlace { readonly identity: string; readonly fromEnd: number }
+
+function transcriptPlace(state: AgentsWorkspaceState | undefined): TranscriptPlace | undefined {
+  if (!state || !("transcript" in state)) return undefined;
+  const place = state.transcript;
+  return typeof place === "object" && place !== null && "identity" in place && "fromEnd" in place && typeof place.identity === "string" && typeof place.fromEnd === "number" ? { identity: place.identity, fromEnd: place.fromEnd } : undefined;
 }
 
 /** A label of the menu with the provider that offered it. */
@@ -155,6 +188,8 @@ class Workspace {
   private initialKey: string | undefined;
   /** options.state until a node was selected: its selection is taken after the initial key's. */
   private restore: AgentsWorkspaceState | undefined;
+  /** Where the transcript was scrolled when the workspace stepped aside; taken by the next transcript opened. */
+  private place: TranscriptPlace | undefined;
   private listing = false;
   /** A failed list, or a throw while no transcript is shown; in the title until the next list succeeds. */
   private failure: string | undefined;
@@ -210,6 +245,7 @@ class Workspace {
     // A workspace that stepped aside for an action opens as it was; the sidebar still starts hidden below 80 columns.
     const state = options.state;
     this.restore = state;
+    this.place = transcriptPlace(state);
     for (const [key, expanded] of state?.expansion ?? []) this.expansion.set(key, expanded);
     this.wide = alt.terminal.columns >= SIDEBAR_MIN_COLUMNS;
     // A state's sidebar is the one the user wants (state()): hidden only when s hid it while it could show.
@@ -372,7 +408,9 @@ class Workspace {
    * is kept shown and focused, so that it opens again as a widening brings it back; hidden only when s hid it while it could show.
    */
   private state(): AgentsWorkspaceState {
-    return {
+    const shown = this.shown;
+    const fromEnd = shown ? shown.scroll.fromEnd : 0;
+    const state: AgentsWorkspaceState & { readonly transcript?: TranscriptPlace } = {
       selectedKey: this.selectedKey,
       row: Math.max(0, this.visible().findIndex((node) => node.key === this.selectedKey)),
       expansion: [...this.expansion],
@@ -382,7 +420,9 @@ class Workspace {
       detailsShown: this.detailsShown,
       ...(this.following ? { following: true } : {}),
       ...(this.filter ? { filter: this.filter } : {}),
+      ...(shown && fromEnd > 0 ? { transcript: { identity: shown.identity, fromEnd } } : {}),
     };
+    return state;
   }
   private rawExpanded(node: SessionTreeNode): boolean { return this.expansion.get(node.key) ?? node.initiallyExpanded; }
   /** A filter shows every match under its ancestors, whatever the user collapsed. */
@@ -735,9 +775,10 @@ class Workspace {
   private editorTui(): WorkflowTui {
     return {
       stop: () => {
-        if (this.finished || this.editing) return;
+        if (this.finished || this.editing) return false;
         this.alt.stop({ preserveScreen: true });
         this.editing = true;
+        return true;
       },
       start: () => {
         if (this.finished || !this.editing) return;
@@ -765,6 +806,9 @@ class Workspace {
       view.setExpanded(this.expanded);
       unsubscribe = this.subscribe(agent, view);
       const shown: Shown = { ...base, source, view, unsubscribe, scroll: new TranscriptScroll(view.component, () => { this.laidOut(); }) };
+      const place = this.place;
+      this.place = undefined;
+      if (place?.identity === shown.identity) shown.scroll.restoreFromEnd(place.fromEnd);
       this.poll(shown);
       return shown;
     } catch (error) {
@@ -836,10 +880,12 @@ class Workspace {
     shown.status = result.status;
     shown.reason = result.reason;
     shown.atStart = result.atStart;
+    if (result.atStart) shown.scroll.giveUpRestore();
     shown.failure = undefined;
     if (result.reset) {
       shown.earlierFailed = false;
       view.reset();
+      shown.scroll.cancelRestore();
       shown.scroll.scrollToEnd();
     }
     if (result.appended.length > 0) view.append(result.appended);
@@ -851,12 +897,15 @@ class Workspace {
     const { source, view } = shown ?? {};
     if (!shown || !source || !view) return;
     if (shown.scroll.scrollTop !== 0) { shown.earlierFailed = false; return; }
+    // Nothing more will load above: a saved place beyond the content is clamped to the top for good.
+    if (shown.earlierFailed || shown.atStart || (shown.status !== undefined && shown.status !== "available")) shown.scroll.giveUpRestore();
     if (shown.loadingEarlier || shown.earlierFailed || shown.atStart || shown.status !== "available") return;
     shown.loadingEarlier = true;
     void this.call(shown, () => source.loadEarlier()).then((result) => {
       shown.loadingEarlier = false;
       if (this.shown !== shown) return;
       shown.atStart = result.atStart;
+      if (result.atStart) shown.scroll.reachedStart();
       // A chunk the view could not take is not loaded again on every frame either.
       shown.earlierFailed = !this.guard(() => {
         if (result.records.length > 0) {

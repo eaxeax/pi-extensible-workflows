@@ -1761,6 +1761,218 @@ void test("an in-place editor without a configured editor reports it in the stat
   }
 });
 
+void test("an abort while the artifact is written starts no editor and gives Pi the terminal back once", async (t) => {
+  timers(t);
+  const escaped = escapes(t);
+  const external = editor();
+  const controller = new AbortController();
+  const provider = new FakeProvider({ run: inPlace("Open script in editor") }, async (_label, ui) => {
+    const opening = ui.openArtifact({ extension: ".js", content: "return 1;" }, "script");
+    controller.abort();
+    await opening;
+  });
+  const harness = await open([], { nodes: tree(TARGETED()), initialKey: "O", actions: [provider], signal: controller.signal, editorCommand: () => external.command(0, 0) });
+  harness.send("a");
+  await settle();
+  harness.send(KEY.enter);
+  await harness.done;
+  await settle();
+  assert.equal(existsSync(external.opened(0)), false, "no editor started");
+  assert.deepEqual(harness.parent, ["stop:true", "start", "renderNow:false"], "Pi was restored once");
+  assert.equal(harness.terminal.stops, 1);
+  assert.deepEqual(escaped, []);
+});
+
+void test("a transcript scrolled up comes back at the same place after a step-aside action; one at the tail stays at the tail", async (t) => {
+  timers(t);
+  const setup = (source: Parameters<NonNullable<Parameters<typeof open>[1]>["setup"] & object>[0]): void => { source.polls.push(polled(entries(0, 100))); };
+  const provider = new FakeProvider({ "workflow-agent": steps("Stop") });
+  const nodes = tree(TARGETED());
+  for (const up of [true, false]) {
+    const first = await open([], { nodes, initialKey: "a", actions: [provider], setup });
+    first.screen();
+    const end = first.alt().viewportTop;
+    assert.equal(end, 100 - 18);
+    if (up) { first.send(KEY.pageUp); first.screen(); }
+    const top = first.alt().viewportTop;
+    assert.equal(top < end, up);
+    first.send("a");
+    await settle();
+    first.send(KEY.enter);
+    await first.done;
+    assert.ok(first.exit);
+    const second = await open([], { nodes, actions: [provider], setup, state: first.exit.state });
+    second.screen();
+    await settle();
+    second.screen();
+    assert.equal(second.alt().viewportTop, top, up ? "the same place" : "the tail");
+    await leave(second);
+  }
+});
+
+void test("a saved place beyond the reopened content is clamped to the top and the view can still scroll", async (t) => {
+  timers(t);
+  const provider = new FakeProvider({ "workflow-agent": steps("Stop") });
+  const nodes = tree(TARGETED());
+  const first = await open([], { nodes, initialKey: "a", actions: [provider], setup: (source) => { source.polls.push(polled(entries(0, 100))); } });
+  first.screen();
+  first.send(KEY.pageUp);
+  first.send(KEY.pageUp);
+  first.screen();
+  first.send("a");
+  await settle();
+  first.send(KEY.enter);
+  await first.done;
+  assert.ok(first.exit);
+  const second = await open([], { nodes, actions: [provider], setup: (source) => { source.polls.push(polled(entries(0, 30))); }, state: first.exit.state });
+  for (let round = 0; round < 3; round += 1) { second.screen(); await settle(); }
+  second.screen();
+  assert.equal(second.alt().viewportTop, 0, "clamped to the top");
+  second.send(KEY.pageDown);
+  second.screen();
+  assert.ok(second.alt().viewportTop > 0, "page down moves the view");
+  second.send(KEY.ctrlEnd);
+  second.screen();
+  assert.equal(second.alt().viewportTop, 30 - 18, "end reaches the tail");
+  await leave(second);
+});
+
+void test("a place above the tail chunk comes back after earlier chunks are loaded on reopening", async (t) => {
+  timers(t);
+  const setup = (source: Parameters<NonNullable<Parameters<typeof open>[1]>["setup"] & object>[0]): void => {
+    source.polls.push(polled(entries(100, 20)));
+    source.earlier.push({ records: entries(0, 100), atStart: true });
+  };
+  const provider = new FakeProvider({ "workflow-agent": steps("Stop") });
+  const nodes = tree(TARGETED());
+  const first = await open([], { nodes, initialKey: "a", actions: [provider], setup });
+  first.screen();
+  first.send(KEY.home);
+  await settle();
+  first.screen();
+  await settle();
+  first.screen();
+  // The earlier chunk is above the lines in view; page up into it so the place lies above the tail chunk.
+  first.send(KEY.pageUp);
+  first.screen();
+  const top = first.alt().viewportTop;
+  assert.ok(top > 0, "not at the start");
+  assert.ok(top < 100 + 20 - 18, "not at the tail");
+  assert.ok(new RegExp(`record ${String(top)}\\b`).test(first.screen()[1] ?? ""), "the first line in view is the record at the top row");
+  const seen = first.screen().slice(1, 4).join("\n");
+  first.send("a");
+  await settle();
+  first.send(KEY.enter);
+  await first.done;
+  assert.ok(first.exit);
+  const second = await open([], { nodes, actions: [provider], setup, state: first.exit.state });
+  for (let round = 0; round < 4; round += 1) { second.screen(); await settle(); }
+  second.screen();
+  assert.equal(second.alt().viewportTop, top, "the same place");
+  assert.equal(second.screen().slice(1, 4).join("\n"), seen, "the same lines");
+  await leave(second);
+});
+
+type PlaceSource = Parameters<NonNullable<Parameters<typeof open>[1]>["setup"] & object>[0];
+
+/** Opens a long transcript, scrolls up into its earlier chunk, steps aside, and returns what the reopened workspace needs. */
+async function savedPlace(): Promise<{ provider: FakeProvider; nodes: ReturnType<typeof tree>; state: NonNullable<Awaited<ReturnType<typeof open>>["exit"]>["state"]; top: number }> {
+  const setup = (source: PlaceSource): void => { source.polls.push(polled(entries(100, 20))); source.earlier.push({ records: entries(0, 100), atStart: true }); };
+  const provider = new FakeProvider({ "workflow-agent": steps("Stop") });
+  const nodes = tree(TARGETED());
+  const first = await open([], { nodes, initialKey: "a", actions: [provider], setup });
+  first.screen();
+  first.send(KEY.home);
+  await settle();
+  first.screen();
+  await settle();
+  first.screen();
+  first.send(KEY.pageUp);
+  first.screen();
+  const top = first.alt().viewportTop;
+  assert.ok(top > 0 && top < 100 + 20 - 18, "a place above the tail chunk");
+  first.send("a");
+  await settle();
+  first.send(KEY.enter);
+  await first.done;
+  assert.ok(first.exit);
+  return { provider, nodes, state: first.exit.state, top };
+}
+
+void test("a pending restore is applied once: PageDown while the earlier chunk is held stays, and the place returns when it arrives", async (t) => {
+  timers(t);
+  const saved = await savedPlace();
+  let release: () => void = () => undefined;
+  const second = await open([], { nodes: saved.nodes, actions: [saved.provider], state: saved.state, setup: (source) => {
+    source.polls.push(polled(entries(100, 20)));
+    source.earlier.push({ records: entries(0, 100), atStart: true });
+    source.earlierGate = new Promise<void>((resolve) => { release = resolve; });
+  } });
+  for (let round = 0; round < 3; round += 1) { second.screen(); await settle(); }
+  second.screen();
+  assert.equal(second.alt().viewportTop, 0, "at the top while the earlier chunk is held");
+  second.send(KEY.pageDown);
+  second.screen();
+  const paged = second.alt().viewportTop;
+  assert.ok(paged > 0, "page down moved the view");
+  second.screen();
+  await settle();
+  second.screen();
+  assert.equal(second.alt().viewportTop, paged, "the pending restore did not undo page down");
+  release();
+  for (let round = 0; round < 4; round += 1) { second.screen(); await settle(); }
+  second.screen();
+  assert.equal(second.alt().viewportTop, saved.top, "the place is restored once the chunk arrives");
+  await leave(second);
+});
+
+void test("a transcript reset while a restore is pending drops the saved place and stays at the tail", async (t) => {
+  timers(t);
+  const saved = await savedPlace();
+  const second = await open([], { nodes: saved.nodes, actions: [saved.provider], state: saved.state, setup: (source) => {
+    source.polls.push(polled(entries(500, 40), { reset: true }));
+  } });
+  for (let round = 0; round < 5; round += 1) { second.screen(); await advance(t); }
+  second.screen();
+  assert.equal(second.alt().viewportTop, 40 - 18, "at the tail of the new content");
+  for (let round = 0; round < 3; round += 1) { second.screen(); await advance(t); }
+  second.screen();
+  assert.equal(second.alt().viewportTop, 40 - 18, "no later layout jumps back to the old offset");
+  await leave(second);
+});
+
+void test("a failing earlier load gives up a pending restore: the view stays at the top and can scroll", async (t) => {
+  timers(t);
+  const saved = await savedPlace();
+  const second = await open([], { nodes: saved.nodes, actions: [saved.provider], state: saved.state, setup: (source) => {
+    source.polls.push(polled(entries(100, 20)));
+    source.failEarlier = new Error("unreadable");
+  } });
+  for (let round = 0; round < 4; round += 1) { second.screen(); await settle(); }
+  second.screen();
+  assert.equal(second.alt().viewportTop, 0, "clamped to the top");
+  second.send(KEY.pageDown);
+  second.screen();
+  assert.ok(second.alt().viewportTop > 0, "page down moves the view");
+  await leave(second);
+});
+
+void test("a poll that is not available gives up a pending restore: later content does not bring the saved place back", async (t) => {
+  timers(t);
+  const saved = await savedPlace();
+  const second = await open([], { nodes: saved.nodes, actions: [saved.provider], state: saved.state, setup: (source) => {
+    source.polls.push(polled(entries(100, 20), { status: "unavailable" }), polled(entries(120, 200)));
+    source.earlier.push({ records: [], atStart: false });
+  } });
+  for (let round = 0; round < 6; round += 1) { second.screen(); await advance(t); }
+  second.screen();
+  assert.equal(second.alt().viewportTop, 0, "the saved place is not applied once the content is long enough");
+  second.send(KEY.pageDown);
+  second.screen();
+  assert.ok(second.alt().viewportTop > 0, "page down moves the view");
+  await leave(second);
+});
+
 void test("an abort while the editor runs leaves when the editor exits: Pi is started once and the workspace does not come back", async (t) => {
   timers(t);
   const escaped = escapes(t);
