@@ -18,7 +18,7 @@ import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import type { AgentRecord, AgentState, RunRecord, RunState } from "./types.js";
+import type { AgentRecord, AgentState, BackgroundWidgetLayout, RunRecord, RunState } from "./types.js";
 import { listRunIds, RunStore } from "./persistence.js";
 import { buildWorkflowPhaseModel, workflowPhaseTreePath } from "./host-phases.js";
 import { agentSilentFor, QUIET_MS, STALL_MS } from "./agent-activity.js";
@@ -77,6 +77,8 @@ const MAX_ROWS = 10;
  * out; one that sits on a build or a test suite is exactly what you want to see.
  */
 const SHELL_VISIBLE_MS = 5000;
+/** Columns of a long shell command shown on its group row. */
+const SHELL_HEAD_WIDTH = 40;
 
 /**
  * The shortcut that focuses the widget.
@@ -224,6 +226,12 @@ export function formatElapsed(ms: number): string {
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
+/** A duration as "1m 40s" (or "45s" under a minute), for the shell text on a scope group. */
+function formatHumanElapsed(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  return total < 60 ? `${String(total)}s` : `${String(Math.floor(total / 60))}m ${String(total % 60)}s`;
+}
+
 export function formatTokens(tokens: number | undefined): string {
   if (!tokens) return "";
   if (tokens < 1000) return `${String(tokens)}t`;
@@ -295,6 +303,8 @@ function renderableRun(value: unknown): value is Partial<RunRecord> {
   if (budgetEvents !== undefined && (!Array.isArray(budgetEvents) || budgetEvents.some((event) => !object(event) || typeof event.type !== "string" || !Array.isArray(event.dimensions) || !event.dimensions.every((dimension) => typeof dimension === "string")))) return false;
   const shellActivity = value.activeShellsByPhase;
   if (shellActivity !== undefined && (!Array.isArray(shellActivity) || shellActivity.some((entry) => !object(entry) || !finiteNumber(entry.phaseIndex) || !finiteNumber(entry.active) || !optionalNumber(entry.startedAt)))) return false;
+  const scopeShells = value.activeShellsByScope;
+  if (scopeShells !== undefined && (!Array.isArray(scopeShells) || scopeShells.some((entry) => !object(entry) || typeof entry.path !== "string" || typeof entry.command !== "string" || !finiteNumber(entry.startedAt) || !Array.isArray(entry.structuralPath) || !entry.structuralPath.every((part) => typeof part === "string")))) return false;
   return true;
 }
 
@@ -398,11 +408,44 @@ function phaseNodeIds(run: Run): { history: (string | undefined)[]; unphased?: s
 }
 
 /** Phase names in the order they opened, with the agents that ran in each. */
-type PhaseSlice = { phase: string; agents: readonly AgentRecord[]; phaseIndex?: number };
+type PhaseSlice = { phase: string; agents: readonly AgentRecord[]; phaseIndex?: number; shells?: readonly { command: string; startedAt: number }[] };
 
-function phaseSlices(run: Run): PhaseSlice[] {
+/**
+ * A run without phases, grouped by where its agents and shells were launched:
+ * the structural path minus the part every agent shares, one group per next level.
+ */
+function scopeSlices(run: Run): PhaseSlice[] {
+  const agents = run.agents ?? [];
+  const shells = run.activeShellsByScope ?? [];
+  // The shared part comes from the agents alone (shells never regroup them), or from
+  // the shells when the run has no agents. Root paths (nothing to name a group) are ignored.
+  const agentPaths = agents.map((agent) => agent.structuralPath ?? []).filter((path) => path.length > 0);
+  const paths = agentPaths.length > 0 || agents.length > 0 ? agentPaths : shells.map((shell) => shell.structuralPath).filter((path) => path.length > 0);
+  const shared = paths.length === 0 ? 0 : Math.min(...paths.map((path) => path.length)) - 1;
+  let drop = 0;
+  const [first] = paths;
+  while (first !== undefined && drop < shared && paths.every((path) => path[drop] === first[drop])) drop += 1;
+  type Entry = { agents: AgentRecord[]; shells: { command: string; startedAt: number }[] };
+  const groups = new Map<string, Entry>();
+  const unphased: Entry = { agents: [], shells: [] };
+  const group = (path: readonly string[], prefixed: boolean): Entry => {
+    const name = path[drop];
+    if (name === undefined || (prefixed && (first === undefined || !path.slice(0, drop).every((part, i) => part === first[i])))) return unphased;
+    const found = groups.get(name) ?? { agents: [], shells: [] };
+    groups.set(name, found);
+    return found;
+  };
+  for (const agent of agents) group(agent.structuralPath ?? [], false).agents.push(agent);
+  for (const shell of shells) group(shell.structuralPath, true).shells.push({ command: shell.command, startedAt: shell.startedAt });
+  const slices = [...groups].map(([phase, entry]) => ({ phase, agents: entry.agents, shells: entry.shells }));
+  if (unphased.agents.length > 0 || unphased.shells.length > 0) slices.push({ phase: "unphased", agents: unphased.agents, shells: unphased.shells });
+  return slices;
+}
+
+function phaseSlices(run: Run, layout: BackgroundWidgetLayout = "phases"): PhaseSlice[] {
   const history = run.phaseHistory ?? [];
   const agents = run.agents ?? [];
+  if (layout === "scopes" && history.length === 0) return scopeSlices(run);
   if (history.length === 0) return agents.length === 0 ? [] : [{ phase: "unphased", agents }];
 
   const bound = (value: number): number => Math.max(0, Math.min(value, agents.length));
@@ -474,7 +517,7 @@ interface Row {
    * phase it hangs from). Folded rows leave a marker where they were.
    */
   fold?:
-    | { kind: "phase"; lead: string; agents: number }
+    | { kind: "phase"; lead: string; agents: number; scoped?: boolean }
     | { kind: "agent"; phase: string; prefix: string; settled: boolean; last: boolean };
   /** For rows inside a phase, the key of that phase's row. */
   phase?: string;
@@ -619,6 +662,10 @@ function collapseRows(rows: readonly Row[], budget: number, paint: Paint, offset
   const fold = (keep: ReadonlySet<number>, markers: Set<Row>): Row[] => {
     const hiddenAgents = new Map<string, number>();
     const totalAgents = new Map<string, number>();
+    // A scope group keeps its own "… N done" marker rather than a count on its row.
+    const scopedKeys = new Set(rows.flatMap((row) => row.fold?.kind === "phase" && row.fold.scoped === true && row.key !== undefined ? [row.key] : []));
+    // A scope group whose row is kept holds its own "… N done" marker; once its row is folded it is counted like a phase.
+    const allHidden = (phase: string): boolean => hiddenAgents.get(phase) === totalAgents.get(phase) && !(scopedKeys.has(phase) && keep.has(indexOfKey.get(phase) ?? -1));
     for (const [index, row] of rows.entries()) {
       if (row.fold?.kind !== "agent") continue;
       totalAgents.set(row.fold.phase, (totalAgents.get(row.fold.phase) ?? 0) + 1);
@@ -642,7 +689,7 @@ function collapseRows(rows: readonly Row[], budget: number, paint: Paint, offset
       if (row.fold?.kind !== "agent") continue;
       const header = headerOf(row);
       if (header !== undefined && !keep.has(header)) continue;
-      if (hiddenAgents.get(row.fold.phase) === totalAgents.get(row.fold.phase)) continue;
+      if (allHidden(row.fold.phase)) continue;
       // Hidden under a hidden agent: the parent's row stands for it.
       const parentIndex = row.parent === undefined ? undefined : indexOfKey.get(row.parent);
       if (parentIndex !== undefined && rows[parentIndex]?.fold?.kind === "agent" && !keep.has(parentIndex)) {
@@ -693,7 +740,7 @@ function collapseRows(rows: readonly Row[], budget: number, paint: Paint, offset
       if (keep.has(index)) {
         flush();
         const total = row.key === undefined ? 0 : totalAgents.get(row.key) ?? 0;
-        const all = row.key !== undefined && total > 0 && hiddenAgents.get(row.key) === total;
+        const all = row.key !== undefined && total > 0 && !scopedKeys.has(row.key) && hiddenAgents.get(row.key) === total;
         out.push(row.fold?.kind === "phase" && all ? counted(row, total) : row);
         continue;
       }
@@ -708,7 +755,7 @@ function collapseRows(rows: readonly Row[], budget: number, paint: Paint, offset
       if (row.fold?.kind === "agent") {
         const phase = row.fold.phase;
         // Agents of a hidden phase are carried by the phase row.
-        if (hiddenAgents.get(phase) === totalAgents.get(phase)) continue;
+        if (allHidden(phase)) continue;
         flush();
         const group = stretchOf.get(index);
         if (group === undefined) continue;
@@ -775,7 +822,7 @@ function collapseRows(rows: readonly Row[], budget: number, paint: Paint, offset
 }
 
 /** The whole widget frame, or undefined when nothing is running. */
-function renderFrame(runs: readonly Run[], now: number, width: number, startOffset = 0, theme?: Theme, scrolling = false, sizeOut: FrameReport = { rows: 0, total: 0, list: [], cursor: 0, offset: 0 }, nav: Navigation = { cursor: undefined, index: 0, folded: new Set() }, canOpen = false): string[] | undefined {
+function renderFrame(runs: readonly Run[], now: number, width: number, startOffset = 0, theme?: Theme, scrolling = false, sizeOut: FrameReport = { rows: 0, total: 0, list: [], cursor: 0, offset: 0 }, nav: Navigation = { cursor: undefined, index: 0, folded: new Set() }, canOpen = false, layout: BackgroundWidgetLayout = "phases"): string[] | undefined {
   // Only live background runs.
   //
   // A finished run leaves its own receipt in the transcript, so holding it
@@ -846,7 +893,7 @@ function renderFrame(runs: readonly Run[], now: number, width: number, startOffs
       });
     }
 
-    const slices = phaseSlices(run);
+    const slices = phaseSlices(run, layout);
     // Targets are only followed while scrolling, so the phase model is not rebuilt on every repaint.
     const phaseIds = scrolling ? phaseNodeIds(run) : undefined;
     slices.forEach((slice, index) => {
@@ -858,7 +905,8 @@ function renderFrame(runs: readonly Run[], now: number, width: number, startOffs
         (agent) => isAgentLive(agent.state),
       );
       const failed = slice.agents.some((agent) => agent.state === "failed");
-      const phaseState = failed ? "failed" : liveAgents && run.state === "running" ? "running" : run.state === "running" ? "completed" : run.state;
+      const sliceShells = slice.shells ?? [];
+      const phaseState = failed ? "failed" : (liveAgents || sliceShells.length > 0) && run.state === "running" ? "running" : run.state === "running" ? "completed" : run.state;
 
       let cost = 0;
       let tokens = 0;
@@ -869,21 +917,25 @@ function renderFrame(runs: readonly Run[], now: number, width: number, startOffs
       const phaseStats = [formatTokens(tokens), formatCost(cost)].filter(Boolean).join(" · ");
 
       const phaseKey = `${runKey}/phase:${String(index)}`;
+      // A scope group names the longest-running shell past the visibility threshold.
+      const longShell = sliceShells.filter((item) => now - item.startedAt >= SHELL_VISIBLE_MS).sort((a, b) => a.startedAt - b.startedAt)[0];
+      const scopedShell = longShell === undefined ? undefined : `shell: ${truncate(sanitizeDisplayText(longShell.command), SHELL_HEAD_WIDTH)} · ${formatHumanElapsed(now - longShell.startedAt)}`;
       rows.push({
         rank: liveAgents || failed ? 1 : 0,
         key: phaseKey,
         ...(target === undefined ? {} : { open: target }),
         parent: runKey,
         run: runKey,
-        fold: { kind: "phase", lead: last ? "╰─" : "├─", agents: slice.agents.length },
-        text: `  ${last ? "╰─" : "├─"} ${mark(phaseState, now, paint, run.state)} ${slice.phase}`,
+        fold: { kind: "phase", lead: last ? "╰─" : "├─", agents: slice.agents.length, ...(slice.shells === undefined ? {} : { scoped: true }) },
+        text: `  ${last ? "╰─" : "├─"} ${mark(phaseState, now, paint, run.state)} ${slice.phase}${scopedShell ? `  ${paint(ROLE.quiet, scopedShell)}` : ""}`,
         ...(phaseStats ? { right: phaseStats } : {}),
       });
 
       const stem = last ? "   " : "  │";
 
       // A phase running only shell commands has no agents under it, so without
-      // this it reads as a name with nothing happening beneath it.
+      // this it reads as a name with nothing happening beneath it. A scope group
+      // says its shell on its own row instead.
       const shell = slice.phaseIndex === undefined ? undefined : phaseShellRow(run, slice.phaseIndex, now);
       if (shell) {
         rows.push({
@@ -1285,7 +1337,7 @@ export function renderReceipt(data: Receipt, expanded: boolean, theme: Theme): s
 
 export interface BackgroundWidgetController { suspend(): void; resume(): void }
 
-export default function widget(pi: BackgroundWidgetAPI, enabled = true, opener?: AgentsOpener): BackgroundWidgetController {
+export default function widget(pi: BackgroundWidgetAPI, enabled = true, opener?: AgentsOpener, layout: BackgroundWidgetLayout = "phases"): BackgroundWidgetController {
   if (!enabled || typeof pi.registerEntryRenderer !== "function" || typeof pi.registerShortcut !== "function" || !pi.events || typeof pi.events.on !== "function") return { suspend() {}, resume() {} };
   const eventBus = pi.events;
   const subscribe = (name: string, handler: (event: unknown) => void): (() => void) => eventBus.on?.(name, handler) ?? (() => {});
@@ -1590,7 +1642,7 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true, opener?:
                 // gave. A pane narrower than the floor gets a cut frame; it does
                 // not get a crash, and pi-tui treats an over-wide line as fatal.
                 const usable = Math.max(20, width);
-                const frame = renderFrame([...runs.values()], Date.now(), usable, focused ? offset : 0, theme, focused, size, { cursor: cursorKey, index: size.cursor, folded: foldedKeys }, context !== undefined && opener?.available(context) === true);
+                const frame = renderFrame([...runs.values()], Date.now(), usable, focused ? offset : 0, theme, focused, size, { cursor: cursorKey, index: size.cursor, folded: foldedKeys }, context !== undefined && opener?.available(context) === true, layout);
                 if (frame === undefined) {
                   renderFailed = true;
                   inputUnsubscribe?.();

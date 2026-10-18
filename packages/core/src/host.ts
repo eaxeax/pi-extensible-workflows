@@ -32,7 +32,7 @@ import { openAgentsWorkspace } from "./agents-workspace.js";
 import { createSessionAgentsSource, type SessionAgentsScope } from "./session-agents.js";
 import { openSessionTranscript } from "./session-transcript.js";
 import { createTranscriptView } from "./transcript-components.js";
-import { HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WORKFLOW_BLOCKED_EVENT, WorkflowError, type WorkflowFunction, isContextFileScope, isExternallyEndedRunState, isHardTerminalRunState, type AgentAccounting, type AgentIdentity, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type HardTerminalRunState, type ModelSpec, type PreparedAgentSession, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type ToolIdentity, type WorkflowAgentSession, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowScriptCall, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
+import { HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WORKFLOW_BLOCKED_EVENT, WorkflowError, type WorkflowFunction, isContextFileScope, isExternallyEndedRunState, isHardTerminalRunState, type AgentAccounting, type AgentIdentity, type AgentRecord, type BackgroundWidgetLayout, type AgentResourcePolicy, type AgentTransport, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type HardTerminalRunState, type ModelSpec, type PreparedAgentSession, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type ToolIdentity, type WorkflowAgentSession, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowScriptCall, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
 import type { SubagentManagerContext, SubagentRunRequest, SubagentStatus } from "../subagents/src/contracts.js";
 import { SETTLED_AGENT_STATES, catalogResultValue, formatWorkflowCatalog, styledTextBlock, textBlock, workflowCatalogBlock, workflowControlCall, workflowControlResult, workflowProgressBlock, type WorkflowProgressRenderState } from "./host-view.js";
 import { DELIVERY_LIMIT_BYTES, ForegroundDeliveryController, markWorkflowFailureDiagnostics, WORKFLOW_LOG_ENTRY, completionDescriptor, completionDeliveryFromStore, createWorkflowFailureDiagnostics, failureDiagnosticsFrom, formatWorkflowFailure, formatWorkflowFailureDelivery, formatWorkflowFailureDeliveryFallback, formatWorkflowFailureDiagnostics, isWorkflowFailureDiagnostics, serializeWorkflowFailureDiagnostics, utf8Prefix, type CompletionDeliveryContext, type ForegroundDelivery, type ForegroundDetachResult, type WorkflowLogEntry } from "./host-delivery.js";
@@ -85,7 +85,7 @@ function workflowLaunchSettings(cwd: string, projectTrusted: boolean, globalSett
 }
 function frozenResourcePolicy(policy: AgentResourcePolicy): () => AgentResourcePolicy { return () => structuredClone(policy); }
 function resumedSnapshotSettings(snapshot: Readonly<LaunchSnapshot>, resolution: WorkflowSettingsResolution, modelAliases: Readonly<Record<string, string>>): { settings: WorkflowSettings; settingsSources?: NonNullable<LaunchSnapshot["settingsSources"]> } {
-  const settings: WorkflowSettings = { ...snapshot.settings, concurrency: snapshot.settingsSources === undefined || snapshot.settingsSources.concurrency === "per-run options" ? snapshot.settings.concurrency : resolution.effective.concurrency, backgroundWidget: resolution.effective.backgroundWidget ?? true, ...(resolution.effective.skills === undefined ? {} : { skills: resolution.effective.skills }), ...(resolution.effective.extensions === undefined ? {} : { extensions: resolution.effective.extensions }), ...(resolution.effective.tools === undefined ? {} : { tools: resolution.effective.tools }), ...(resolution.effective.retention === undefined ? {} : { retention: resolution.effective.retention }), modelAliases };
+  const settings: WorkflowSettings = { ...snapshot.settings, concurrency: snapshot.settingsSources === undefined || snapshot.settingsSources.concurrency === "per-run options" ? snapshot.settings.concurrency : resolution.effective.concurrency, backgroundWidget: resolution.effective.backgroundWidget ?? true, ...(resolution.effective.backgroundWidgetLayout === undefined ? {} : { backgroundWidgetLayout: resolution.effective.backgroundWidgetLayout }), ...(resolution.effective.skills === undefined ? {} : { skills: resolution.effective.skills }), ...(resolution.effective.extensions === undefined ? {} : { extensions: resolution.effective.extensions }), ...(resolution.effective.tools === undefined ? {} : { tools: resolution.effective.tools }), ...(resolution.effective.retention === undefined ? {} : { retention: resolution.effective.retention }), modelAliases };
   const settingsSources = snapshot.settingsSources === undefined ? undefined : { ...snapshot.settingsSources, modelAliases: resolution.sources.modelAliases, ...(resolution.sources.skills === undefined ? {} : { skills: resolution.sources.skills }), ...(resolution.sources.extensions === undefined ? {} : { extensions: resolution.sources.extensions }), ...(resolution.sources.tools === undefined ? {} : { tools: resolution.sources.tools }), ...(resolution.sources.retention === undefined ? {} : { retention: resolution.sources.retention }), concurrency: snapshot.settingsSources.concurrency === "per-run options" ? "per-run options" : resolution.sources.concurrency };
   return { settings, ...(settingsSources === undefined ? {} : { settingsSources }) };
 }
@@ -342,14 +342,16 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     return textBlock(data ? `Warning: ${data.message}` : "");
   });
   let backgroundWidgetEnabled = true;
+  let backgroundWidgetLayout: BackgroundWidgetLayout = "phases";
   try {
     const globalSettings = resolveWorkflowSettings(process.cwd(), false, workflowSettingsPath(extensionAgentDir)).effective;
     backgroundWidgetEnabled = globalSettings.backgroundWidget ?? true;
+    backgroundWidgetLayout = globalSettings.backgroundWidgetLayout ?? "phases";
     // Registered at load, before Pi resolves --model and restores the session model. Project aliases need project trust, which is unknown here.
     registerAliasVirtualModels(pi, Object.keys(globalSettings.modelAliases ?? {}), workflowSettingsPath(extensionAgentDir));
   } catch { /* Keep the optional UI enabled; the launch path reports settings errors. */ }
   let lastCommandContext: ExtensionCommandContext | undefined;
-  const backgroundWidgetController = backgroundWidget(pi, backgroundWidgetEnabled, widgetAgentsOpener((ctx, key) => openAgents(ctx, key), () => lastCommandContext));
+  const backgroundWidgetController = backgroundWidget(pi, backgroundWidgetEnabled, widgetAgentsOpener((ctx, key) => openAgents(ctx, key), () => lastCommandContext), backgroundWidgetLayout);
   const codemodeTools = loadCodemodeToolsSetting(extensionAgentDir);
   const logBridge = (store: RunStore, lifecycle: RunLifecycle, workflowName: string) => async (message: string) => {
     const timestamp = Date.now();
@@ -609,7 +611,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
           ? phaseActivities.map((activity, index) => index === phaseActivityIndex ? { ...activity, active: activity.active + 1 } : activity)
           : [...phaseActivities, { phaseIndex: shellPhaseIndex, active: 1, startedAt: shellStartedAt }];
         const activeShells = current.activeShells ?? 0;
-        return { ...current, activeShells: activeShells + 1, ...(activeShells > 0 && current.activeShellStartedAt !== undefined ? {} : { activeShellStartedAt: shellStartedAt }), activeShellsByPhase: nextPhaseActivities };
+        const scopeActivities = [...(current.activeShellsByScope ?? []), { path, structuralPath: [...identity.structuralPath], command: (command.split("\n", 1)[0] ?? "").trim().slice(0, 200), startedAt: shellStartedAt }];
+        return { ...current, activeShells: activeShells + 1, activeShellsByScope: scopeActivities, ...(activeShells > 0 && current.activeShellStartedAt !== undefined ? {} : { activeShellStartedAt: shellStartedAt }), activeShellsByPhase: nextPhaseActivities };
       });
       runs.get(store.runId)?.update?.(workflowToolUpdate(withLiveActivities(started)));
       try {
@@ -633,6 +636,10 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
           const activeShells = Math.max(0, (current.activeShells ?? 0) - 1);
           if (activeShells > 0) {
             const next = { ...current, activeShells };
+            const scopeActivities = [...(current.activeShellsByScope ?? [])];
+            const scopeIndex = scopeActivities.findIndex((activity) => activity.path === path);
+            if (scopeIndex >= 0) scopeActivities.splice(scopeIndex, 1);
+            if (scopeActivities.length) next.activeShellsByScope = scopeActivities; else delete next.activeShellsByScope;
             if (nextPhaseActivities.length) next.activeShellsByPhase = nextPhaseActivities; else delete next.activeShellsByPhase;
             return next;
           }
@@ -1222,7 +1229,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
         loaded = { ...loaded, run: (await store.load()).run };
         await eventPublisher.runState(store, loaded.snapshot.metadata, previousState, "interrupted", "session_shutdown");
         loaded = { ...loaded, run: (await store.load()).run };
-      } else if (loaded.run.activeShells !== undefined || loaded.run.activeShellStartedAt !== undefined || loaded.run.activeShellsByPhase !== undefined) {
+      } else if (loaded.run.activeShells !== undefined || loaded.run.activeShellStartedAt !== undefined || loaded.run.activeShellsByPhase !== undefined || loaded.run.activeShellsByScope !== undefined) {
         await store.updateState((current) => {
           if (HARD_TERMINAL_RUN_STATES.has(current.state)) return current;
           return withoutActiveShells(current);

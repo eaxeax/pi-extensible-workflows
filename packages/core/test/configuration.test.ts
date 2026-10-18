@@ -45,6 +45,14 @@ void test("strict settings use defaults and reject unknown or unsafe values", ()
   assert.equal(loadSettings(path).backgroundWidget, false);
   writeFileSync(path, JSON.stringify({ backgroundWidget: "yes" }));
   assert.throws(() => loadSettings(path), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SETTINGS");
+  writeFileSync(path, JSON.stringify({}));
+  assert.equal(loadSettings(path).backgroundWidgetLayout, undefined, "absent means the phases layout");
+  for (const layout of ["phases", "scopes"]) {
+    writeFileSync(path, JSON.stringify({ backgroundWidgetLayout: layout }));
+    assert.equal(loadSettings(path).backgroundWidgetLayout, layout);
+  }
+  writeFileSync(path, JSON.stringify({ backgroundWidgetLayout: "tree" }));
+  assert.throws(() => loadSettings(path), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SETTINGS" && /backgroundWidgetLayout must be "phases" or "scopes"/.test(error.message));
   writeFileSync(path, JSON.stringify({ extensionSettings: { herdr: { enableFullyInspectableMode: true } } }));
   assert.equal(loadSettings(path).extensionSettings?.herdr?.enableFullyInspectableMode, true);
   writeFileSync(path, JSON.stringify({ extensionSettings: { trajectory: { port: 7432 } } }));
@@ -413,6 +421,8 @@ void test("resolves trusted project settings with replacement and inheritance se
   assert.deepEqual(partial.effective.modelAliases, { reviewer: "openai/gpt" });
   assert.deepEqual(partial.effective.skills, ["global"]);
   writeFileSync(projectPath, JSON.stringify({ backgroundWidget: false }));
+  assert.throws(() => resolveWorkflowSettings(cwd, true, globalPath), /Unknown workflow setting/);
+  writeFileSync(projectPath, JSON.stringify({ backgroundWidgetLayout: "scopes" }));
   assert.throws(() => resolveWorkflowSettings(cwd, true, globalPath), /Unknown workflow setting/);
   writeFileSync(projectPath, "{ malformed");
   assert.doesNotThrow(() => resolveWorkflowSettings(cwd, false, globalPath));

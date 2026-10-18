@@ -141,7 +141,7 @@ function harness(sessionId = "session-1", options = {}) {
     },
   };
 
-  const controller = widget(pi, options.backgroundWidget ?? true, options.opener);
+  const controller = widget(pi, options.backgroundWidget ?? true, options.opener, options.layout);
   return {
     context,
     controller,
@@ -1499,9 +1499,9 @@ function agent(id, name, state, extra = {}) {
   };
 }
 
-function startRuns(runs) {
+function startRuns(runs, options = {}) {
   const root = mkdtempSync(join(tmpdir(), "widget-attention-"));
-  const host = harness();
+  const host = harness("session-1", options);
   host.start();
   for (const run of runs) {
     const directory = writeRun(join(root, run.id), runState(run));
@@ -2370,4 +2370,133 @@ void test("a pi-vim-like editor that swallows Alt+O never sees it while the hint
   assert.equal(fits.key("\u001bo") || (reached.push("o"), editorKey("\u001bo")), true);
   assert.deepEqual(reached, ["o"]);
   fits.shutdown();
+});
+
+const lane = (id, name, state, structuralPath, extra = {}) => agent(id, name, state, { structuralPath, ...extra });
+const shellAt = (structuralPath, command, secondsAgo) => ({ path: `shell:${command}`, structuralPath, command, startedAt: Date.now() - secondsAgo * 1000 - 500 });
+
+function lanesRun(extra = {}) {
+  return {
+    id: "run-1",
+    workflowName: "agents-followups",
+    phase: undefined,
+    phaseHistory: [],
+    agents: [
+      lane("s1", "scout", "completed", ["lanes", "source"]),
+      lane("s2", "impl", "completed", ["lanes", "source"]),
+      lane("w1", "widget-impl", "running", ["lanes", "widget"]),
+      lane("k1", "ws-impl", "running", ["lanes", "workspace"]),
+      lane("k2", "ws-review", "running", ["lanes", "workspace", "verify", "review"]),
+    ],
+    ...extra,
+  };
+}
+
+void test("scopes layout groups a phase-less run by place of launch", () => {
+  const host = startRuns([lanesRun()], { layout: "scopes" });
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(host, width);
+    assert.ok(frame.length <= 10, `rows at ${String(width)}`);
+    assert.ok(frame.every((line) => visibleWidth(line) <= width), `fits ${String(width)}`);
+  }
+  const frame = drawAt(host, 120).map(stableLine);
+  const text = frame.join("\n");
+  assert.ok(frame.some((line) => /agents-followups · 2\/5/.test(line)), text);
+  for (const name of ["source", "widget", "workspace"]) assert.ok(frame.some((line) => new RegExp(`[├╰]─ \\S ${name}`).test(line)), `${name}: ${text}`);
+  assert.ok(!frame.some((line) => /unphased|lanes/.test(line)), text);
+  assert.ok(frame.some((line) => /ws-review/.test(line)), text);
+  assert.ok(!frame.some((line) => /verify|review ›/.test(line)), `no extra level: ${text}`);
+  host.shutdown();
+});
+
+void test("scopes layout shows a long shell on its group and folds finished agents", () => {
+  const host = startRuns([lanesRun({ activeShells: 1, activeShellsByScope: [shellAt(["lanes", "source"], "gate.mjs compare", 100), shellAt(["lanes", "widget"], "quick.sh", 1)] })], { layout: "scopes" });
+  const frame = drawAt(host, 120).map(stableLine);
+  const text = frame.join("\n");
+  const exact = drawAt(host, 120).map(plain);
+  assert.ok(exact.some((line) => /[├╰]─ \S source .*shell: gate\.mjs compare · 1m 4[01]s/.test(line)), exact.join("\n"));
+  assert.ok(!exact.some((line) => /[│ ] +[├╰]─ \S shell:/.test(line)), `no separate shell row: ${text}`);
+  assert.ok(!frame.some((line) => /quick\.sh/.test(line)), `a short shell stays hidden: ${text}`);
+  host.shutdown();
+});
+
+void test("scopes layout folds finished agents under the 10-row budget and long commands fit", () => {
+  const done = [...Array.from({ length: 8 }, (_, i) => lane(`d${String(i)}`, `done-${String(i)}`, "completed", ["lanes", "source"])), lane("r0", "src-run", "running", ["lanes", "source"])];
+  const host = startRuns([lanesRun({ agents: [...done, lanesRun().agents[2]], activeShellsByScope: [shellAt(["lanes", "source"], `node ${"x".repeat(200)}`, 100)] })], { layout: "scopes" });
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(host, width);
+    assert.ok(frame.length <= 10);
+    assert.ok(frame.every((line) => visibleWidth(line) <= width), `fits ${String(width)}`);
+  }
+  const shown = drawAt(host, 120).map(stableLine);
+  assert.ok(shown.some((line) => /… \d+ done/.test(line)), shown.join("\n"));
+  host.shutdown();
+});
+
+void test("phases layout ignores scope shells and groups a phase-less run as unphased", () => {
+  const run = lanesRun({ activeShellsByScope: [shellAt(["lanes", "source"], "gate.mjs compare", 100)] });
+  const host = startRuns([run]);
+  const text = drawAt(host, 120).map(stableLine).join("\n");
+  assert.match(text, /unphased/);
+  assert.doesNotMatch(text, /shell:|gate\.mjs/);
+  host.shutdown();
+});
+
+void test("scopes layout draws a run with phases as before", () => {
+  const phased = { id: "run-1", phaseHistory: [{ phase: "p", afterAgent: 0 }], agents: lanesRun().agents };
+  const a = startRuns([phased]);
+  const b = startRuns([phased], { layout: "scopes" });
+  assert.deepEqual(drawAt(b, 120).map(stableLine), drawAt(a, 120).map(stableLine));
+  a.shutdown();
+  b.shutdown();
+});
+
+void test("scopes layout folds an all-finished group into its own done marker", () => {
+  const run = lanesRun({ activeShellsByScope: [shellAt(["lanes", "source"], "gate.mjs compare", 100)] });
+  const host = startRuns([run], { layout: "scopes" });
+  const frame = drawAt(host, 120).map(stableLine);
+  const text = frame.join("\n");
+  assert.ok(frame.some((line) => /agents-followups · 2\/5/.test(line)), text);
+  assert.ok(drawAt(host, 120).map(plain).some((line) => /[├╰]─ \S source .*shell: gate\.mjs compare · 1m 4[01]s/.test(line)), text);
+  assert.ok(frame.some((line) => /… 2 done/.test(line)), text);
+  assert.ok(!frame.some((line) => /\(\d+ agents\)/.test(line)), text);
+  for (const width of [70, 40]) assert.ok(drawAt(host, width).every((line) => visibleWidth(line) <= width));
+  host.shutdown();
+});
+
+void test("scopes layout: a root shell, a shell-only run and a foreign prefix do not collapse groups", () => {
+  const root = startRuns([lanesRun({ activeShellsByScope: [shellAt([], "root.sh", 100)] })], { layout: "scopes" });
+  const rootText = drawAt(root, 120).map(plain).join("\n");
+  assert.match(rootText, /unphased/, rootText);
+  for (const name of ["source", "widget", "workspace"]) assert.match(rootText, new RegExp(`[├╰]─ \\S ${name}`), rootText);
+  assert.doesNotMatch(rootText, /[├╰]─ \S lanes/, rootText);
+  assert.match(rootText, /root\.sh/, rootText);
+  const quick = startRuns([lanesRun({ activeShellsByScope: [shellAt(["other"], "quick.sh", 1)] })], { layout: "scopes" });
+  const quickText = drawAt(quick, 120).map(plain).join("\n");
+  for (const name of ["source", "widget", "workspace"]) assert.match(quickText, new RegExp(`[├╰]─ \\S ${name}`), quickText);
+  assert.doesNotMatch(quickText, /[├╰]─ \S lanes/, quickText);
+  quick.shutdown();
+  root.shutdown();
+  const only = startRuns([{ id: "run-1", phaseHistory: [], agents: [], activeShellsByScope: [shellAt(["lanes", "source"], "solo.sh", 100)] }], { layout: "scopes" });
+  const onlyText = drawAt(only, 120).map(plain).join("\n");
+  assert.match(onlyText, /[├╰]─ \S source .*solo\.sh/, onlyText);
+  assert.doesNotMatch(onlyText, /lanes/, onlyText);
+  only.shutdown();
+  const foreign = startRuns([lanesRun({ activeShellsByScope: [shellAt(["other", "widget"], "far.sh", 100)] })], { layout: "scopes" });
+  const foreignText = drawAt(foreign, 120).map(plain);
+  const widget = foreignText.find((line) => /[├╰]─ \S lanes|[├╰]─ \S widget/.test(line) && /far\.sh/.test(line));
+  assert.equal(widget, undefined, foreignText.join("\n"));
+  foreign.shutdown();
+});
+
+void test("scopes layout: folded groups under budget are counted once", () => {
+  const groups = Array.from({ length: 12 }, (_, i) => lane(`g${String(i)}`, `a${String(i)}`, "completed", ["lanes", `grp${String(i)}`]));
+  const host = startRuns([lanesRun({ agents: groups, activeShellsByScope: [shellAt([], "root.sh", 100)] })], { layout: "scopes" });
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(host, width);
+    assert.ok(frame.length <= 10 && frame.every((line) => visibleWidth(line) <= width));
+  }
+  const text = drawAt(host, 120).map(plain).join("\n");
+  assert.doesNotMatch(text, /\(\d+ agents?\)[\s\S]*… \d+ done/, text);
+  host.shutdown();
 });

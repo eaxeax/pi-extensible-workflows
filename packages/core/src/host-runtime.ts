@@ -37,6 +37,7 @@ export function withoutActiveShells(run: PersistedRun): PersistedRun {
   delete next.activeShells;
   delete next.activeShellStartedAt;
   delete next.activeShellsByPhase;
+  delete next.activeShellsByScope;
   return next;
 }
 

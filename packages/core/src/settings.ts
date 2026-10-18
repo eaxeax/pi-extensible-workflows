@@ -110,7 +110,7 @@ function parseSettings(path: string, partial: boolean): Readonly<WorkflowSetting
     fail("CONFIG_ERROR", `Invalid workflow settings JSON at ${path}: ${errorText(error)}`);
   }
   if (!object(parsed)) fail("INVALID_SETTINGS", `Workflow settings at ${path} must be an object`);
-  const allowed = new Set(["concurrency", "modelAliases", "skills", "extensions", "extensionSettings", "tools", "retention", ...(partial ? [] : ["backgroundWidget", "codemodeTools"]) ]);
+  const allowed = new Set(["concurrency", "modelAliases", "skills", "extensions", "extensionSettings", "tools", "retention", ...(partial ? [] : ["backgroundWidget", "backgroundWidgetLayout", "codemodeTools"]) ]);
   const unknown = Object.keys(parsed).find((key) => !allowed.has(key));
   if (Object.prototype.hasOwnProperty.call(parsed, "disabledAgentResources")) fail("INVALID_SETTINGS", `disabledAgentResources is no longer supported; use skills, extensions, and tools selectors (settings: ${path})`);
   if (unknown) fail("INVALID_SETTINGS", `Unknown workflow setting at ${path}: ${unknown}`);
@@ -118,6 +118,8 @@ function parseSettings(path: string, partial: boolean): Readonly<WorkflowSetting
   if (concurrency !== undefined && (!positiveInteger(concurrency) || concurrency > 16)) fail("INVALID_SETTINGS", `${path}.concurrency must be an integer from 1 to 16`);
   const backgroundWidget = parsed.backgroundWidget === undefined ? (partial ? undefined : DEFAULT_SETTINGS.backgroundWidget) : parsed.backgroundWidget;
   if (backgroundWidget !== undefined && typeof backgroundWidget !== "boolean") fail("INVALID_SETTINGS", `${path}.backgroundWidget must be a boolean`);
+  const backgroundWidgetLayout = parsed.backgroundWidgetLayout;
+  if (backgroundWidgetLayout !== undefined && backgroundWidgetLayout !== "phases" && backgroundWidgetLayout !== "scopes") fail("INVALID_SETTINGS", `${path}.backgroundWidgetLayout must be "phases" or "scopes"`);
   const codemodeTools = parsed.codemodeTools;
   if (codemodeTools !== undefined && codemodeTools !== "all" && codemodeTools !== "read-only" && codemodeTools !== "none") fail("INVALID_SETTINGS", `${path}.codemodeTools must be "all", "read-only", or "none"`);
   const modelAliases = parsed.modelAliases === undefined ? undefined : validateModelAliases(parsed.modelAliases, path);
@@ -127,7 +129,7 @@ function parseSettings(path: string, partial: boolean): Readonly<WorkflowSetting
   const extensionSettings = parsed.extensionSettings === undefined ? undefined : validateWorkflowExtensionSettings(parsed.extensionSettings, path, "INVALID_SETTINGS");
   const retention = validateRetention(parsed.retention, path);
   return Object.freeze({
-    ...(concurrency === undefined ? {} : { concurrency }), ...(backgroundWidget === undefined ? {} : { backgroundWidget }), ...(codemodeTools === undefined ? {} : { codemodeTools }), ...(modelAliases === undefined ? {} : { modelAliases }),
+    ...(concurrency === undefined ? {} : { concurrency }), ...(backgroundWidget === undefined ? {} : { backgroundWidget }), ...(backgroundWidgetLayout === undefined ? {} : { backgroundWidgetLayout }), ...(codemodeTools === undefined ? {} : { codemodeTools }), ...(modelAliases === undefined ? {} : { modelAliases }),
     ...(skills === undefined ? {} : { skills }), ...(extensions === undefined ? {} : { extensions }),
     ...(extensionSettings === undefined ? {} : { extensionSettings }), ...(tools === undefined ? {} : { tools }), ...(retention === undefined ? {} : { retention }),
   });

@@ -24,6 +24,7 @@ import {
   type PersistedRun,
 } from "../src/index.js";
 import { RunStore } from "../src/persistence.js";
+import { decodePersistedRun } from "../src/decoders.js";
 
 function agent(id: string, state: AgentRecord["state"] = "completed", parentId?: string): AgentRecord {
   return { id, name: id, path: id, state, ...(parentId ? { parentId } : {}), model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 };
@@ -400,4 +401,13 @@ void test("details column follows the scrolled viewport beside a long tree", () 
   assert.ok(detailRow(scrolled) >= 40, `details must start inside the scrolled viewport, got row ${String(detailRow(scrolled))}`);
   assert.equal(scrolled.length, top.length);
   assert.ok(scrolled.some((line) => line.startsWith("→")), "the selected tree row is unchanged");
+});
+void test("scope shell activity records the structural path and survives decoding", () => {
+  const activity = { path: "shell:1", structuralPath: ["lanes", "source"], command: "node gate.mjs compare", startedAt: 5 };
+  const stored = { ...run("running"), activeShells: 1, activeShellsByScope: [activity] };
+  assert.deepEqual(decodePersistedRun(JSON.parse(JSON.stringify(stored)))?.activeShellsByScope, [activity]);
+  assert.equal(decodePersistedRun({ ...stored, activeShellsByScope: [{ ...activity, structuralPath: "lanes" }] }), undefined);
+  assert.equal(decodePersistedRun({ ...stored, activeShellsByScope: [{ ...activity, command: 3 }] }), undefined);
+  assert.equal(decodePersistedRun({ ...stored, activeShellsByScope: [{ ...activity, startedAt: "now" }] }), undefined);
+  assert.equal(decodePersistedRun({ ...stored, activeShellsByScope: {} }), undefined);
 });
