@@ -101,6 +101,19 @@ void test("/agents needs the TUI, says when the session has no agents, and opens
   } finally { await source.close(); }
 });
 
+void test("/agents rejects arguments with a usage notice and opens nothing", async () => {
+  const { home, cwd } = fixture();
+  await createRun(home, cwd, [], "run-empty", ["plan"]);
+  const { agents, opened } = host(home);
+  assert.ok(agents);
+  const notices: string[] = [];
+  for (const mode of ["tui", "rpc"]) await executeCommand(agents, "  run-empty ", context(cwd, mode, notices));
+  assert.deepEqual(notices, Array(2).fill("/agents takes no arguments. Use /agents to open the agents of this session."));
+  assert.equal(opened.length, 0);
+  await executeCommand(agents, "   ", context(cwd, "tui", notices));
+  assert.equal(opened.length, 1, "blank arguments open the workspace as none do");
+});
+
 void test("/agents opens the workspace when the subagents cannot be listed, and the Subagents group says why", async () => {
   const { home, cwd } = fixture();
   const { agents, opened } = host(home);

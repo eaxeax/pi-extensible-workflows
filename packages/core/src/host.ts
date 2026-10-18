@@ -1559,7 +1559,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
   };
   pi.registerCommand("agents", {
     description: "Open the agents of this Pi session with their transcripts",
-    handler: async (_args, ctx) => {
+    handler: async (args, ctx) => {
+      if (args.trim()) { ctx.ui.notify("/agents takes no arguments. Use /agents to open the agents of this session.", "warning"); return; }
       if (ctx.mode !== "tui") { ctx.ui.notify("/agents needs the TUI.", "warning"); return; }
       await openAgents(ctx);
     },
