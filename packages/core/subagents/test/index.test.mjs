@@ -1064,6 +1064,10 @@ test("keeps top-level model with a role and persists a background execution fail
   assert.ok(agentOptions);
   assert.deepEqual(options, { label: "subagent", workflowName: "subagents", model: "fixture/cheap:high" });
   assert.deepEqual((await manager.inspect({ id: launched.details.id }, { toolCallId: "lookup", signal: undefined, extensionContext })).error, { code: "AGENT_FAILED", message: "agent failed" });
+  const runDirectory = join(cwd, "subagents-storage", launched.details.id);
+  const persisted = async (name) => JSON.parse(await readFile(join(runDirectory, name), "utf8").catch(() => "null"));
+  await waitFor(async () => (await persisted("status.json"))?.state === "failed");
+  assert.deepEqual(await persisted("failure.json"), { code: "AGENT_FAILED", message: "agent failed" });
   await rm(cwd, { recursive: true, force: true });
 });
 test("returns foreground terminal envelopes, preserves mode for retry, and suppresses follow-ups", async () => {
@@ -2971,3 +2975,76 @@ function deferred() {
   const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
   return { promise, resolve, reject };
 }
+
+/** A TUI session context that records the subagent widget's own frame. */
+function subagentWidgetContext() {
+  const calls = [];
+  let component;
+  const context = {
+    mode: "tui",
+    hasUI: true,
+    cwd: tmpdir(),
+    sessionManager: { getSessionId: () => "session-1", getEntries: () => [] },
+    ui: {
+      setWidget(key, value) {
+        calls.push({ key, value });
+        component = typeof value === "function" ? value({ requestRender() {} }, { fg: (_role, text) => text, bold: (text) => text, bg: (_role, text) => text }) : undefined;
+      },
+      onTerminalInput: () => () => {},
+    },
+  };
+  return { context, calls, frame: () => (calls.at(-1)?.value === undefined ? undefined : component?.render(80)) };
+}
+/** A core workflow widget host: the Pi pieces it needs, and its session handlers. */
+function coreWidgetPi() {
+  const handlers = new Map();
+  const pi = { on: (name, handler) => { handlers.set(name, handler); }, events: { on: () => () => {} }, appendEntry() {}, registerEntryRenderer() {}, registerShortcut() {} };
+  return { pi, handlers };
+}
+const backgroundRun = (id, label, state = "running") => [{ id, sessionId: "session-1", state, startedAt: Date.now() - 1_000, progress: { lastEventAt: Date.now(), toolCalls: [], accounting: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0 } } }, { prompt: "work", mode: "background", label }];
+
+test("the subagent widget leaves its frame to the core workflow widget while it holds the flag, keeps writing receipts, and draws again once it is let go", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const { default: coreWidget } = await import("../../dist/src/background-widget.js");
+  const { subagentsInWorkflowWidget } = await import("../../dist/src/subagent-widget-flag.js");
+  const { createSubagentBackgroundWidget } = await import("../../dist/subagents/src/view.js");
+  const receipts = [];
+  const own = subagentWidgetContext();
+  const subagentWidget = createSubagentBackgroundWidget({ appendEntry: (customType, data) => { receipts.push({ customType, data }); } });
+  subagentWidget.start(own.context);
+  subagentWidget.update(...backgroundRun("s1", "alpha"));
+  assert.match(own.frame()?.join("\n") ?? "", /Subagent[\s\S]*alpha/, "without the core widget the subagent frame shows");
+
+  const core = coreWidgetPi();
+  coreWidget(core.pi, true, undefined, "phases", () => []);
+  core.handlers.get("session_start")(undefined, subagentWidgetContext().context);
+  assert.equal(subagentsInWorkflowWidget(), true);
+  t.mock.timers.tick(200);
+  assert.equal(own.frame(), undefined, "the next paint takes the subagent frame down, without a new status");
+  subagentWidget.update(...backgroundRun("s2", "beta"));
+  assert.equal(own.frame(), undefined, "and a status does not draw it again");
+  subagentWidget.update(...backgroundRun("s2", "beta", "completed"));
+  assert.deepEqual(receipts.map(({ customType, data }) => [customType, data.id]), [["piewf-subagent-receipt", "s2"]], "receipts are still written");
+
+  core.handlers.get("session_shutdown")(undefined, undefined);
+  assert.equal(subagentsInWorkflowWidget(), false);
+  t.mock.timers.tick(200);
+  assert.match(own.frame()?.join("\n") ?? "", /alpha/, "the subagent frame comes back once the flag is let go, without a new status");
+  subagentWidget.dispose();
+});
+
+test("with backgroundWidget false the core widget never sets the flag and the subagent frame shows", async () => {
+  const { default: coreWidget } = await import("../../dist/src/background-widget.js");
+  const { subagentsInWorkflowWidget } = await import("../../dist/src/subagent-widget-flag.js");
+  const { createSubagentBackgroundWidget } = await import("../../dist/subagents/src/view.js");
+  const core = coreWidgetPi();
+  coreWidget(core.pi, false, undefined, "phases", () => []);
+  assert.equal(core.handlers.get("session_start"), undefined);
+  assert.equal(subagentsInWorkflowWidget(), false);
+  const own = subagentWidgetContext();
+  const subagentWidget = createSubagentBackgroundWidget();
+  subagentWidget.start(own.context);
+  subagentWidget.update(...backgroundRun("s1", "alpha"));
+  assert.match(own.frame()?.join("\n") ?? "", /alpha/);
+  subagentWidget.dispose();
+});

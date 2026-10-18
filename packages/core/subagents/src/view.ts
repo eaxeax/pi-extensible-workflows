@@ -1,8 +1,9 @@
 import type { AgentToolResult, ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
-import { formatCost, formatStalledDuration, formatWorkflowRuntime, sanitizeDisplayText, WORKFLOW_AGENT_STALL_THRESHOLD_MS } from "../../src/index.js";
+import { formatCost, formatStalledDuration, formatWorkflowRuntime, sanitizeDisplayText } from "../../src/index.js";
 import { agentActivityLabel, stalledDuration, textBlock } from "../../src/host-view.js";
-import { drawFrame, formatElapsed, formatTokens, mark, QUIET_MS, REPAINT_MS, type Paint } from "../../src/background-widget.js";
+import { drawFrame, formatElapsed, formatTokens, REPAINT_MS, subagentRow, type Paint } from "../../src/background-widget.js";
+import { subagentsInWorkflowWidget } from "../../src/subagent-widget-flag.js";
 import type { SubagentRunRequest, SubagentStatus } from "./contracts.js";
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
@@ -215,25 +216,6 @@ export function renderSubagentResult(result: AgentToolResult<unknown>, options: 
 
 type WidgetRun = { status: Readonly<SubagentStatus>; request: Readonly<SubagentRunRequest> };
 
-/** One run as a workflow agent row: a quiet or stalled warning on the left, model and figures against the right rule. */
-function widgetRow({ status, request }: WidgetRun, now: number, paint: Paint): { text: string; right: string } {
-  const lastEventAt = status.progress?.lastEventAt;
-  const silent = lastEventAt === undefined || !Number.isFinite(lastEventAt) || now - lastEventAt < QUIET_MS ? undefined : now - lastEventAt;
-  const role = silent !== undefined && silent >= WORKFLOW_AGENT_STALL_THRESHOLD_MS ? "error" : "warning";
-  const icon = silent === undefined ? mark(status.state, now, paint) : paint(role, "⚠");
-  const warning = silent === undefined ? "" : `  ${paint(role, `${role === "error" ? "stalled" : "quiet"} ${formatElapsed(silent)}`)}`;
-  const accounting = status.progress?.accounting;
-  const attempts = status.attempts ?? 1;
-  const right = [
-    modelName(status),
-    formatTokens(accounting === undefined ? undefined : accounting.input + accounting.output),
-    formatCost(accounting?.cost),
-    status.startedAt === undefined ? "" : formatElapsed(now - status.startedAt),
-    attempts > 1 ? `attempt ${String(attempts)}` : "",
-  ].filter(Boolean).join(" · ");
-  return { text: `${icon} ${sanitizeDisplayText(label({ ...request, id: status.id }))}${warning}`, right };
-}
-
 const RECEIPT_ENTRY_TYPE = "piewf-subagent-receipt";
 type SubagentReceipt = { readonly id: string; readonly label: string; readonly state: string; readonly model?: string; readonly tools?: readonly string[]; readonly input: number; readonly output: number; readonly cacheRead: number; readonly costUsd: number; readonly durationMs: number; readonly attempts: number; readonly error?: string };
 
@@ -289,18 +271,31 @@ export function createSubagentBackgroundWidget(host: ReceiptHost = {}) {
   let timer: ReturnType<typeof setInterval> | undefined;
   let showing = false;
 
-  const hide = (): void => {
-    if (timer) clearInterval(timer);
-    timer = undefined;
+  const clearFrame = (): void => {
     requestRender = undefined;
     if (showing) {
       try { context?.ui.setWidget(key, undefined); } catch { /* The session UI may already be closing. */ }
     }
     showing = false;
   };
+  const hide = (): void => {
+    if (timer) clearInterval(timer);
+    timer = undefined;
+    clearFrame();
+  };
   const paint = (): void => {
     if (context?.mode !== "tui" || runs.size === 0) {
       hide();
+      return;
+    }
+    // The timer runs while there are runs, frame or not, so the frame comes back once the core widget lets the runs go.
+    if (timer === undefined) {
+      timer = setInterval(paint, REPAINT_MS);
+      timer.unref();
+    }
+    // The core workflow widget draws these runs in its own frame while it holds the flag.
+    if (subagentsInWorkflowWidget()) {
+      clearFrame();
       return;
     }
     if (showing) {
@@ -312,12 +307,13 @@ export function createSubagentBackgroundWidget(host: ReceiptHost = {}) {
         requestRender = () => { tui.requestRender(); };
         return {
           render(width: number): string[] {
+            if (subagentsInWorkflowWidget()) return [];
             const now = Date.now();
             const paintRole: Paint = (role, text) => theme.fg(role, text);
             // One row per run, so the default concurrency of eight fills the frame exactly.
             // ponytail: no Alt+O scrolling as in the workflow widget; add it if runs routinely exceed the frame.
             const budget = MAX_BACKGROUND_WIDGET_ROWS - 2;
-            const rows = [...runs.values()].map((run) => widgetRow(run, now, paintRole));
+            const rows = [...runs.values()].map((run) => subagentRow(run, now, paintRole));
             const body = rows.length <= budget ? rows : [...rows.slice(0, budget - 1), { text: theme.fg("muted", `… ${String(rows.length - budget + 1)} more`) }];
             const title = runs.size === 1 ? "Subagent" : `Subagents · ${String(runs.size)} runs`;
             return drawFrame(title, "", body, width, paintRole, (text) => theme.fg("accent", text)).map((line) => truncateToWidth(line, Math.max(1, width), ""));
@@ -326,8 +322,6 @@ export function createSubagentBackgroundWidget(host: ReceiptHost = {}) {
         };
       }, { placement: "belowEditor" });
       showing = true;
-      timer = setInterval(() => { requestRender?.(); }, REPAINT_MS);
-      timer.unref();
     } catch {
       hide();
     }

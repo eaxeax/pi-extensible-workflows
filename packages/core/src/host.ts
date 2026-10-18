@@ -351,7 +351,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     registerAliasVirtualModels(pi, Object.keys(globalSettings.modelAliases ?? {}), workflowSettingsPath(extensionAgentDir));
   } catch { /* Keep the optional UI enabled; the launch path reports settings errors. */ }
   let lastCommandContext: ExtensionCommandContext | undefined;
-  const backgroundWidgetController = backgroundWidget(pi, backgroundWidgetEnabled, widgetAgentsOpener((ctx, key) => openAgents(ctx, key), () => lastCommandContext), backgroundWidgetLayout);
+  // The widget draws the background subagents this host observes (liveSubagents, below) after the runs.
+  const backgroundWidgetController = backgroundWidget(pi, backgroundWidgetEnabled, widgetAgentsOpener((ctx, key) => openAgents(ctx, key), () => lastCommandContext), backgroundWidgetLayout, () => liveSubagents.values());
   const codemodeTools = loadCodemodeToolsSetting(extensionAgentDir);
   const logBridge = (store: RunStore, lifecycle: RunLifecycle, workflowName: string) => async (message: string) => {
     const timestamp = Date.now();
@@ -437,7 +438,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
   const liveAgents = new LiveAgentRegistry();
   const liveSubagents = new Map<string, { readonly status: Readonly<SubagentStatus>; readonly request: Readonly<SubagentRunRequest> }>();
   const clearSubagentStatusObserver = (): void => { liveSubagents.clear(); registry.setSubagentStatusObserver(undefined); };
-  registry.setSubagentStatusObserver((status, request) => { liveSubagents.set(status.id, { status, request }); });
+  registry.setSubagentStatusObserver((status, request) => { liveSubagents.set(status.id, { status, request }); backgroundWidgetController.subagentsChanged(); });
   const trajectoryRuns = (context: unknown) => {
     const { cwd, sessionId } = hostSessionContext(context);
     if (!cwd || !sessionId) throw new WorkflowError("RUN_NOT_FOUND", "Trajectory requires the current project and Pi session");

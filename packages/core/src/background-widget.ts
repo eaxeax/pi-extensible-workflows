@@ -22,6 +22,8 @@ import type { AgentRecord, AgentState, BackgroundWidgetLayout, RunRecord, RunSta
 import { listRunIds, RunStore } from "./persistence.js";
 import { buildWorkflowPhaseModel, workflowPhaseTreePath } from "./host-phases.js";
 import { agentSilentFor, QUIET_MS, STALL_MS } from "./agent-activity.js";
+import { claimSubagentsInWorkflowWidget, releaseSubagentsInWorkflowWidget } from "./subagent-widget-flag.js";
+import type { SubagentRunRequest, SubagentStatus } from "../subagents/src/contracts.js";
 
 export { QUIET_MS };
 import {
@@ -244,6 +246,49 @@ export function formatCost(cost: number | undefined): string {
   // Three decimals below a cent: at two, every cheap agent reads as $0.00 and
   // the per-agent column becomes a row of zeroes.
   return cost < 0.01 ? `$${cost.toFixed(3)}` : `$${cost.toFixed(2)}`;
+}
+
+/** A background subagent as the core host observes it: its latest status and the request that started it. */
+export interface BackgroundSubagent { readonly status: Readonly<SubagentStatus>; readonly request: Readonly<SubagentRunRequest> }
+
+/** Key of the Subagents group row, which is also the /agents workspace node it opens. */
+const SUBAGENTS_KEY = "subagents";
+
+/** A subagent's label as the subagents extension names it: the request's label, else the short id. */
+export function subagentLabel(request: Readonly<Partial<SubagentRunRequest>>, id: string | undefined): string {
+  if (typeof request.label === "string" && request.label.trim()) return request.label.trim();
+  if (typeof id === "string" && id) return id.slice(0, 8);
+  return "subagent";
+}
+
+/** The model a subagent runs on, with its thinking level. */
+export function subagentModel(status: Readonly<SubagentStatus>): string {
+  const model = status.progress?.state?.model ?? status.attemptDetails?.at(-1)?.setup.model;
+  return model ? `${model.model}${model.thinking ? `:${model.thinking}` : ""}` : "";
+}
+
+/** One background subagent as a workflow agent row: a quiet or stalled warning on the left, model and figures against the right rule. */
+export function subagentRow({ status, request }: BackgroundSubagent, now: number, paint: Paint): { text: string; right: string; silent: number | undefined } {
+  const lastEventAt = status.progress?.lastEventAt;
+  const silent = lastEventAt === undefined || !Number.isFinite(lastEventAt) || now - lastEventAt < QUIET_MS ? undefined : now - lastEventAt;
+  const role = silent !== undefined && silent >= STALL_MS ? ROLE.failed : ROLE.warn;
+  const icon = silent === undefined ? mark(status.state, now, paint) : paint(role, "⚠");
+  const warning = silent === undefined ? "" : `  ${paint(role, `${role === ROLE.failed ? "stalled" : "quiet"} ${formatElapsed(silent)}`)}`;
+  const accounting = status.progress?.accounting;
+  const attempts = status.attempts ?? 1;
+  const right = [
+    subagentModel(status),
+    formatTokens(accounting === undefined ? undefined : accounting.input + accounting.output),
+    formatCost(accounting?.cost),
+    status.startedAt === undefined ? "" : formatElapsed(now - status.startedAt),
+    attempts > 1 ? `attempt ${String(attempts)}` : "",
+  ].filter(Boolean).join(" · ");
+  return { text: `${icon} ${sanitizeDisplayText(subagentLabel(request, status.id))}${warning}`, right, silent };
+}
+
+/** The subagents the widget draws: background ones of this session still running. A status without a session is kept. */
+function backgroundSubagents(source: Iterable<BackgroundSubagent>, sessionId: string | undefined): BackgroundSubagent[] {
+  return [...source].filter(({ status, request }) => request.mode === "background" && status.state === "running" && (status.sessionId === undefined || status.sessionId === sessionId));
 }
 
 /**
@@ -659,13 +704,16 @@ function collapseRows(rows: readonly Row[], budget: number, paint: Paint, offset
     return keep;
   };
 
+  // What each "… N more" marker inside the Subagents group stands for.
+  const groupMarkers = new Map<Row, number>();
   const fold = (keep: ReadonlySet<number>, markers: Set<Row>): Row[] => {
     const hiddenAgents = new Map<string, number>();
     const totalAgents = new Map<string, number>();
     // A scope group keeps its own "… N done" marker rather than a count on its row.
     const scopedKeys = new Set(rows.flatMap((row) => row.fold?.kind === "phase" && row.fold.scoped === true && row.key !== undefined ? [row.key] : []));
     // A scope group whose row is kept holds its own "… N done" marker; once its row is folded it is counted like a phase.
-    const allHidden = (phase: string): boolean => hiddenAgents.get(phase) === totalAgents.get(phase) && !(scopedKeys.has(phase) && keep.has(indexOfKey.get(phase) ?? -1));
+    // Only a phase row carries a count of its folded agents; the Subagents group keeps a marker inside it instead.
+    const allHidden = (phase: string): boolean => phase !== SUBAGENTS_KEY && hiddenAgents.get(phase) === totalAgents.get(phase) && !(scopedKeys.has(phase) && keep.has(indexOfKey.get(phase) ?? -1));
     for (const [index, row] of rows.entries()) {
       if (row.fold?.kind !== "agent") continue;
       totalAgents.set(row.fold.phase, (totalAgents.get(row.fold.phase) ?? 0) + 1);
@@ -770,6 +818,7 @@ function collapseRows(rows: readonly Row[], budget: number, paint: Paint, offset
           const closes = members.some((fold) => fold?.kind === "agent" && fold.last);
           const marker: Row = { rank: 0, text: paint(ROLE.quiet, `${row.fold.prefix}${closes ? "╰─ " : ""}… ${String(total)} ${settled ? "done" : "more"}`) };
           markers.add(marker);
+          if (phase === SUBAGENTS_KEY) groupMarkers.set(marker, total);
           out.push(marker);
         }
       }
@@ -780,6 +829,18 @@ function collapseRows(rows: readonly Row[], budget: number, paint: Paint, offset
   };
 
   const headers = rows.filter((row) => row.header === true).length;
+  const subagentGroup = indexOfKey.get(SUBAGENTS_KEY);
+  const subagentRows = rows.filter((row) => row.fold?.kind === "agent" && row.fold.phase === SUBAGENTS_KEY).length;
+  // A kept group row whose folded subagents lost a marker to the budget says how many it folds, in place of its markers.
+  const accounted = (shown: Row[]): Row[] => {
+    const group = subagentGroup === undefined ? undefined : rows[subagentGroup];
+    if (group === undefined || !shown.includes(group)) return shown;
+    const drawn = shown.filter((row) => row.fold?.kind === "agent" && row.fold.phase === SUBAGENTS_KEY).length;
+    const marked = shown.reduce((sum, row) => sum + (groupMarkers.get(row) ?? 0), 0);
+    if (drawn + marked === subagentRows) return shown;
+    const hidden = subagentRows - drawn;
+    return shown.flatMap((row) => groupMarkers.has(row) ? [] : row === group ? [{ ...row, text: `${row.text}${paint(ROLE.quiet, ` (${String(hidden)} more)`)}` }] : [row]);
+  };
   const allHeaders = (keep: ReadonlySet<number>): boolean => rows.filter((row, index) => row.header === true && keep.has(index)).length === headers;
   // When some runs do not fit, their count takes the last row, so the kept rows
   // get one fewer. Making room for it afterwards would cut a phase away from
@@ -796,19 +857,22 @@ function collapseRows(rows: readonly Row[], budget: number, paint: Paint, offset
     const keep = select(capacity);
     if (best && essential.some((index) => !keep.has(index))) break;
     const kept = rows.filter((row, index) => row.header === true && keep.has(index)).length;
-    const hiddenRuns = headers - kept;
+    // The Subagents group is not a run: when it does not fit, the count names its subagents apart.
+    const groupHidden = subagentGroup !== undefined && !keep.has(subagentGroup);
+    const hiddenRuns = headers - kept - (groupHidden ? 1 : 0);
     // Waiting runs whose header is folded into the count. Their headers are
     // taken first, so this is non-zero only when more runs wait than the body holds.
     const hiddenWaiting = rows.filter((row) => row.waiting === true && !keep.has(headerOf(row) ?? -1)).length;
     const markers = new Set<Row>();
     const shown = fold(keep, markers);
-    if (hiddenRuns > 0) {
+    if (hiddenRuns > 0 || groupHidden) {
+      const parts = [...(hiddenRuns > 0 ? [`${String(hiddenRuns)} more ${hiddenRuns === 1 ? "run" : "runs"}`] : []), ...(groupHidden ? [`${String(subagentRows)} ${subagentRows === 1 ? "subagent" : "subagents"}`] : [])];
       shown.push({
         rank: 0,
-        text: `${paint(ROLE.quiet, `… ${String(hiddenRuns)} more ${hiddenRuns === 1 ? "run" : "runs"}`)}${hiddenWaiting > 0 ? `${paint(ROLE.quiet, " · ")}${paint(ROLE.warn, `◆ ${String(hiddenWaiting)} waiting`)}` : ""}`,
+        text: `${paint(ROLE.quiet, `… ${parts.join(" · ")}`)}${hiddenWaiting > 0 ? `${paint(ROLE.quiet, " · ")}${paint(ROLE.warn, `◆ ${String(hiddenWaiting)} waiting`)}` : ""}`,
       });
     }
-    if (shown.length <= budget) return shown;
+    if (shown.length <= budget) return accounted(shown);
     best = { shown, markers };
   }
   if (!best) return [];
@@ -818,11 +882,11 @@ function collapseRows(rows: readonly Row[], budget: number, paint: Paint, offset
   // hidden runs only when that capacity left a row for it, so they fit.
   const final = best;
   let spare = budget - final.shown.filter((row) => !final.markers.has(row)).length;
-  return final.shown.filter((row) => !final.markers.has(row) || spare-- > 0);
+  return accounted(final.shown.filter((row) => !final.markers.has(row) || spare-- > 0));
 }
 
 /** The whole widget frame, or undefined when nothing is running. */
-function renderFrame(runs: readonly Run[], now: number, width: number, startOffset = 0, theme?: Theme, scrolling = false, sizeOut: FrameReport = { rows: 0, total: 0, list: [], cursor: 0, offset: 0 }, nav: Navigation = { cursor: undefined, index: 0, folded: new Set() }, canOpen = false, layout: BackgroundWidgetLayout = "phases"): string[] | undefined {
+function renderFrame(runs: readonly Run[], now: number, width: number, startOffset = 0, theme?: Theme, scrolling = false, sizeOut: FrameReport = { rows: 0, total: 0, list: [], cursor: 0, offset: 0 }, nav: Navigation = { cursor: undefined, index: 0, folded: new Set() }, canOpen = false, layout: BackgroundWidgetLayout = "phases", subagents: readonly BackgroundSubagent[] = []): string[] | undefined {
   // Only live background runs.
   //
   // A finished run leaves its own receipt in the transcript, so holding it
@@ -835,7 +899,7 @@ function renderFrame(runs: readonly Run[], now: number, width: number, startOffs
   // views of one run disagreeing with each other. Background runs have no such
   // view — the tool call returned the moment they started.
   const live = runs.filter((run) => isRunLive(run.state) && run.delivery?.mode !== "foreground");
-  if (live.length === 0) return undefined;
+  if (live.length === 0 && subagents.length === 0) return undefined;
 
   const paint: Paint = (role, text) => (theme ? theme.fg(role, text) : text);
   // One stat per transcript per frame, not per agent per repaint.
@@ -1026,6 +1090,36 @@ function renderFrame(runs: readonly Run[], now: number, width: number, startOffs
     });
   }
 
+  // Background subagents follow the runs as one group: its row stands for them as a run header does for its run, and
+  // each subagent folds like an agent of a phase, so the same budget and markers apply.
+  if (subagents.length > 0) {
+    rows.push({
+      rank: 2,
+      header: true,
+      key: SUBAGENTS_KEY,
+      run: SUBAGENTS_KEY,
+      text: `${mark("running", now, paint)} Subagents`,
+      open: SUBAGENTS_KEY,
+    });
+    subagents.forEach((entry, index) => {
+      const last = index === subagents.length - 1;
+      const row = subagentRow(entry, now, paint);
+      if (row.silent !== undefined) quiet += 1;
+      const key = `subagent:${entry.status.id}`;
+      rows.push({
+        rank: row.silent !== undefined ? 3 : 1,
+        parent: SUBAGENTS_KEY,
+        run: SUBAGENTS_KEY,
+        phase: SUBAGENTS_KEY,
+        fold: { kind: "agent", phase: SUBAGENTS_KEY, prefix: "  ", settled: false, last },
+        key,
+        open: key,
+        text: `  ${last ? "╰─" : "├─"} ${row.text}`,
+        ...(row.right ? { right: row.right } : {}),
+      });
+    });
+  }
+
   // The rules change colour while scrolling, so it is obvious at a glance that
   // the arrows are going here and not to the editor.
   // Folded rows are left out in scroll mode; a row is folded when any row it hangs from is.
@@ -1054,8 +1148,13 @@ function renderFrame(runs: readonly Run[], now: number, width: number, startOffs
     ...(waiting > 0 ? [`◆ ${String(waiting)} waiting`] : []),
     ...(quiet > 0 ? [`⚠ ${String(quiet)} quiet`] : []),
   ];
-  const heading = live.length === 1 ? "Workflow" : "Workflows";
-  const withCount = [live.length === 1 ? heading : `${heading} · ${String(live.length)} runs`, ...attention].join(" · ");
+  const heading = live.length === 1 && subagents.length === 0 ? "Workflow" : "Workflows";
+  // Beside subagents a single run is counted too, so the title says what each part of the frame holds.
+  const counts = [
+    ...(live.length > 1 || (live.length === 1 && subagents.length > 0) ? [`${String(live.length)} ${live.length === 1 ? "run" : "runs"}`] : []),
+    ...(subagents.length > 0 ? [`${String(subagents.length)} ${subagents.length === 1 ? "subagent" : "subagents"}`] : []),
+  ];
+  const withCount = [heading, ...counts, ...attention].join(" · ");
   // When the title is too long the run count goes before the counts that need a person.
   const withoutCount = [heading, ...attention].join(" · ");
   const room = Math.max(1, width - 8);
@@ -1335,10 +1434,19 @@ export function renderReceipt(data: Receipt, expanded: boolean, theme: Theme): s
   return lines;
 }
 
-export interface BackgroundWidgetController { suspend(): void; resume(): void }
+export interface BackgroundWidgetController {
+  suspend(): void;
+  resume(): void;
+  /** A background subagent changed: the frame is drawn again from the subagent reader. */
+  subagentsChanged(): void;
+}
 
-export default function widget(pi: BackgroundWidgetAPI, enabled = true, opener?: AgentsOpener, layout: BackgroundWidgetLayout = "phases"): BackgroundWidgetController {
-  if (!enabled || typeof pi.registerEntryRenderer !== "function" || typeof pi.registerShortcut !== "function" || !pi.events || typeof pi.events.on !== "function") return { suspend() {}, resume() {} };
+/**
+ * `subagents` reads the subagents the host observes; given it, the widget draws the background ones of the session as a
+ * group after the runs, and holds the flag that leaves the subagents extension's own frame undrawn while it is started.
+ */
+export default function widget(pi: BackgroundWidgetAPI, enabled = true, opener?: AgentsOpener, layout: BackgroundWidgetLayout = "phases", subagents?: () => Iterable<BackgroundSubagent>): BackgroundWidgetController {
+  if (!enabled || typeof pi.registerEntryRenderer !== "function" || typeof pi.registerShortcut !== "function" || !pi.events || typeof pi.events.on !== "function") return { suspend() {}, resume() {}, subagentsChanged() {} };
   const eventBus = pi.events;
   const subscribe = (name: string, handler: (event: unknown) => void): (() => void) => eventBus.on?.(name, handler) ?? (() => {});
   const registerEntryRenderer = pi.registerEntryRenderer;
@@ -1418,6 +1526,10 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true, opener?:
   let sessionGeneration = 0;
 
   const sessionId = (): string | undefined => context?.sessionManager.getSessionId();
+  /** The subagents drawn now; none without a reader. */
+  const liveSubagents = (): BackgroundSubagent[] => subagents === undefined ? [] : backgroundSubagents(subagents(), sessionId());
+  /** Owner of the subagent flag for this instance. */
+  const flagOwner = {};
   const resetNavigation = (): void => {
     focused = false;
     offset = 0;
@@ -1568,13 +1680,13 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true, opener?:
     for (const run of runs.values()) {
       if (isRunLive(run.state) && run.delivery?.mode !== "foreground") return true;
     }
-    return false;
+    return liveSubagents().length > 0;
   };
   const needsAnimation = (): boolean => {
     for (const run of runs.values()) {
       if (run.state === "running" && run.delivery?.mode !== "foreground") return true;
     }
-    return false;
+    return liveSubagents().length > 0;
   };
   const startTimers = (): void => {
     if (!showing || suspended || !isTuiContext()) return;
@@ -1642,7 +1754,7 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true, opener?:
                 // gave. A pane narrower than the floor gets a cut frame; it does
                 // not get a crash, and pi-tui treats an over-wide line as fatal.
                 const usable = Math.max(20, width);
-                const frame = renderFrame([...runs.values()], Date.now(), usable, focused ? offset : 0, theme, focused, size, { cursor: cursorKey, index: size.cursor, folded: foldedKeys }, context !== undefined && opener?.available(context) === true, layout);
+                const frame = renderFrame([...runs.values()], Date.now(), usable, focused ? offset : 0, theme, focused, size, { cursor: cursorKey, index: size.cursor, folded: foldedKeys }, context !== undefined && opener?.available(context) === true, layout, liveSubagents());
                 if (frame === undefined) {
                   renderFailed = true;
                   inputUnsubscribe?.();
@@ -1820,6 +1932,7 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true, opener?:
   };
 
   const stop = (): void => {
+    releaseSubagentsInWorkflowWidget(flagOwner);
     sessionGeneration += 1;
     failureEvents.clear();
     hide();
@@ -1873,9 +1986,11 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true, opener?:
     } catch {
       // No history to read; runs from this session on are recorded anyway.
     }
-    if (!isTuiContext()) return;
-
-
+    if (!isTuiContext()) {
+      releaseSubagentsInWorkflowWidget(flagOwner);
+      return;
+    }
+    if (subagents !== undefined) claimSubagentsInWorkflowWidget(flagOwner);
     tick();
     void reconcile(sessionContext, generation).catch(() => {
       if (generation === sessionGeneration) tick();
@@ -1899,5 +2014,6 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true, opener?:
   });
 
   pi.on("session_shutdown", stop);
-  return { suspend, resume };
+  // A subagent change needs no rescan of the run files, only a repaint.
+  return { suspend, resume, subagentsChanged: () => { try { paint(true); } catch { hide(); } } };
 }
