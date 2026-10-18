@@ -2159,3 +2159,240 @@ void test("the title ends with the session totals and drops them first when narr
   assert.ok(titleRow(bare).trimEnd().endsWith("1/1 running"), "parts without data are left out");
   await leave(bare);
 });
+
+const ACTIVE = (a: number, b: number, c: number): Listed[] => [agent("a", { lastActivityAt: a }), agent("b", { lastActivityAt: b }), agent("c", { lastActivityAt: c, running: false, state: "completed" })];
+
+void test("f follows the running agent with the newest activity and stops on navigation", async (t) => {
+  timers(t);
+  const harness = await open(ACTIVE(10, 20, 99), { initialKey: "a" });
+  assert.doesNotMatch(title(harness), /following/);
+  harness.send("f");
+  assert.match(title(harness), /^#2\/3 b .*following/);
+  assert.match(harness.screen().at(-1) ?? "", /f stop following/);
+  harness.agents = ACTIVE(30, 20, 99);
+  await advance(t);
+  assert.match(title(harness), /^#1\/3 a .*following/, "moves with activity");
+  harness.agents = ACTIVE(30, 30, 99);
+  await advance(t);
+  assert.match(title(harness), /^#1\/3 a /, "a tie keeps the selection");
+  harness.send(KEY.down);
+  assert.doesNotMatch(title(harness), /following/, "an arrow stops it");
+  for (const key of ["j", "[", "n", "]"]) {
+    harness.send("f");
+    assert.match(title(harness), /following/);
+    harness.send(key);
+    assert.doesNotMatch(title(harness), /following/, `${key} stops it`);
+  }
+  await leave(harness);
+});
+
+void test("f with no running agent keeps the selection, and a click stops it", async (t) => {
+  timers(t);
+  const harness = await open([agent("a", { running: false, state: "completed", lastActivityAt: 5 }), agent("b", { running: false, state: "completed" })], { initialKey: "b" });
+  harness.send("f");
+  assert.match(title(harness), /^#2\/2 b .*following/);
+  await leave(harness);
+  const two = await open(ACTIVE(10, 20, 1), { initialKey: "a" });
+  two.send("f");
+  click(two, 4, 2);
+  assert.doesNotMatch(title(two), /following/);
+  await leave(two);
+});
+
+void test("opening a menu stops follow mode; a state with following opens following", async (t) => {
+  timers(t);
+  const provider = new FakeProvider({ "workflow-agent": steps("Stop") });
+  const specs = TARGETED().map((spec) => spec.agent ? { ...spec, agent: agent(spec.key, { lastActivityAt: spec.key === "c" ? 9 : 1 }) } : spec);
+  const harness = await open([], { nodes: tree(specs), actions: [provider], initialKey: "a" });
+  harness.send("f");
+  assert.match(title(harness), /^#3\/4 c .*following/);
+  harness.send("a");
+  await settle();
+  assert.doesNotMatch(title(harness), /following/);
+  await leave(harness);
+  const again = await open([], { nodes: tree(specs), actions: [provider], initialKey: "a", state: { selectedKey: "a", row: 0, expansion: [], focus: "sidebar", sidebarVisible: true, toolsExpanded: false, detailsShown: false, following: true } });
+  assert.match(title(again), /^#3\/4 c .*following/);
+  await leave(again);
+
+  const aside = await open([], { nodes: tree(specs), actions: [provider], initialKey: "a" });
+  aside.send("f");
+  aside.send("a");
+  await settle();
+  assert.doesNotMatch(title(aside), /following/, "the open menu stops it");
+  aside.send(KEY.enter);
+  await aside.done;
+  assert.equal(aside.exit?.state.following, true, "a step-aside hands follow mode back");
+  const resumed = await open([], { nodes: tree(specs), actions: [provider], initialKey: "a", state: aside.exit.state });
+  assert.match(title(resumed), /^#3\/4 c .*following/);
+  await leave(resumed);
+
+  const closed = await open([], { nodes: tree(specs), actions: [provider], initialKey: "a" });
+  closed.send("f", "a");
+  await settle();
+  closed.send(KEY.escape);
+  assert.doesNotMatch(title(closed), /following/, "closing the menu leaves it off");
+  await leave(closed);
+});
+
+const FILTERED = (): Listed[] => [agent("alpha"), agent("beta", { depth: 1, state: "failed", running: false }), agent("gamma", { depth: 1 }), agent("scout", { group: "Subagents", state: "failed", running: false })];
+
+void test("/ filters the sidebar by text with ancestors, shows the count and keeps or moves the selection", async (t) => {
+  timers(t);
+  const harness = await open(FILTERED(), { initialKey: "gamma" });
+  harness.send("/");
+  assert.equal(rowOf(harness, "/ ▏"), 1, "the input row opens under the title");
+  harness.send("B", "E", "T");
+  assert.deepEqual(sidebarRows(harness).map((line) => line.replace(/^[^\w]*/, "").split(" ")[0]), ["build", "alpha", "beta"], "ancestors kept, case-insensitive");
+  assert.match(title(harness), /^build a1b2 .* 1 match$/, "the selection stays on the run, shown as an ancestor; the count has no ancestors");
+  harness.send("\x7f", "\x7f", "\x7f");
+  harness.send("g", "a", "m");
+  assert.match(title(harness), /^build a1b2 .* 1 match$/, "the selection stays on the run: it still shows as an ancestor");
+  harness.send(KEY.enter);
+  assert.equal(rowOf(harness, "/ ▏"), -1, "the input row closes");
+  assert.match(harness.screen().at(-1) ?? "", /^\/ filter: gam · esc clear/);
+  harness.send(KEY.escape);
+  assert.equal(sidebarRows(harness).length, 6, "esc cleared it");
+  assert.doesNotMatch(harness.screen().at(-1) ?? "", /filter:/);
+  await leave(harness);
+});
+
+void test("the filter takes a state: prefix, escapes with esc while open, and keeps the selection that still shows", async (t) => {
+  timers(t);
+  const harness = await open(FILTERED(), { initialKey: "scout" });
+  harness.send("/");
+  for (const char of "state:failed") harness.send(char);
+  assert.equal(sidebarRows(harness).filter((line) => /alpha|beta|scout/.test(line)).length, 3, "failed agents and the ancestor of beta");
+  assert.doesNotMatch(sidebarRows(harness).join("\n"), /gamma/);
+  assert.match(title(harness), /^#4\/4 scout .*2 matches/, "the selection stays");
+  harness.send(KEY.escape);
+  assert.equal(sidebarRows(harness).filter((line) => /gamma/.test(line)).length, 1);
+  assert.equal(harness.left, false, "esc closed the filter, not the workspace");
+  await leave(harness);
+});
+
+void test("the filter survives a step-aside and fits narrow screens", async (t) => {
+  timers(t);
+  const provider = new FakeProvider({ "workflow-agent": steps("Stop") });
+  const specs = TARGETED();
+  const harness = await open([], { nodes: tree(specs), actions: [provider], initialKey: "c" });
+  harness.send("/", "c", KEY.enter);
+  harness.send("a");
+  await settle();
+  harness.send(KEY.enter);
+  await harness.done;
+  const state = harness.exit?.state;
+  assert.equal(state?.filter, "c");
+  for (const columns of [120, 70, 40]) {
+    const again = await open([], { nodes: tree(specs), actions: [provider], state: state, columns });
+    assert.match(again.screen().at(-1) ?? "", /filter: c/);
+    assert.match(titleRow(again), /\d+ match/, "the count shows");
+    assert.ok(sidebarRows(again).length < TARGETED().length, "the restored sidebar is filtered");
+    assert.ok(again.screen().every((line) => visibleWidth(line) <= columns), `fits ${String(columns)}`);
+    await leave(again);
+  }
+});
+
+void test("a tie keeps a selection that is not the first of the tied nodes", async (t) => {
+  timers(t);
+  const harness = await open(ACTIVE(30, 30, 1), { initialKey: "b" });
+  harness.send("f");
+  assert.match(title(harness), /^#2\/3 b .*following/);
+  harness.agents = ACTIVE(40, 40, 1);
+  await advance(t);
+  assert.match(title(harness), /^#2\/3 b /, "still b");
+  await leave(harness);
+});
+
+void test("scrolling the transcript away from the tail stops following and the view stays put", async (t) => {
+  timers(t);
+  const harness = await open(ACTIVE(10, 20, 1), { initialKey: "a", setup: (source) => { source.polls.push(polled(entries(0, 100))); } });
+  harness.send("f");
+  await settle();
+  harness.screen();
+  const end = harness.alt().viewportTop;
+  assert.ok(end > 0, "a transcript to scroll");
+  harness.send(KEY.pageUp);
+  harness.screen();
+  const top = harness.alt().viewportTop;
+  assert.ok(top < end);
+  await advance(t);
+  harness.screen();
+  assert.doesNotMatch(title(harness), /following/);
+  assert.equal(harness.alt().viewportTop, top, "the tick does not jump back");
+  harness.send("f", KEY.ctrlHome);
+  await advance(t);
+  assert.doesNotMatch(title(harness), /following/, "ctrl+home stops it");
+  await leave(harness);
+});
+
+void test("a state word without the state: prefix does not match, and pasted whitespace is normalized", async (t) => {
+  timers(t);
+  const harness = await open(FILTERED(), { initialKey: "gamma" });
+  harness.send("/");
+  for (const char of "fail") harness.send(char);
+  assert.doesNotMatch(sidebarRows(harness).join("\n"), /alpha|beta|scout/, "fail names no node");
+  harness.send(KEY.escape);
+  harness.send("/", paste("build \t\n  a1b2"));
+  assert.match(sidebarRows(harness).join("\n"), /build a1b2/, "tabs, newlines and repeated spaces match single spaces");
+  assert.doesNotMatch(sidebarRows(harness).join("\n"), /gamma/);
+  await leave(harness);
+});
+
+void test("under a filter left and right move to the parent and the first shown child and space leaves the expansion alone", async (t) => {
+  timers(t);
+  const harness = await open(FILTERED(), { initialKey: "gamma" });
+  harness.send("/", "g", "a", "m", KEY.enter);
+  harness.send(KEY.left);
+  assert.match(title(harness), /^#1\/4 alpha/, "left goes to the parent");
+  harness.send("l");
+  assert.match(title(harness), /^#3\/4 gamma/, "l goes to the first shown child, skipping the hidden beta");
+  harness.send("h", "h");
+  assert.match(title(harness), /^build /, "h again reaches the run");
+  harness.send("l", " ");
+  assert.match(title(harness), /^#1\/4 alpha/);
+  harness.send(KEY.escape);
+  assert.equal(sidebarRows(harness).length, 6, "space changed nothing once the filter is cleared");
+  await leave(harness);
+});
+
+void test("under a filter ] stays on the shown nodes", async (t) => {
+  timers(t);
+  const harness = await open(FILTERED(), { initialKey: "alpha" });
+  harness.send("/", paste("state:failed"), KEY.enter);
+  harness.send("]");
+  assert.match(title(harness), /^#2\/4 beta/);
+  harness.send("]");
+  assert.match(title(harness), /^#4\/4 scout/, "gamma is skipped");
+  await leave(harness);
+});
+
+void test("a refresh that takes the selected node out of the filter moves the selection to the first match", async (t) => {
+  timers(t);
+  const specs = (second: string): Spec[] => [{ key: "k1", agent: agent("one") }, { key: "k2", agent: agent(second) }, { key: "k3", agent: agent("other") }, { key: "k4", agent: agent("gamut") }];
+  const harness = await open([], { nodes: tree(specs("gamma")), initialKey: "k2" });
+  harness.send("/", paste("gam"), KEY.enter);
+  assert.match(title(harness), /^#2\/4 gamma .*2 matches/);
+  harness.nodes = tree(specs("delta"));
+  await advance(t);
+  assert.match(title(harness), /^#4\/4 gamut .*1 match$/, "the selected node stays listed but no longer matches: the first match is selected");
+  assert.doesNotMatch(sidebarRows(harness).join("\n"), /other|delta/, "the sidebar stays filtered");
+  await leave(harness);
+});
+
+void test("a filter of only spaces filters nothing and esc leaves the workspace", async (t) => {
+  timers(t);
+  const harness = await open(FILTERED(), { initialKey: "alpha" });
+  harness.send("/", " ", KEY.enter);
+  harness.send(KEY.escape);
+  await harness.done;
+  assert.equal(harness.left, true);
+});
+
+void test("follow only picks among the shown nodes of a filter", async (t) => {
+  timers(t);
+  const harness = await open(ACTIVE(10, 20, 1), { initialKey: "a" });
+  harness.send("/", "a", KEY.enter);
+  harness.send("f");
+  assert.match(title(harness), /^#1\/3 a .*following/, "b is filtered out");
+  await leave(harness);
+});
