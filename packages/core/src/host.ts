@@ -1511,7 +1511,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
   };
   /** /agents: every agent of the session, or it says there is none. */
   const everyAgent = (ctx: ExtensionCommandContext): Pick<AgentsWorkspaceLoop, "hasContent" | "onEmpty"> => ({
-    hasContent: (nodes) => nodes.some((node) => node.kind === "agent"),
+    // As /workflow: a run without agents (shell or checkpoint work only) is something to show.
+    hasContent: (nodes) => nodes.length > 0,
     onEmpty: () => { ctx.ui.notify("No agents in this session.", "info"); },
   });
   const navigatorDependencies: WorkflowNavigatorDependencies = { pi, home, clipboard, extensionAgentDir, runs, terminalRunStates, hardTerminalRunStates: HARD_TERMINAL_RUN_STATES, ensureSessionLease, coordinateRunMutation, answerCheckpoint, recovery, stopWorkflowRun, moveForegroundToBackground: deliveryController.moveForegroundToBackground, isForegroundAttached: deliveryController.isForegroundAttached, liveAgents, registry, projectTrusted, resumeHostContext, resumeSelectedWorkflow, reportBlocked: reportWorkflowBlocked, trajectoryProvider, setNavigatorOpen: (open) => { if (open) backgroundWidgetController.suspend(); else backgroundWidgetController.resume(); }, openWorkflowsWorkspace: (ctx, loop) => runAgents(ctx, "workflows", loop) };
