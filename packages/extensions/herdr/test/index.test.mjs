@@ -349,7 +349,7 @@ void test("opens a terminal live session without inventing a continuation", asyn
   const runCall = calls.find(([command, subcommand]) => command === "pane" && subcommand === "run");
   assert.ok(runCall);
   assert.ok(runCommand);
-  assert.match(runCommand, new RegExp(`--session '${SESSION_FILE.replace(/[.*+?^${}()|[\]\\\/]/g, "\\$&")}'`));
+  assert.match(runCommand, new RegExp(`--session '${SESSION_FILE.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}'`));
   assert.doesNotMatch(runCommand, /--session-id/);
   assert.deepEqual(externalSettings, { acme: { enabled: true } });
   assert.deepEqual(ownership, ["suspend", "resume"]);
