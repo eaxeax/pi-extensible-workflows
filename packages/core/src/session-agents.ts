@@ -1,6 +1,8 @@
+import { stat } from "node:fs/promises";
+import { join } from "node:path";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { SubagentManager, SubagentManagerContext, SubagentStatus } from "../subagents/src/contracts.js";
-import { attemptValue, statusValue } from "../subagents/src/decode.js";
+import { attemptValue, safeSubagentId, statusValue } from "../subagents/src/decode.js";
 import type { AgentsActionTarget, SubagentPresentation, SubagentPresenter } from "./agents-actions-contract.js";
 import type { SessionAgent, SessionAgentsSource, SessionTreeNode } from "./agents-workspace-contract.js";
 import { formatAgentsTimeline, type AgentsTimelineEntry } from "./agents-timeline.js";
@@ -31,8 +33,6 @@ export type SessionAgentsScope = "all" | "workflows" | "subagents";
 /** The order of the /subagents dashboard (subagents/src/navigator.ts). */
 const SUBAGENT_ATTENTION_ORDER: Readonly<Record<SubagentStatus["state"], number>> = { running: 0, failed: 1, stopped: 2, completed: 3 };
 
-/** The /subagents dashboard's check before a run's files are read: not the manager's id format, which a custom manager need not share. */
-function safeSubagentId(id: string): boolean { return id !== "." && id !== ".." && /^[A-Za-z0-9._-]+$/.test(id); }
 /** The /subagents dashboard's manager context; per-agent inspections carry the attempt metadata and live activity. */
 function managerContext(context: ExtensionCommandContext, includeAttemptMetadata: boolean): SubagentManagerContext {
   return { toolCallId: "agents-command", signal: undefined, onUpdate: undefined, ...(includeAttemptMetadata ? { includeAttemptMetadata: true, includeActivity: true } : {}), extensionContext: context };
@@ -57,6 +57,8 @@ function activityLabel(running: boolean, agent: Parameters<typeof agentActivityL
   return running && agent !== undefined ? agentActivityLabel(agent) || undefined : undefined;
 }
 function lastActivity(at: number | undefined): { readonly lastActivityAt?: number } { return at === undefined ? {} : { lastActivityAt: at }; }
+/** An agent id as the last part of its key: one that starts like a tree node's part ("node:") or like this escape ("~") gets a "~" first, so no agent key equals a node key and no two ids share a key. */
+function agentKeyPart(id: string): string { return id.startsWith("node:") || id.startsWith("~") ? `~${id}` : id; }
 /** The tree kind of each /workflow tree node kind. */
 const RUN_NODE_KIND: Readonly<Record<WorkflowPhaseTreeNode["kind"], SessionTreeNode["kind"]>> = { workflow: "run", phase: "phase", operation: "operation", shell: "shell", agent: "agent" };
 /** The width the details' timeline is drawn at; the pane wraps what is wider. */
@@ -150,16 +152,30 @@ function worktreeRows(reference: WorktreeReference, cache: Map<string, WorktreeE
   return [...rows, ...changes.stat.map(sanitizeDisplayText), ...(changes.uncommitted ? ["uncommitted changes"] : [])];
 }
 
+/** A run's state.json and journal.json identity (modification time, size, inode): equal stamps mean neither was written again. */
+async function stateStamp(directory: string): Promise<string | undefined> {
+  const infos = await Promise.all(["state.json", "journal.json"].map((name) => stat(join(directory, name)).catch(() => undefined)));
+  return infos[0] === undefined ? undefined : infos.map((info) => info === undefined ? "-" : `${String(info.mtimeMs)}:${String(info.size)}:${String(info.ino)}`).join("|");
+}
+
+/** Whether summary.json is written no earlier than state.json and journal.json: only then does the summary hold the time the run settled. */
+async function summaryIsFresh(directory: string): Promise<boolean> {
+  const times = await Promise.all(["summary.json", "state.json", "journal.json"].map(async (name) => (await stat(join(directory, name))).mtimeMs)).catch(() => undefined);
+  return times !== undefined && times[0] !== undefined && times[0] >= Math.max(times[1] ?? 0, times[2] ?? 0);
+}
+
 /** How long a running workflow agent has been silent, when it is quiet or stalled. */
 type Silence = { readonly kind: "quiet" | "stalled"; readonly ms: number };
 
 export function createSessionAgentsSource(context: ExtensionCommandContext, deps: SessionAgentsDependencies, scope: SessionAgentsScope = "all"): SessionAgentsSource {
   const worktreeCache = new Map<string, WorktreeEntry>();
+  /** Runs that have reached a terminal state: their snapshot, summary and worktrees are read once. */
+  const settled = new Map<string, { stamp: string | undefined; loaded: { run: PersistedRun; snapshot: Readonly<LaunchSnapshot>; waitingFor: string | undefined; worktrees: readonly WorktreeReference[] }; resolvedAt: number | undefined }>();
   const runAgent = (run: PersistedRun, agent: AgentRecord, cache: Map<string, number | undefined>): SessionAgent => {
     const attempt = latestAttempt(agent.attemptDetails);
     const running = !SETTLED_AGENT_STATES.has(agent.state);
     return {
-      key: `run:${run.id}:${agent.id}`,
+      key: `run:${run.id}:${agentKeyPart(agent.id)}`,
       name: sanitizeDisplayText(agent.label ?? agent.name),
       state: agent.state,
       summary: agentSummary(agent.model, agent.accounting),
@@ -180,7 +196,7 @@ export function createSessionAgentsSource(context: ExtensionCommandContext, deps
     const model = buildWorkflowPhaseModel(run, snapshot);
     const tree = buildWorkflowPhaseTree(model);
     const expanded = workflowPhaseTreeInitialExpanded(tree);
-    const key = (node: WorkflowPhaseTreeNode): string => node.kind === "workflow" ? `run:${run.id}` : node.kind === "agent" && node.agent ? `run:${run.id}:${node.agent.id}` : `run:${run.id}:node:${node.id}`;
+    const key = (node: WorkflowPhaseTreeNode): string => node.kind === "workflow" ? `run:${run.id}` : node.kind === "agent" && node.agent ? `run:${run.id}:${agentKeyPart(node.agent.id)}` : `run:${run.id}:node:${node.id}`;
     const shownRun = { workflowName: sanitizeDisplayText(run.workflowName), id: sanitizeDisplayText(run.id) };
     const runTarget: AgentsActionTarget = { kind: "run", runId: run.id };
     // Every node expanded: the sidebar order, a parent before its children.
@@ -230,16 +246,28 @@ export function createSessionAgentsSource(context: ExtensionCommandContext, deps
     const sessionId = context.sessionManager.getSessionId();
     // A display refresh: leave the cleanup of abandoned run temps to the /workflow picker.
     const runIds = await listRunIds(context.cwd, sessionId, deps.home, false);
+    for (const id of [...settled.keys()]) if (!runIds.includes(id)) settled.delete(id);
     const loaded = await Promise.all(runIds.map(async (runId) => {
       const store = new RunStore(context.cwd, sessionId, runId, deps.home);
+      const cached = settled.get(runId);
+      // A run that has reached a terminal state is read once and reused while its state.json is unchanged (file metadata):
+      // another Pi can resume it, and a changed file is read in full again.
+      const stamp = await stateStamp(store.directory);
+      if (cached !== undefined) {
+        if (stamp !== undefined && stamp === cached.stamp) return { loaded: { ...cached.loaded, run: deps.overlayRun(cached.loaded.run) }, resolvedAt: cached.resolvedAt };
+        settled.delete(runId);
+      }
       try {
         const { run, snapshot } = await store.load();
         // As the /workflow picker: a settled run sorts by the time it settled.
         const terminalAt = (await store.loadSummary().catch(() => undefined))?.terminalAt;
-        const resolvedAt = terminalAt === undefined ? undefined : Date.parse(terminalAt);
+        const parsed = terminalAt === undefined ? Number.NaN : Date.parse(terminalAt);
+        const resolvedAt = Number.isFinite(parsed) ? parsed : undefined;
         const waitingFor = run.state === "awaiting_input" ? (await store.awaitingCheckpoints().catch(() => []))[0]?.name : undefined;
         const worktrees = await store.recordedWorktrees().catch(() => []);
-        return { loaded: { run: deps.overlayRun(run), snapshot, waitingFor, worktrees }, resolvedAt: resolvedAt !== undefined && Number.isFinite(resolvedAt) ? resolvedAt : undefined };
+        const entry = { loaded: { run, snapshot, waitingFor, worktrees }, resolvedAt };
+        if (isHardTerminalRunState(run.state) && await summaryIsFresh(store.directory)) settled.set(runId, { ...entry, stamp });
+        return { loaded: { ...entry.loaded, run: deps.overlayRun(run) }, resolvedAt };
       } catch { return undefined; }
     }));
     return navigatorAttentionSort(loaded.filter((entry) => entry !== undefined)).flatMap(({ loaded: { run, snapshot, waitingFor, worktrees } }) => runNodes(run, snapshot, waitingFor, worktrees, now, cache));
@@ -308,13 +336,13 @@ export function createSessionAgentsSource(context: ExtensionCommandContext, deps
     // Without presentations (no presenter, or a getter or describe() that fails) every subagent keeps its short id.
     const presentations = requested.size > 0 ? await Promise.resolve().then(() => deps.subagentPresenter?.()?.describe([...requested])).catch(() => undefined) : undefined;
     const sorted = navigatorAttentionSortByState(entries, ({ status }) => status.state, ({ status }) => status.finishedAt, SUBAGENT_ATTENTION_ORDER);
-    const first = sorted[0];
-    if (first === undefined) return [];
+    if (sorted.length === 0) return [];
     // Each row is its listed id: its key, name, presentation and target; a presentation for an id not asked for is ignored.
     const children = sorted.map(({ id, status, owned }) => subagent(manager, id, status, owned, requested.has(id) ? presentations?.get(id) : undefined));
     const childNames = children.map((child) => child.agent?.name);
-    // The group takes the state of its first subagent: the one the /subagents order puts first.
-    const state = first.status.state;
+    // The group summarizes its subagents: running while one runs, else failed if one failed, else done.
+    const states = sorted.map(({ status }) => status.state);
+    const state = states.includes("running") ? "running" : states.includes("failed") ? "failed" : states.every((value) => value === "stopped") ? "stopped" : "completed";
     const counts = subagentsCounts(sorted.map(({ status }) => status));
     const group: SessionTreeNode = {
       key: "subagents",

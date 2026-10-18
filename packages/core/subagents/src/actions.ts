@@ -4,7 +4,7 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { ActionUi, AgentsAction, AgentsActionProvider, AgentsActionTarget, SubagentPresentation, SubagentPresenter } from "../../src/agents-actions-contract.js";
 import { agentActionLabels, deepFreeze, errorText, formatAgentDetail, formatAgentError, jsonValue, loadingRegistry, navigatorAttentionSortByState, sanitizeDisplayText, visibleStandaloneAgentAttemptActions, workflowPromptArtifact, workflowResultArtifact, type AgentAttemptActionUi, type AgentAttemptSummary, type AgentDetailPresentation, type StandaloneAgentAttemptActionContext, type WorkflowProgressStyles } from "../../src/index.js";
 import { normalizeSubagentRunRequest, type SubagentManager, type SubagentManagerContext, type SubagentProgress, type SubagentRunRequest, type SubagentStatus } from "./contracts.js";
-import { attemptValue, statusValue } from "./decode.js";
+import { attemptValue, safeSubagentId, statusValue } from "./decode.js";
 
 /**
  * The /subagents actions: the rules the /subagents picker (navigator.ts) and the
@@ -25,7 +25,6 @@ export type SubagentActionUi = Pick<ActionUi, "notify" | "confirm" | "select" | 
 
 function objectValue(value: unknown): Record<string, unknown> | undefined { return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined; }
 function isFileNotFound(error: unknown): boolean { return objectValue(error)?.code === "ENOENT"; }
-function safeRunId(id: string): boolean { return id !== "." && id !== ".." && /^[A-Za-z0-9._-]+$/.test(id); }
 
 function inspectionValue(value: unknown): { status: SubagentStatus; record: Record<string, unknown> } | undefined {
   const record = objectValue(value);
@@ -39,7 +38,7 @@ function managerContext(context: ExtensionCommandContext, waitForForeground = tr
 }
 
 async function loadRequest(storageDirectory: string, id: string): Promise<{ request?: SubagentRunRequest; error?: string }> {
-  if (!safeRunId(id)) return {};
+  if (!safeSubagentId(id)) return {};
   try {
     const value: unknown = JSON.parse(await readFile(join(storageDirectory, id, "request.json"), "utf8"));
     return { request: normalizeSubagentRunRequest(value) };

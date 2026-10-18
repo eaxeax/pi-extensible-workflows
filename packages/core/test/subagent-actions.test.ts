@@ -11,6 +11,7 @@ import { createSessionAgentsSource } from "../src/session-agents.js";
 import { createSubagentActionProvider, createSubagentPresenter, listNames, loadEntries } from "../subagents/src/actions.js";
 import type { SubagentAttemptActionData, SubagentManager, SubagentManagerContext } from "../subagents/src/contracts.js";
 import { registerSubagentsExtension } from "../subagents/src/index.js";
+import { safeSubagentId } from "../subagents/src/decode.js";
 
 const SESSION = "session-1";
 const NOW = 61_000;
@@ -108,6 +109,11 @@ const GROUP: AgentsActionTarget = { kind: "subagents" };
 const IN_PLACE = new Set(["Copy branch", "Copy worktree path", "Open prompt in editor", "Open system prompt in editor", "Open result in editor", "Copy run path", "Copy agent ID"]);
 /** The menu as the provider gives it: each label with its inPlace mark. */
 function marked(labels: readonly string[]) { return labels.map((label) => IN_PLACE.has(label) ? { label, inPlace: true } : { label }); }
+
+void test("a subagent id is safe only as one plain path segment", () => {
+  for (const id of ["sub-safe", "a.b_c-1", "...", "A9"]) assert.equal(safeSubagentId(id), true, id);
+  for (const id of ["", ".", "..", "bad/id", "bad\\id", "a b", "id\n", "ü"]) assert.equal(safeSubagentId(id), false, JSON.stringify(id));
+});
 
 void test("offers each subagent today's /subagents labels for its state, without Back, and marks the in-place ones", async () => {
   const { provider } = fixture();

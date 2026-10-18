@@ -472,3 +472,41 @@ void test("reset drops every record and the live message", () => {
   assertOrder(text(), ["alpha", "FRESH"]);
   view.dispose();
 });
+
+void test("user text joins its text parts with nothing and leaves images out, as Pi's chat does", () => {
+  const { view, text } = setup();
+  view.append([message(100, { role: "user", content: [{ type: "text", text: "FIRST-" }, { type: "image", data: "AAAA", mimeType: "image/png" }, { type: "text", text: "SECOND" }] })]);
+  assert.ok(text().includes("FIRST-SECOND"), text());
+  assert.ok(!text().includes("[image]"));
+});
+
+void test("a warning line is yellow and a dim line stays dim", () => {
+  const { view, raw } = setup();
+  view.append([{ kind: "unreadable", offset: 100, bytes: 5 }, entry(200, { type: "model_change", provider: "p", modelId: "m" })]);
+  const lines = raw();
+  const unreadable = lines.find((line) => stripTerminalSequences(line).includes("unreadable")) ?? "";
+  assert.ok(unreadable.includes(`${ESC}[33m`) && !unreadable.includes(`${ESC}[2m`), JSON.stringify(unreadable));
+  const model = lines.find((line) => stripTerminalSequences(line).includes("model: p/m")) ?? "";
+  assert.ok(model.includes(`${ESC}[2m`), JSON.stringify(model));
+});
+
+void test("a streaming tool call has a tool block before the message ends, and its arguments grow in place", () => {
+  const { view, text } = setup();
+  const streamed = (args: Readonly<Record<string, unknown>>) => ({ type: "message_update" as const, message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "bash", arguments: args }] } });
+  view.live({ type: "message_start", message: { role: "assistant", content: [] } });
+  view.live(streamed({ command: "ls STREAMED" }));
+  assert.ok(text().includes("$ ls STREAMED"), text());
+  view.live(streamed({ command: "ls STREAMED-MORE" }));
+  assert.equal(count(text(), "$ ls"), 1);
+  assert.ok(text().includes("ls STREAMED-MORE"));
+  view.live({ type: "message_end", message: { role: "assistant", content: [] } });
+  assert.ok(!text().includes("STREAMED"));
+});
+
+void test("a tool without a built-in definition (workflow_result) renders Pi's generic block once, with its arguments and result", () => {
+  const { view, text } = setup();
+  view.append([call(100, "w1", "workflow_result", { result: "DONE-VALUE" }), result(200, "w1", "workflow_result", "accepted-text")]);
+  const rendered = text();
+  assertOrder(rendered, ["workflow_result", "DONE-VALUE", "accepted-text"]);
+  assert.ok(!rendered.includes("Workflow Result Workflow Result"));
+});

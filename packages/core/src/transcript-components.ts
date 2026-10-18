@@ -29,10 +29,16 @@ const BUILT_IN_TOOLS = new Map<string, (cwd: string) => ToolRendering>([["read",
 /** AssistantMessageComponent draws only content, stopReason and errorMessage. */
 const UNDRAWN = { api: "", provider: "", model: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, timestamp: 0 } satisfies Omit<AssistantMessage, "role" | "content" | "stopReason">;
 
+const ESC = String.fromCharCode(27);
 function text(value: unknown): string { return typeof value === "string" ? value : ""; }
 function list(value: unknown): readonly unknown[] { return Array.isArray(value) ? value : []; }
 /** sanitizeDisplayText line by line, keeping the line breaks and tabs that Markdown and code need. */
 function clean(value: string): string { return value.split(/\r\n|\r|\n/).map((line) => line.split("\t").map(sanitizeDisplayText).join("\t")).join("\n"); }
+/** A user message's text as Pi's own chat joins it: the text parts one after another, no images. */
+function userText(content: unknown): string {
+  if (typeof content === "string") return clean(content);
+  return list(content).flatMap((part) => object(part) && part.type === "text" ? [clean(text(part.text))] : []).join("");
+}
 /** Message content as text: a string as it is, text parts one after another, images as "[image]". */
 function contentText(content: unknown): string {
   if (typeof content === "string") return clean(content);
@@ -88,8 +94,13 @@ function expandable(component: Component): component is Expandable { return "set
  * time the block with the clock, neither of which the records carry.
  */
 function complete(tool: ToolExecutionComponent, result: ToolResult): void { tool.updateResult(result); }
-/** Pi's theme is not reachable from here: bold stays bold and every other style of the dashboards is dim. */
-function paint(line: string, style: Block["style"]): string { return style === undefined ? line : styleTextWithAnsi(line, undefined, undefined, style === "bold" ? { bold: true } : { dim: true }); }
+/** Pi's theme is not reachable from here: the dashboards' colours are the terminal's own (yellow for a warning line), bold stays bold, and muted and dim text is dim. */
+const STYLE_COLOURS: Readonly<Partial<Record<NonNullable<Block["style"]>, string>>> = { warning: `${ESC}[33m` };
+function paint(line: string, style: Block["style"]): string {
+  if (style === undefined) return line;
+  const colour = STYLE_COLOURS[style];
+  return colour === undefined ? styleTextWithAnsi(line, undefined, undefined, style === "bold" ? { bold: true } : { dim: true }) : styleTextWithAnsi(line, colour, undefined, {});
+}
 function blocksText(blocks: readonly Block[], expanded: boolean): string {
   return blocks.flatMap((block) => {
     if (!block.text) return [];
@@ -115,11 +126,11 @@ export const createTranscriptView: CreateTranscriptView = ({ ui, cwd }) => {
   const root = new Container();
   const definitions = new Map([...BUILT_IN_TOOLS].map(([name, create]) => [name, create(cwd)] as const));
   let items: Item[] = [];
-  let streaming: { readonly component: AssistantMessageComponent; message: AssistantMessage } | undefined;
+  let streaming: { readonly component: AssistantMessageComponent; readonly box: Container; message: AssistantMessage; tools: { readonly id: string; readonly name: string; readonly tool: ToolExecutionComponent }[] } | undefined;
   let expanded = false;
 
   function changed(): void {
-    root.children = [...items.map((item) => item.child), ...(streaming ? [streaming.component] : [])];
+    root.children = [...items.map((item) => item.child), ...(streaming ? [streaming.box] : [])];
     ui.requestRender();
   }
   function clear(): void {
@@ -177,6 +188,20 @@ export const createTranscriptView: CreateTranscriptView = ({ ui, cwd }) => {
       }
     }
   }
+  /** The streamed message's tool blocks follow its calls: a call keeps its block while its arguments grow. */
+  function streamTools(live: NonNullable<typeof streaming>): void {
+    const calls = live.message.content.flatMap((part) => part.type === "toolCall" ? [part] : []);
+    live.tools = calls.map((part, index) => {
+      const [id, name, args] = [clean(part.id), part.name, cleanArguments(part.arguments)];
+      const known = live.tools[index];
+      if (known?.id === id && known.name === name) {
+        known.tool.updateArgs(args);
+        return known;
+      }
+      return { id, name, tool: block(name, id, args, undefined) };
+    });
+    live.box.children = [live.component, ...live.tools.map(({ tool: component }) => component)];
+  }
   function bashExecution(message: Fields): BashExecutionComponent {
     const component = new BashExecutionComponent(clean(text(message.command)), ui, message.excludeFromContext === true);
     const output = clean(text(message.output));
@@ -194,7 +219,7 @@ export const createTranscriptView: CreateTranscriptView = ({ ui, cwd }) => {
     const custom = message?.role === "custom" ? message : value?.type === "custom_message" ? value : undefined;
     const compaction = message?.role === "compactionSummary" ? message : value?.type === "compaction" ? value : undefined;
     const branch = message?.role === "branchSummary" ? message : value?.type === "branch_summary" ? value : undefined;
-    if (message?.role === "user") child.children.push(new Spacer(1), new UserMessageComponent(contentText(message.content), getMarkdownTheme()));
+    if (message?.role === "user") child.children.push(new Spacer(1), new UserMessageComponent(userText(message.content), getMarkdownTheme()));
     else if (message?.role === "assistant") {
       child.addChild(new AssistantMessageComponent(assistantMessage(message), false, getMarkdownTheme()));
       const stopped = stopResult(message);
@@ -247,6 +272,7 @@ export const createTranscriptView: CreateTranscriptView = ({ ui, cwd }) => {
       if (next === expanded) return;
       expanded = next;
       for (const item of items) for (const component of item.child.children) if (expandable(component)) component.setExpanded(next);
+      for (const { tool: component } of streaming?.tools ?? []) component.setExpanded(next);
       changed();
     },
     live(event) {
@@ -255,11 +281,13 @@ export const createTranscriptView: CreateTranscriptView = ({ ui, cwd }) => {
         const message = assistantMessage({ ...event.message });
         const component = new AssistantMessageComponent(undefined, false, getMarkdownTheme());
         component.updateContent(message, true);
-        streaming = { component, message };
+        streaming = { component, box: new Container(), message, tools: [] };
+        streamTools(streaming);
       } else if (event.type === "message_update" && streaming) {
         if (event.message) streaming.message = assistantMessage({ ...event.message });
         else appendDelta(streaming.message, event.assistantMessageEvent);
         streaming.component.updateContent(streaming.message, true);
+        streamTools(streaming);
       } else if (event.type === "message_end" && streaming) streaming = undefined;
       else return;
       changed();
