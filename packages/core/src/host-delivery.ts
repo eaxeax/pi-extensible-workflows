@@ -12,6 +12,8 @@ export type PendingFailureDiagnostic = { diagnostic: WorkflowFailureDiagnostics;
 type ForegroundDeliveryControllerOptions = {
   runs: ReadonlyMap<string, { store: RunStore }>;
   deliver?: (content: string) => void;
+  /** Where a terminal delivery that failed is reported; without it the failure is dropped. */
+  warn?: (content: string) => void;
 };
 
 export class ForegroundDeliveryController {
@@ -20,17 +22,22 @@ export class ForegroundDeliveryController {
   readonly foregroundResumeClaims = new WeakSet<RunStore>();
   readonly terminalDeliveryLanes = new WeakMap<RunStore, SerialLane>();
   /** Terminal deliveries still running; session shutdown waits for them before the session's files may go. */
-  readonly #pendingDeliveries = new Set<Promise<unknown>>();
+  readonly #pendingDeliveries = new Set<Promise<void>>();
 
   constructor(private readonly options: ForegroundDeliveryControllerOptions) {}
-  /** Records a terminal delivery chain started for a settling run. A rejection still surfaces as an unhandled one, as before. */
+  /**
+   * Records a terminal delivery chain started for a settling run. A chain that fails is reported through `warn`: Pi installs no
+   * unhandled-rejection handler, so a rejection left unhandled would end the Pi process.
+   */
   trackDelivery = (delivery: Promise<unknown>): void => {
-    const tracked: Promise<unknown> = delivery.finally(() => { this.#pendingDeliveries.delete(tracked); });
+    const tracked: Promise<void> = delivery.then(() => undefined, (error: unknown) => {
+      try { this.options.warn?.(`Workflow result delivery failed: ${errorText(error)}`); } catch { /* the session UI may be closing */ }
+    }).finally(() => { this.#pendingDeliveries.delete(tracked); });
     this.#pendingDeliveries.add(tracked);
   };
   /** Resolves once every tracked delivery has settled, also those tracked while waiting. */
   deliveriesSettled = async (): Promise<void> => {
-    while (this.#pendingDeliveries.size > 0) await Promise.allSettled([...this.#pendingDeliveries]);
+    while (this.#pendingDeliveries.size > 0) await Promise.all([...this.#pendingDeliveries]);
   };
   claimForegroundDelivery = async (store: RunStore, toolCallId: string): Promise<"claimed" | "delivered" | "detached"> => {
     let claim: "claimed" | "delivered" | "detached" = "detached";

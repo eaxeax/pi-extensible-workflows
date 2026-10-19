@@ -345,7 +345,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
   // Extension load failures a headless launcher reported for this host. They hold for the whole process, so every executor,
   // including those that paused resume, cold resume and retry create, keeps failing ownerless options closed.
   let extensionLoad: AgentExecutionRoot["extensionLoad"];
-  const deliveryController = new ForegroundDeliveryController({ runs, ...(typeof pi.sendMessage === "function" ? { deliver: (content: string) => { deliver(pi, content); } } : {}) });
+  const deliveryController = new ForegroundDeliveryController({ runs, warn: (content: string) => { deliverWarning(pi, content); }, ...(typeof pi.sendMessage === "function" ? { deliver: (content: string) => { deliver(pi, content); } } : {}) });
   let releaseWorkflowRegistry: (() => void) | undefined;
   const providerRecoveryLane = new SerialLane();
   const enqueueProviderRecovery = <T>(task: () => Promise<T>): Promise<T> => providerRecoveryLane.run(task);
