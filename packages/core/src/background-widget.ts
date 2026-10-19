@@ -621,6 +621,8 @@ function maxOffset(total: number, budget: number): number {
 
 function collapse(rows: readonly Row[], budget: number, paint: Paint, offset: number, scrolling: boolean): Row[] {
   const shown = collapseRows(rows, budget, paint, offset, scrolling);
+  // While scrolling the reader moves the window to the checkpoint; the flag is for the frame at rest.
+  if (scrolling) return shown;
   // A waiting checkpoint whose own row gave way to the run headers is still
   // said on its run's header, so the count in the title is never unaccounted for.
   const drawn = new Set(shown);
@@ -885,6 +887,13 @@ function collapseRows(rows: readonly Row[], budget: number, paint: Paint, offset
   return accounted(final.shown.filter((row) => !final.markers.has(row) || spare-- > 0));
 }
 
+/** Whether a row is folded away in scroll mode: a row it hangs from is folded shut. */
+function foldedAway(parent: string | undefined, parentOf: (key: string) => string | undefined, folded: ReadonlySet<string>): boolean {
+  //NOTE: parent keys come from rows drawn earlier, so the chain cannot loop.
+  for (let at = parent; at !== undefined; at = parentOf(at)) if (folded.has(at)) return true;
+  return false;
+}
+
 /** The whole widget frame, or undefined when nothing is running. */
 function renderFrame(runs: readonly Run[], now: number, width: number, startOffset = 0, theme?: Theme, scrolling = false, sizeOut: FrameReport = { rows: 0, total: 0, list: [], cursor: 0, offset: 0 }, nav: Navigation = { cursor: undefined, index: 0, folded: new Set() }, canOpen = false, layout: BackgroundWidgetLayout = "phases", subagents: readonly BackgroundSubagent[] = []): string[] | undefined {
   // Only live background runs.
@@ -970,7 +979,9 @@ function renderFrame(runs: readonly Run[], now: number, width: number, startOffs
       );
       const failed = slice.agents.some((agent) => agent.state === "failed");
       const sliceShells = slice.shells ?? [];
-      const phaseState = failed ? "failed" : (liveAgents || sliceShells.length > 0) && run.state === "running" ? "running" : run.state === "running" ? "completed" : run.state;
+      // A running shell keeps its phase running with no agent live, however briefly it has run.
+      const phaseShells = slice.phaseIndex !== undefined && run.activeShellsByPhase?.some((entry) => entry.phaseIndex === slice.phaseIndex && entry.active > 0) === true;
+      const phaseState = failed ? "failed" : (liveAgents || sliceShells.length > 0 || phaseShells) && run.state === "running" ? "running" : run.state === "running" ? "completed" : run.state;
 
       let cost = 0;
       let tokens = 0;
@@ -1125,11 +1136,7 @@ function renderFrame(runs: readonly Run[], now: number, width: number, startOffs
   // Folded rows are left out in scroll mode; a row is folded when any row it hangs from is.
   const byKey = new Map(rows.flatMap((row) => row.key === undefined ? [] : [[row.key, row] as const]));
   const foldable = new Set(rows.flatMap((row) => row.parent === undefined ? [] : [row.parent]));
-  const hiddenByFold = (row: Row): boolean => {
-    //NOTE: parent keys come from rows drawn earlier, so the chain cannot loop.
-    for (let at = row.parent; at !== undefined; at = byKey.get(at)?.parent) if (nav.folded.has(at)) return true;
-    return false;
-  };
+  const hiddenByFold = (row: Row): boolean => foldedAway(row.parent, (key) => byKey.get(key)?.parent, nav.folded);
   const tree = scrolling && nav.folded.size > 0 ? rows.filter((row) => !hiddenByFold(row)) : rows;
   let offset = startOffset;
   if (scrolling) {
@@ -1600,22 +1607,25 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true, opener?:
     if (isKeyRelease(data)) return { consume: true };
     if (matchesKey(data, "alt+o")) return { consume: true };
     const item = size.list[size.cursor];
-    if (matchesKey(data, Key.up) || data === "k") { moveCursor(-1); return { consume: true }; }
-    if (matchesKey(data, Key.down) || data === "j") { moveCursor(1); return { consume: true }; }
+    if (matchesKey(data, Key.up) || matchesKey(data, "k")) { moveCursor(-1); return { consume: true }; }
+    if (matchesKey(data, Key.down) || matchesKey(data, "j")) { moveCursor(1); return { consume: true }; }
     // Keys the hint promises are always taken: a row that cannot fold folds the
     // row it hangs from and the cursor goes there; with nothing to fold they do nothing.
-    if (matchesKey(data, Key.left) || data === "h") {
+    if (matchesKey(data, Key.left) || matchesKey(data, "h")) {
       const own = item?.key !== undefined && item.foldable && !foldedKeys.has(item.key);
       const target = own ? item.key : item?.parent;
       if (target !== undefined) {
         foldedKeys.add(target);
+        // The rows it folds leave the list now, so a move before the next repaint cannot land on one.
+        const parents = new Map(size.list.map((entry) => [entry.key, entry.parent]));
+        size.list = size.list.filter((entry) => !foldedAway(entry.parent, (key) => parents.get(key), foldedKeys));
         const at = size.list.findIndex((entry) => entry.key === target);
         if (at >= 0) { cursorKey = target; size.cursor = at; }
         requestRender?.();
       }
       return { consume: true };
     }
-    if (matchesKey(data, Key.right) || data === "l") {
+    if (matchesKey(data, Key.right) || matchesKey(data, "l")) {
       if (item?.key !== undefined && foldedKeys.delete(item.key)) requestRender?.();
       return { consume: true };
     }
@@ -1628,7 +1638,7 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true, opener?:
       opener.open(target, item.open);
       return { consume: true };
     }
-    if (matchesKey(data, Key.escape) || data === "q") {
+    if (matchesKey(data, Key.escape) || matchesKey(data, "q")) {
       leaveScroll();
       requestRender?.();
       return { consume: true };

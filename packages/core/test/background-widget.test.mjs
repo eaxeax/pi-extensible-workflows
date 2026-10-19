@@ -741,6 +741,23 @@ void test("a phase of shell work shows its commands once they have run a while",
   host.shutdown();
 });
 
+void test("a phase whose only live work is a running shell is drawn running, not done", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-shell-phase-"));
+  const host = harness();
+  host.start();
+  const directory = writeRun(join(root, "run-1"), {
+    ...runState(),
+    agents: [],
+    activeShellsByPhase: [{ phaseIndex: 0, active: 1, startedAt: Date.now() - 20_000 }],
+  });
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  const text = host.frames.at(-1).map(plain).join("\n");
+  assert.match(text, /1 command/, text);
+  assert.match(text, /[├╰]─ [⣷⣯⣟⡿⢿⣽⣻] shell/, text);
+  assert.doesNotMatch(text, /✓ shell/, text);
+  host.shutdown();
+});
+
 void test("crossing a budget threshold shows on the run line", () => {
   const root = mkdtempSync(join(tmpdir(), "widget-budget-"));
   const directory = writeRun(join(root, "run-1"), {
@@ -2148,7 +2165,7 @@ function scrollHost(opener) {
 }
 
 void test("Alt+O reaches the widget before an editor that binds it, in both encodings, only while the hint shows", () => {
-  const { host, draw } = scrollHost();
+  const { host, draw, cursorLine } = scrollHost();
   assert.match(draw()[0], /Alt\+O to scroll/);
   // The harness runs terminal-input listeners first, as Pi does; an editor like
   // pi-vim's would only see what they leave.
@@ -2157,8 +2174,12 @@ void test("Alt+O reaches the widget before an editor that binds it, in both enco
   assert.equal(host.key("\u001b"), true);
   assert.equal(host.key("\u001b[111;3u"), true, "and so is the kitty form");
   assert.match(draw()[0], /enter open/);
+  host.key("j");
+  // The registered shortcut finds scroll mode on and leaves it alone: the cursor stays where it was.
+  [...host.shortcuts.values()][0].handler();
+  assert.match(draw()[0], /enter open/);
+  assert.match(cursorLine(), /p0/);
   host.key("q");
-  // The registered shortcut finds scroll mode on and leaves it alone only when asked.
   host.shutdown();
 
   const fits = harness();
@@ -2320,6 +2341,66 @@ void test("the registered shortcut leaves scroll mode on when the listener has e
   host.key("\u001bo");
   [...host.shortcuts.values()][0].handler();
   assert.match(draw()[0], /enter open/, "not toggled off, not entered twice");
+  host.shutdown();
+});
+
+void test("h/j/k/l/q work when the terminal reports them as escape sequences", () => {
+  const { host, draw, cursorLine } = scrollHost();
+  const kitty = (letter) => `\u001b[${String(letter.charCodeAt(0))}u`;
+  host.key("\u001bo");
+  assert.equal(host.key(kitty("j")), true, "j is taken");
+  assert.match(cursorLine(), /p0/);
+  host.key(kitty("j"));
+  assert.match(cursorLine(), /scout/);
+  host.key(kitty("k"));
+  assert.match(cursorLine(), /p0/);
+  host.key(kitty("h"));
+  assert.ok(!draw().some((line) => /scout/.test(line)), "h folds the phase");
+  host.key(kitty("l"));
+  assert.ok(draw().some((line) => /scout/.test(line)), "l unfolds it");
+  assert.equal(host.key(kitty("q")), true, "q is taken");
+  assert.match(draw()[0], /Alt\+O to scroll/, "and leaves scroll mode");
+  host.shutdown();
+});
+
+void test("a fold followed by a move before the next repaint never lands on a row just folded", () => {
+  const opened = [];
+  const { host } = scrollHost({ available: () => true, open: (_context, key) => { opened.push(key); } });
+  host.key("\u001bo");
+  host.key("j");
+  host.key("j");
+  // Keys that arrive together are handled before Pi repaints.
+  const repaint = host.tui.requestRender;
+  host.tui.requestRender = () => {};
+  host.key("h");
+  host.key("j");
+  host.key("\r");
+  host.tui.requestRender = repaint;
+  assert.deepEqual(opened, ["run:run-1:node:phase/p1%231"], "the move went past the folded agent to the next phase");
+  host.shutdown();
+});
+
+void test("in scroll mode a waiting run's header keeps its figures while its checkpoint row is just below the window", () => {
+  __navigationForTests.enabled = true;
+  const root = mkdtempSync(join(tmpdir(), "widget-scroll-waiting-"));
+  const host = harness();
+  host.start();
+  const phases = (prefix) => Array.from({ length: 5 }, (_, index) => ({ phase: `${prefix}${String(index)}`, afterAgent: 0 }));
+  const first = writeRun(join(root, "run-1"), runState({ workflowName: "alpha", agents: [], phaseHistory: phases("a") }));
+  const second = writeRun(join(root, "run-2"), runState({ id: "run-2", workflowName: "beta", agents: [], phaseHistory: phases("b") }));
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: first, sessionId: "session-1" });
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-2", runDirectory: second, sessionId: "session-1" });
+  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, { runId: "run-2", runDirectory: second, sessionId: "session-1", name: "ok?", state: "awaiting" });
+  const draw = () => host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
+  assert.equal(host.key("\u001bo"), true);
+  const frame = draw();
+  const header = frame.find((line) => /beta/.test(line));
+  assert.ok(header, frame.join("\n"));
+  assert.ok(!frame.some((line) => /waiting: ok\?/.test(line)), `the checkpoint row is below the window\n${frame.join("\n")}`);
+  assert.doesNotMatch(header, /◆ waiting/, frame.join("\n"));
+  host.key("q");
+  const rest = draw();
+  assert.ok(rest.slice(1).some((line) => /◆ waiting/.test(line)), `at rest the frame still says it\n${rest.join("\n")}`);
   host.shutdown();
 });
 

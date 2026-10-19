@@ -135,11 +135,15 @@ void test("the host keeps the command context after /agents returns, so the widg
     assert.deepEqual(opened, [undefined, "run:run"]);
 
     for (const handler of handlers.get("session_shutdown") ?? []) await handler(undefined, session);
+    // The same session starts again with the run still live, so the widget draws it and Enter could open it; only the
+    // remembered command context is gone.
+    for (const handler of handlers.get("session_start") ?? []) await handler(undefined, session);
     emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run", runDirectory: directory, sessionId: "session" });
-    key("\u001bo");
-    key("\r");
+    assert.equal(key("\u001bo"), true, "the widget scrolls again");
+    assert.equal(key("\r"), true);
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(opened.length, 2, "after the session ends Enter opens nothing");
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler(undefined, session);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
