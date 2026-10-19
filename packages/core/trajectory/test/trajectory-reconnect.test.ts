@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer as createHttpServer, type Server } from "node:http";
 import { createServer } from "node:net";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -17,8 +17,9 @@ async function availablePort(): Promise<number> {
   await new Promise<void>((resolve, reject) => server.close((error) => { if (error) reject(error); else resolve(); }));
   return port;
 }
-function input(home: string, port: number) {
-  return { cwd: home, sessionId: "trajectory-reconnect-test", port, loadRuns: async () => [], loadSubagents: async () => [], loadMetadata: async () => ({ runs: [], subagents: [] }), handleAction: async () => {} };
+/** `published` gets the time of every state publish: the controller loads the metadata only over an open connection. */
+function input(home: string, port: number, published: number[] = []) {
+  return { cwd: home, sessionId: "trajectory-reconnect-test", port, loadRuns: async () => [], loadSubagents: async () => [], loadMetadata: async () => { published.push(Date.now()); return { runs: [], subagents: [] }; }, handleAction: async () => {} };
 }
 async function serverPid(home: string): Promise<number> {
   return (JSON.parse(await readFile(join(home, "pi-extensible-workflows", "trajectory.lock"), "utf8")) as { pid: number }).pid;
@@ -55,7 +56,8 @@ void test("a reconnect outage is reported once through the session's reporter, n
   const consoleError = t.mock.method(console, "error", () => {});
   let holder: Server | undefined;
   try {
-    await controller.open(input(home, port), (message) => { reports.push(message); });
+    const published: number[] = [];
+    await controller.open(input(home, port, published), (message) => { reports.push(message); });
     const first = await serverPid(home);
     holder = await breakServer(home, port);
     await until(() => reports.length > 0, "the first report");
@@ -66,8 +68,9 @@ void test("a reconnect outage is reported once through the session's reporter, n
     await closeServer(holder);
     holder = undefined;
     await until(async () => { const pid = await serverPid(home).catch(() => first); return pid !== first && alive(pid); }, "a new server after the port was freed");
-    // The new server is up; give the controller a moment to attach to it before the next outage.
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    // The controller is attached to the new server once it published its state there, after that server wrote its lock.
+    const restarted = (await stat(join(home, "pi-extensible-workflows", "trajectory.lock"))).mtimeMs;
+    await until(() => published.some((at) => at >= Math.floor(restarted)), "the state published to the new server");
     holder = await breakServer(home, port);
     await until(() => reports.length > 1, "the report for the second outage");
     assert.equal(reports.length, 2);
