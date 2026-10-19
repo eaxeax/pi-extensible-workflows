@@ -432,7 +432,9 @@ export function createTrajectoryController(agentDir: string): TrajectoryControll
   const stopPolling = () => { if (pollTimer !== undefined) { clearInterval(pollTimer); pollTimer = undefined; } };
   const clearTranscriptRequests = () => { for (const request of pendingTranscripts.values()) clearTimeout(request.timer); pendingTranscripts.clear(); };
   let viewers = 0;
-  const startPolling = () => { stopPolling(); pollTimer = setInterval(() => { void sendState().catch((error: unknown) => { if (!closing) console.error(`Trajectory state publish failed: ${errorText(error)}`); }); }, viewers > 0 ? ACTIVE_POLL_MS : IDLE_POLL_MS); pollTimer.unref(); };
+  // One report per run of failing publishes, through the session like the reconnect report; a publish that works ends the run.
+  let publishReported = false;
+  const startPolling = () => { stopPolling(); pollTimer = setInterval(() => { void sendState().then(() => { publishReported = false; }, (error: unknown) => { if (!closing && !publishReported) { publishReported = true; reportProblem(`Trajectory state publish failed: ${errorText(error)}`); } }); }, viewers > 0 ? ACTIVE_POLL_MS : IDLE_POLL_MS); pollTimer.unref(); };
   let stateLoad: { socket: TrajectoryPublisherClient; task: Promise<void> } | undefined;
   let lastState: string | undefined;
   const publisherValue = (input: TrajectoryPublisherInput): LiveStateRecord => ({ id: publisherId(input.cwd, input.sessionId), title: `session ${input.sessionId.slice(0, 8)}`, cwd: input.cwd, sessionId: input.sessionId, connected: true });
@@ -622,6 +624,8 @@ export function createTrajectoryController(agentDir: string): TrajectoryControll
           await publishConnectedState(activeSocket, input);
           return;
         } catch (error) {
+          // An attempt that fails after close() belongs to a session that is gone: its report would reach the console.
+          if (!isCurrent()) return;
           if (!reported) { reported = true; reportProblem(`Trajectory disconnected, retrying in the background: ${errorText(error)}`); }
           backoff = Math.min(RECONNECT_MAX_DELAY_MS, backoff * 2);
         }
