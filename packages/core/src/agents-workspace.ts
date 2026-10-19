@@ -1,7 +1,7 @@
 import type { KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import { getKeybindings, HStack, isKeyRelease, matchesKey, parseKey, ScrollView, Text, TUI_KEYBINDINGS, truncateToWidth, TuiAltScreen, visibleWidth, VStack, wrapTextWithAnsi, type Component, type Keybinding, type OverlayHandle, type OverlayOptions, type TuiInputListenerResult, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import type { ActionUi, AgentsAction, AgentsActionProvider, AgentsActionTarget } from "./agents-actions-contract.js";
-import type { AgentsWorkspaceExit, AgentsWorkspaceOptions, AgentsWorkspaceState, OpenAgentsWorkspace, SessionAgent, SessionTreeNode, TranscriptView } from "./agents-workspace-contract.js";
+import type { AgentsWorkspaceExit, AgentsWorkspaceOptions, AgentsWorkspaceState, OpenAgentsWorkspace, SessionAgent, SessionTreeNode, TranscriptPlace, TranscriptView } from "./agents-workspace-contract.js";
 import { formatCost, formatTokens } from "./background-widget.js";
 import { workflowKeyMatches } from "./host-navigator.js";
 import { navigateWorkflowPhaseTree, workflowPhaseTreeVisibleNodes, type WorkflowPhaseTree, type WorkflowPhaseTreeDirection, type WorkflowPhaseTreeNode } from "./host-phases.js";
@@ -112,6 +112,7 @@ class TranscriptScroll extends ScrollView {
   private laidContent = 0;
   private pendingFromEnd: number | undefined;
   private restoredAt: string | undefined;
+  private laidTop: number | undefined;
   private atStart = false;
   constructor(content: Component, private readonly laidOut: () => void) { super(content, { follow: "end", primary: true, scrollbar: "auto" }); }
   /** Rows added above the lines in view; applied at the next layout, once the content height counts them. */
@@ -119,7 +120,7 @@ class TranscriptScroll extends ScrollView {
   /** How many rows lie below the lines in view; 0 at the tail. */
   get fromEnd(): number { return this.isFollowingEnd ? 0 : Math.max(0, this.laidContent - this.viewportHeight - this.scrollTop); }
   /** Scrolls to `rows` above the tail once the content reaches that far (the transcript loads after it opens, the tail chunk first); until then it stays at the top so earlier chunks keep loading. */
-  restoreFromEnd(rows: number): void { if (rows > 0) { this.pendingFromEnd = rows; this.restoredAt = undefined; } }
+  restoreFromEnd(rows: number): void { if (rows > 0) { this.pendingFromEnd = rows; this.restoredAt = undefined; this.laidTop = undefined; } }
   /** The earliest record is loaded: a place above it is clamped to the top. */
   reachedStart(): void { this.atStart = true; }
   /** Nothing more will load above: a saved place beyond the laid-out content is dropped, the view stays clamped at the top. */
@@ -128,8 +129,10 @@ class TranscriptScroll extends ScrollView {
     if (this.laidContent > 0) this.pendingFromEnd = undefined;
   }
   /** The content was replaced: a saved place no longer applies. */
-  cancelRestore(): void { this.pendingFromEnd = undefined; this.restoredAt = undefined; }
+  cancelRestore(): void { this.pendingFromEnd = undefined; this.restoredAt = undefined; this.laidTop = undefined; }
   override updateLayout(contentHeight: number, viewportHeight: number, requestRender: () => void): void {
+    // A view that is not where the last layout left it was scrolled by the user: the saved place no longer applies.
+    if (this.pendingFromEnd !== undefined && this.laidTop !== undefined && this.scrollTop !== this.laidTop) this.cancelRestore();
     super.updateLayout(contentHeight, viewportHeight, requestRender);
     this.laidContent = contentHeight;
     const rows = this.kept;
@@ -141,17 +144,9 @@ class TranscriptScroll extends ScrollView {
       this.scrollTo(Math.max(0, target), { disableFollow: true });
       if (target >= 0 || this.atStart) this.pendingFromEnd = undefined;
     } else if (rows !== 0 && !this.isFollowingEnd) this.scrollTo(this.scrollTop + rows, { disableFollow: true });
+    this.laidTop = this.scrollTop;
     this.laidOut();
   }
-}
-
-/** Where a transcript was scrolled to when the workspace stepped aside: the agent's identity and the rows below the lines in view. */
-interface TranscriptPlace { readonly identity: string; readonly fromEnd: number }
-
-function transcriptPlace(state: AgentsWorkspaceState | undefined): TranscriptPlace | undefined {
-  if (!state || !("transcript" in state)) return undefined;
-  const place = state.transcript;
-  return typeof place === "object" && place !== null && "identity" in place && "fromEnd" in place && typeof place.identity === "string" && typeof place.fromEnd === "number" ? { identity: place.identity, fromEnd: place.fromEnd } : undefined;
 }
 
 /** A label of the menu with the provider that offered it. */
@@ -230,6 +225,8 @@ class Workspace {
   private shown: Shown | undefined;
   /** The view being opened: it takes the events a stream replays while it is subscribed, before `shown` holds it. */
   private opening: TranscriptView | undefined;
+  /** The failure of a live event replayed while the transcript being opened subscribes. */
+  private openFailure: string | undefined;
   /** The right pane of the selected node when it is not an agent, or an agent's on d; a new one for each selection. */
   private detailsScroll: ScrollView | undefined;
   private focus: "sidebar" | "transcript";
@@ -280,7 +277,7 @@ class Workspace {
     // A workspace that stepped aside for an action opens as it was; the sidebar still starts hidden below 80 columns.
     const state = options.state;
     this.restore = state;
-    this.place = transcriptPlace(state);
+    this.place = state?.transcript;
     for (const [key, expanded] of state?.expansion ?? []) this.expansion.set(key, expanded);
     this.wide = alt.terminal.columns >= SIDEBAR_MIN_COLUMNS;
     // A state's sidebar is the one the user wants (state()): hidden only when s hid it while it could show.
@@ -445,7 +442,7 @@ class Workspace {
   private state(): AgentsWorkspaceState {
     const shown = this.shown;
     const fromEnd = shown ? shown.scroll.fromEnd : 0;
-    const state: AgentsWorkspaceState & { readonly transcript?: TranscriptPlace } = {
+    const state: AgentsWorkspaceState = {
       selectedKey: this.selectedKey,
       row: Math.max(0, this.visible().findIndex((node) => node.key === this.selectedKey)),
       expansion: [...this.expansion],
@@ -490,11 +487,12 @@ class Workspace {
       const title = clean(node.title(this.styles)).toLowerCase();
       // A node that is not an agent has its state as the last word of its title; an agent matches by its name, its state by "state:".
       const words = title.split(" ");
+      // The Subagents group's state summarizes its children and is not matched itself.
       const state = (node.agent?.state ?? words.at(-1) ?? "").toLowerCase();
       const label = node.agent ? clean(node.agent.name) : clean(node.title(this.styles)).split(" ").slice(0, -1).join(" ");
       const id = (node.key.split(":").at(-1) ?? "").toLowerCase();
       const found = foldFind(label, text);
-      if (wantedState === undefined ? found !== undefined || id.includes(text) : state === wantedState) direct.add(node.key);
+      if (wantedState === undefined ? found !== undefined || id.includes(text) : node.kind !== "group" && state === wantedState) direct.add(node.key);
       if (wantedState === undefined && found !== undefined) byLabel.set(node.key, { label, ...found });
     }
     const shown = new Set(direct);
@@ -554,7 +552,7 @@ class Workspace {
     const node = next === undefined ? undefined : this.byKey.get(next);
     if (node) this.select(node);
   }
-  /** Up, down, left and right exactly as in /workflow: navigateWorkflowPhaseTree over the sidebar and its expansion. */
+  /** Up, down, left and right as in /workflow: navigateWorkflowPhaseTree over the sidebar and its expansion; under a filter, over the nodes it keeps. */
   private navigate(direction: WorkflowPhaseTreeDirection): void {
     if (this.nodes.length === 0) return;
     if (this.filterActive() && (direction === "left" || direction === "right")) { this.navigateShown(direction); return; }
@@ -567,7 +565,7 @@ class Workspace {
     const node = next.nodeId === undefined ? undefined : this.byKey.get(next.nodeId);
     if (node && node.key !== this.selectedKey) this.select(node);
   }
-  /** [ and ]: the agent (n and N: the node that needs a person) before or after the selected node in sidebar order, hidden ones included, round at both ends; its ancestors are expanded. */
+  /** [ and ]: the agent (n and N: the node that needs a person) before or after the selected node in sidebar order, collapsed ones included and under a filter only the nodes it keeps, round at both ends; its ancestors are expanded. */
   private jump(delta: number, wanted: (node: SessionTreeNode) => boolean = (node) => node.agent !== undefined): void {
     const index = this.nodes.findIndex((node) => node.key === this.selectedKey);
     this.following = false;
@@ -843,8 +841,9 @@ class Workspace {
       view = this.options.createView({ ui: this.alt, cwd: agent.cwd });
       view.setExpanded(this.expanded);
       this.opening = view;
+      this.openFailure = undefined;
       try { unsubscribe = this.subscribe(agent, view); } finally { this.opening = undefined; }
-      const shown: Shown = { ...base, source, view, unsubscribe, scroll: new TranscriptScroll(view.component, () => { this.laidOut(); }) };
+      const shown: Shown = { ...base, failure: this.openFailure, source, view, unsubscribe, scroll: new TranscriptScroll(view.component, () => { this.laidOut(); }) };
       const place = this.place;
       this.place = undefined;
       if (place?.identity === shown.identity) shown.scroll.restoreFromEnd(place.fromEnd);
@@ -860,7 +859,12 @@ class Workspace {
   private subscribe(agent: SessionAgent, view: TranscriptView): (() => void) | undefined {
     // The listener runs in the agent session's event emitter: a throw from the view must stay here.
     return agent.live?.subscribe((event) => {
-      if (this.shown?.view === view || this.opening === view) this.guard(() => { view.live(event); this.alt.requestRender(); });
+      const forward = (): void => { view.live(event); this.alt.requestRender(); };
+      if (this.shown?.view === view) this.guard(forward);
+      // The transcript being opened is not shown yet: its failure is its own status line, not the previous transcript's.
+      else if (this.opening === view) {
+        try { forward(); } catch (error) { this.openFailure = `transcript failed: ${errorText(error)}`; }
+      }
     });
   }
   /** Every step runs even when an earlier one throws: a view that fails to dispose still lets the source close. */
@@ -880,6 +884,7 @@ class Workspace {
   private failed(shown: Shown, error: unknown): void {
     if (this.shown !== shown) return;
     shown.failure = `transcript read failed: ${errorText(error)}`;
+    shown.earlierFailure = undefined;
     this.alt.requestRender();
   }
   /** Runs work done after a result, a key or a live event; a throw ends as a status line, never as an uncaught exception or unhandled rejection. */

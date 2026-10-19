@@ -297,10 +297,10 @@ void test("a stream that replays synchronously while the view subscribes reaches
   await leave(harness);
 });
 
-void test("the failure of the earlier history stays in the status line through the next polls, until the user leaves the top or a read fails", async (t) => {
+void test("the failure of the earlier history stays in the status line through the next polls, until the user leaves the top or a read fails, and stays cleared after that", async (t) => {
   timers(t);
   const harness = await open([agent("alpha")], { columns: 70, setup: (source) => {
-    source.polls.push(polled(entries(1000, 40)), polled([]), polled([]), new Error("permission denied"));
+    source.polls.push(polled(entries(1000, 40)), polled([]), polled([]), new Error("permission denied"), polled([]));
     source.failEarlier = new Error("disk read failed");
   } });
   harness.screen();
@@ -314,6 +314,8 @@ void test("the failure of the earlier history stays in the status line through t
   assert.ok(harness.screen().some((line) => line.includes("transcript read failed: disk read failed")), "and so does the next");
   await advance(t);
   assert.ok(harness.screen().some((line) => line.includes("transcript read failed: permission denied")), "a failed poll replaces it");
+  await advance(t);
+  assert.ok(!harness.screen().some((line) => line.includes("disk read failed") || line.includes("permission denied")), "the next successful poll does not bring the earlier failure back");
   await leave(harness);
 });
 
@@ -1946,7 +1948,7 @@ async function savedPlace(): Promise<{ provider: FakeProvider; nodes: ReturnType
   return { provider, nodes, state: first.exit.state, top };
 }
 
-void test("a pending restore is applied once: PageDown while the earlier chunk is held stays, and the place returns when it arrives", async (t) => {
+void test("a pending restore is applied once: PageDown while the earlier chunk is held stays, and the place is not applied again when it arrives", async (t) => {
   timers(t);
   const saved = await savedPlace();
   let release: () => void = () => undefined;
@@ -1969,7 +1971,8 @@ void test("a pending restore is applied once: PageDown while the earlier chunk i
   release();
   for (let round = 0; round < 4; round += 1) { second.screen(); await settle(); }
   second.screen();
-  assert.equal(second.alt().viewportTop, saved.top, "the place is restored once the chunk arrives");
+  assert.notEqual(second.alt().viewportTop, saved.top, "the user scrolled: the saved place is not applied again");
+  assert.ok(second.alt().viewportTop >= paged, "the lines the user chose stay in view");
   await leave(second);
 });
 
@@ -2665,6 +2668,7 @@ void test("a state: match keeps its line", async (t) => {
   const scout = markedRows(harness).find((line) => line.includes("scout")) ?? "";
   assert.doesNotMatch(scout, /<dim:/);
   assert.doesNotMatch(scout, /<bold:(?:state|failed|scout)>/);
+  assert.doesNotMatch(scout, /<accent:/, "no accent emphasis");
   await leave(harness);
   const byId = await open([agent("id77", { name: "delta" })], { theme: MARKED });
   byId.send("/", "i", "d", "7", "7");
@@ -2796,10 +2800,48 @@ void test("a refresh that takes the selected node out of the filter moves the se
 void test("a filter of only spaces filters nothing and esc leaves the workspace", async (t) => {
   timers(t);
   const harness = await open(FILTERED(), { initialKey: "alpha" });
+  const rows = sidebarRows(harness);
   harness.send("/", " ", KEY.enter);
+  assert.deepEqual(sidebarRows(harness), rows, "every row stays");
+  assert.doesNotMatch(titleRow(harness), /match/, "no match count");
   harness.send(KEY.escape);
   await harness.done;
   assert.equal(harness.left, true);
+});
+
+void test("n and N under a filter visit only the shown nodes", async (t) => {
+  timers(t);
+  const nodes = needing(nodesOf(FILTERED()), { alpha: "failed", beta: "failed", gamma: "failed", scout: "failed" });
+  const harness = await open([], { nodes, initialKey: "alpha" });
+  harness.send("/", paste("state:failed"), KEY.enter);
+  harness.send("n");
+  assert.match(title(harness), /^#2\/4 beta/);
+  harness.send("n");
+  assert.match(title(harness), /^#4\/4 scout/, "gamma is skipped");
+  harness.send("N");
+  assert.match(title(harness), /^#2\/4 beta/);
+  await leave(harness);
+});
+
+void test("state: does not match the Subagents group, whose state summarizes its children", async (t) => {
+  timers(t);
+  const nodes = tree([{ key: "subagents", kind: "group", label: "Subagents", state: "failed" }, { key: "scout", parent: "subagents", agent: agent("scout", { state: "failed", running: false }) }]);
+  const harness = await open([], { nodes, initialKey: "scout" });
+  harness.send("/", paste("state:failed"), KEY.enter);
+  assert.match(titleRow(harness), / 1 match\b/);
+  await leave(harness);
+});
+
+void test("a live event replayed while an agent opens fails on that agent, not on the workspace", async (t) => {
+  timers(t);
+  const live = new FakeLive();
+  live.replay.push({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "x" } });
+  const harness = await open([agent("alpha"), agent("beta", { live })], { failLive: "beta" });
+  harness.send(KEY.down);
+  const screen = harness.screen();
+  assert.doesNotMatch(titleRow(harness), /agents workspace failed/);
+  assert.ok(screen.some((line) => line.includes("transcript failed: live failed")), "the opened transcript's status line holds the failure");
+  await leave(harness);
 });
 
 void test("follow only picks among the shown nodes of a filter", async (t) => {

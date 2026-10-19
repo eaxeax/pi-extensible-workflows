@@ -161,7 +161,12 @@ export interface AgentsWorkspaceState {
   readonly following?: boolean;
   /** `/`: the sidebar filter text, when one is set. */
   readonly filter?: string;
+  /** Where the shown transcript was scrolled to, when it was not at its tail: the agent's identity and the rows below the lines in view. */
+  readonly transcript?: TranscriptPlace;
 }
+
+/** Where a transcript was scrolled to when the workspace stepped aside. */
+export interface TranscriptPlace { readonly identity: string; readonly fromEnd: number }
 
 /** The workspace left for an action that needs Pi's dialogs: the caller runs it with Pi's UI and opens the workspace again with `state`. */
 export interface AgentsWorkspaceExit {

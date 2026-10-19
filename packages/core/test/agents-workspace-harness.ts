@@ -348,6 +348,7 @@ export interface OpenOptions {
   listGate?: Promise<void>;
   failView?: string;
   failRender?: string;
+  failLive?: string;
   setup?: (source: FakeSource) => void;
   nodes?: SessionTreeNode[];
   source?: SessionAgentsSource;
@@ -395,6 +396,7 @@ export async function open(agents: Listed[], options: OpenOptions = {}): Promise
       if (key === options.failView) throw new Error("no view");
       const view = new FakeView(key, viewUi, cwd, options.wrap);
       if (key === options.failRender) view.fail.render = new Error("render failed");
+      if (key === options.failLive) view.fail.live = new Error("live failed");
       harness.views.push(view);
       return view;
     },
