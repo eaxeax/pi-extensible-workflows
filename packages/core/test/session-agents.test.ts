@@ -185,6 +185,8 @@ void test("a run with phases, a shell and parallel scopes gives the /workflow tr
   ], { phase: "review", phaseHistory: [{ phase: "plan", afterAgent: 0 }, { phase: "review", afterAgent: 1 }] }, launch);
   // The live view of the run brings the shell running in the review phase.
   const overlayRun = (run: PersistedRun): PersistedRun => ({ ...run, activeShellsByPhase: [{ phaseIndex: 1, active: 2, startedAt: now - 3000 }] });
+  // A running run's header shows its runtime once it has run a second: a creation time ahead of the clock keeps "1s" out under load.
+  setCreatedAt(new RunStore(cwd, "session", "run", home), new Date(now + 3_600_000).toISOString());
   const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home, { overlayRun })).list();
   const review = "run:run:node:phase/review%231";
   assert.deepEqual(nodes.map(({ key, parentKey, depth, kind, initiallyExpanded }) => [key, parentKey, depth, kind, initiallyExpanded]), [
@@ -315,6 +317,7 @@ void test("labels, phase names and operation scopes are display text", async () 
   const { home, cwd } = fixture();
   const launch = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "agents" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, phases: ["re\u001b[31mview"], schemas: [] });
   await createRun(home, cwd, "session", "run", "flow\u0007", "running", [agent("api", "api", "running", [attempt(1, "api-1")], { structuralPath: ["p\u001b]0;title\u0007"] })], { phaseHistory: [{ phase: "re\u001b[31mview", afterAgent: 0 }] }, launch);
+  setCreatedAt(new RunStore(cwd, "session", "run", home), new Date(Date.now() + 3_600_000).toISOString());
   const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home)).list();
   const lines = nodes.map((node) => node.line(PLAIN, false, true));
   assert.deepEqual(lines, ["  ▾ flow  run  ⠦ 0/1", "    ▾ review · ⠦", "      ▾ p · ⠦", "        • api · ⠦"]);

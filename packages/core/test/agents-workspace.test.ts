@@ -1202,6 +1202,9 @@ void test("a run's sidebar rows are its /workflow tree rows, its nodes show the 
     record("ui", "completed", { structuralPath: ["p", "b"], startedAt: now - 25_000, durationMs: 10_000 }),
   ] }, launch);
   const overlayRun = (run: PersistedRun): PersistedRun => ({ ...run, activeShellsByPhase: [{ phaseIndex: 1, active: 2, startedAt: now - 3000 }] });
+  // A running run's header shows its runtime once it has run a second: a creation time ahead of the clock keeps "1s" out under load.
+  const summaryPath = join(store.directory, "summary.json");
+  writeFileSync(summaryPath, JSON.stringify({ ...JSON.parse(readFileSync(summaryPath, "utf8")) as object, createdAt: new Date(now + 3_600_000).toISOString() }));
   const context = { cwd, sessionManager: { getSessionId: () => "session" } } as unknown as ExtensionCommandContext;
   const source = createSessionAgentsSource(context, { home, overlayRun, liveAgent: () => undefined, subagents: () => undefined });
   const loaded = await store.load();
