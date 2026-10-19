@@ -773,7 +773,8 @@ export class RunStore {
    * that cannot be read or resolved drops only itself.
    */
   async recordedWorktrees(): Promise<readonly WorktreeReference[]> {
-    const records = await this.#loadWorktreeRecords();
+    // Unreadable records lose the owned rows only: borrowed bindings resolve from their source runs.
+    const records = await this.#loadWorktreeRecords().catch((): WorktreeReference[] => []);
     // Unreadable bindings: no named record can be told apart from a borrowed one, so none is listed.
     let unreadable = false;
     const bindings = await this.borrowedWorktreeRecords().catch((): readonly BorrowedWorktreeBinding[] => { unreadable = true; return []; });

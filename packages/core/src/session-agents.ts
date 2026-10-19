@@ -14,6 +14,7 @@ import { agentActivityLabel, formatWorkflowNodeDetails, formatWorkflowRuntime, f
 import { sameFilesystemPath } from "./paths.js";
 import { listRunIds, RunStore, type PersistedRun, type WorktreeReference } from "./persistence.js";
 import { isHardTerminalRunState, SETTLED_AGENT_STATES, type AgentAccounting, type AgentAttemptError, type AgentAttemptSummary, type AgentRecord, type LaunchSnapshot, type ModelSpec, type WorkflowAgentSession } from "./types.js";
+import { budgetUsage } from "./budget.js";
 import { errorText, isObject, sanitizeDisplayText } from "./utils.js";
 
 export interface SessionAgentsDependencies {
@@ -106,7 +107,7 @@ function subagentsCounts(statuses: readonly SubagentStatus[]): string {
 function runSummary(run: PersistedRun, styles: WorkflowProgressStyles): string {
   const done = run.agents.filter((agent) => SETTLED_AGENT_STATES.has(agent.state)).length;
   const cost = formatCost(run.agents.reduce((sum, agent) => sum + (agent.accounting?.cost ?? 0), 0));
-  return [progressStyleForState(run.state, styles)(runStateGlyph(run.state, "⠦")), `${String(done)}/${String(run.agents.length)}`, cost, run.usage ? formatWorkflowRuntime(run.usage.durationMs) : ""].filter(Boolean).join(" ");
+  return [progressStyleForState(run.state, styles)(runStateGlyph(run.state, "⠦")), `${String(done)}/${String(run.agents.length)}`, cost, run.usage && (run.state !== "running" || run.usage.durationMs >= 1000) ? formatWorkflowRuntime(run.usage.durationMs) : ""].filter(Boolean).join(" ");
 }
 /** The row of a run root or the group: arrow and ▾/▸ in the columns of a depth-0 /workflow row, the bold label, two spaces, the summary. */
 function headerLine(label: string, summary: string, selected: boolean, expanded: boolean, expandable: boolean, styles: WorkflowProgressStyles): string {
@@ -260,14 +261,21 @@ export function createSessionAgentsSource(context: ExtensionCommandContext, deps
       try {
         const { run, snapshot } = await store.load();
         // As the /workflow picker: a settled run sorts by the time it settled.
-        const terminalAt = (await store.loadSummary().catch(() => undefined))?.terminalAt;
+        const summary = await store.loadSummary().catch(() => undefined);
+        const terminalAt = summary?.terminalAt;
         const parsed = terminalAt === undefined ? Number.NaN : Date.parse(terminalAt);
         const resolvedAt = Number.isFinite(parsed) ? parsed : undefined;
         const waitingFor = run.state === "awaiting_input" ? (await store.awaitingCheckpoints().catch(() => []))[0]?.name : undefined;
         const worktrees = await store.recordedWorktrees().catch(() => []);
         const entry = { loaded: { run, snapshot, waitingFor, worktrees }, resolvedAt };
         if (isHardTerminalRunState(run.state) && await summaryIsFresh(store.directory)) settled.set(runId, { ...entry, stamp });
-        return { loaded: { ...entry.loaded, run: deps.overlayRun(run) }, resolvedAt };
+        const overlaid = deps.overlayRun(run);
+        // A running run records its runtime only when it settles: show the time since it was created.
+        const created = summary === undefined ? Number.NaN : Date.parse(summary.createdAt);
+        const shown = overlaid.state === "running" && Number.isFinite(created)
+          ? { ...overlaid, usage: { ...budgetUsage(overlaid.usage), durationMs: Math.max(overlaid.usage?.durationMs ?? 0, now - created) } }
+          : overlaid;
+        return { loaded: { ...entry.loaded, run: shown }, resolvedAt };
       } catch { return undefined; }
     }));
     return navigatorAttentionSort(loaded.filter((entry) => entry !== undefined)).flatMap(({ loaded: { run, snapshot, waitingFor, worktrees } }) => runNodes(run, snapshot, waitingFor, worktrees, now, cache));

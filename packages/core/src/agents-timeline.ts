@@ -71,7 +71,7 @@ export function formatAgentsTimeline(entries: readonly AgentsTimelineEntry[], no
   const room = width - groupColumn - barsTail - 1 - MIN_BAR - 1;
   const withBars = room >= Math.min(labelWidth, MIN_LABEL);
   // A row without a start says so: "queued" only for a queued entry, "not started" for any other state (a cancelled pending agent).
-  const unstarted = (state: string): string => state === "queued" ? "queued" : "not started";
+  const unstarted = (state: string): string => state === "queued" ? "○ queued" : "not started";
   // Without bars that word takes the duration slot.
   if (!withBars) for (const row of rows) if (row.started === undefined) row.duration = unstarted(row.state);
   const durationWidth = Math.max(0, ...rows.map((row) => visibleWidth(row.duration)));
@@ -79,11 +79,12 @@ export function formatAgentsTimeline(entries: readonly AgentsTimelineEntry[], no
   const label = withBars ? Math.min(labelWidth, room) : Math.max(0, Math.min(labelWidth, width - groupColumn - tail - 1));
   const barWidth = width - groupColumn - label - 1 - tail - 1;
   return [header, ...rows.map((row) => {
-    const paint = progressStyleForState(row.state, styles);
+    // A stopped agent's glyph is ✗: the dashboards draw a stopped run in the error style.
+    const paint = row.state === "stopped" ? (text: string) => styles.error(text) : progressStyleForState(row.state, styles);
     const queued = row.state === "queued" && (row.started === undefined || row.end === undefined);
     const middle = withBars ? ` ${row.started === undefined || row.end === undefined ? pad(paint(queued ? "○ queued" : unstarted(row.state)), barWidth) : paint(bar(row.started - origin, row.end - origin, span, barWidth))}` : "";
     const head = `${groupColumn ? `${styles.dim(pad(row.group, groupWidth))} ` : ""}${pad(row.label, label)}${middle}`;
-    const end = ` ${styles.dim(row.duration.padStart(durationWidth))} ${queued && withBars ? " " : paint(glyph(row.state))}`;
+    const end = ` ${styles.dim(row.duration.padStart(durationWidth))} ${queued ? " " : paint(glyph(row.state))}`;
     // The label and bar give way first: the duration and glyph are cut only when they alone exceed the width.
     return truncateToWidth(`${pad(head, Math.max(0, width - visibleWidth(end)))}${end}`, width, "");
   })];

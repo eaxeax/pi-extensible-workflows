@@ -55,6 +55,13 @@ function setTerminalAt(store: RunStore, terminalAt: string): void {
   assert.ok(typeof summary === "object" && summary !== null);
   writeFileSync(path, JSON.stringify({ ...summary, terminalAt }));
 }
+/** Sets the creation time recorded in the run's summary.json. */
+function setCreatedAt(store: RunStore, createdAt: string): void {
+  const path = join(store.directory, "summary.json");
+  const summary: unknown = JSON.parse(readFileSync(path, "utf8"));
+  assert.ok(typeof summary === "object" && summary !== null);
+  writeFileSync(path, JSON.stringify({ ...summary, createdAt }));
+}
 function liveSession(sessionId: string, transport = "local"): WorkflowAgentSession {
   return {
     reference: { transport, sessionId },
@@ -242,12 +249,12 @@ void test("a run's root row is a header: name, short id, styled state glyph, don
   const completed = "bbbbbbbb-2222-4222-8222-222222222222";
   const interrupted = "cccccccc-3333-4333-8333-333333333333";
   const cost = (value: number): Partial<AgentRecord> => ({ accounting: { ...ZERO, cost: value } });
-  await createRun(home, cwd, "session", running, "alpha", "running", [
+  setCreatedAt(await createRun(home, cwd, "session", running, "alpha", "running", [
     agent("a", "a", "completed", [attempt(1, "a-1")], cost(0.5)),
     agent("b", "b", "running", [attempt(1, "b-1")], cost(0.25)),
     agent("c", "c", "failed", [attempt(1, "c-1")]),
     agent("d", "d", "queued", []),
-  ]);
+  ]), new Date(Date.now() - 7_200_000).toISOString());
   setTerminalAt(await createRun(home, cwd, "session", completed, "beta\u001b[31m", "completed", [agent("e", "e", "completed", [attempt(1, "e-1")])], { usage: { tokens: 0, costUsd: 0, durationMs: 65_000, agentLaunches: 1 } }), "2026-06-01T00:00:00.000Z");
   await createRun(home, cwd, "session", interrupted, "gamma", "interrupted", [agent("f", "f", "cancelled", [attempt(1, "f-1")], cost(0.004))], { usage: { tokens: 0, costUsd: 0, durationMs: 3000, agentLaunches: 1 } });
   const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home)).list();
@@ -257,8 +264,8 @@ void test("a run's root row is a header: name, short id, styled state glyph, don
     return node;
   };
   // The ▾/▸ icon in the column of a depth-0 row; the label bold, the glyph in the run state's style.
-  assert.equal(root(running).line(TAGGED, true, true), "→ ▾ <bold>alpha aaaaaaaa</bold>  <accent>⠦</accent> 2/4 $0.75");
-  assert.equal(root(running).line(PLAIN, false, false), "  ▸ alpha aaaaaaaa  ⠦ 2/4 $0.75");
+  assert.equal(root(running).line(TAGGED, true, true), "→ ▾ <bold>alpha aaaaaaaa</bold>  <accent>⠦</accent> 2/4 $0.75 2h");
+  assert.equal(root(running).line(PLAIN, false, false), "  ▸ alpha aaaaaaaa  ⠦ 2/4 $0.75 2h");
   assert.equal(root(completed).line(TAGGED, false, false), "  ▸ <bold>beta bbbbbbbb</bold>  <success>✓</success> 1/1 1m 5s", "no cost without one; the runtime of the run's usage; the name as display text");
   assert.equal(root(interrupted).line(TAGGED, false, true), "  ▾ <bold>gamma cccccccc</bold>  <warning>↯</warning> 1/1 $0.004 3s");
   // A run that is not in a hard terminal state starts expanded; a finished one collapsed.
@@ -1086,4 +1093,23 @@ void test("a borrowed worktree binding that cannot be resolved loses only its ow
   assert.equal(branchRow("run:run-child:own"), true);
   assert.equal(branchRow("run:run-child:borrowed"), true);
   assert.equal(branchRow("run:run-child:broken"), false);
+});
+
+void test("a malformed worktrees.json loses the run's own worktree rows but keeps its borrowed ones", async () => {
+  const { home, cwd } = fixture();
+  gitRepo(cwd);
+  const banana = "worktree/named/banana";
+  const source = await createRun(home, cwd, "session", "run-src", "wf", "completed", []);
+  await source.worktree(banana);
+  const store = await createRun(home, cwd, "session", "run-child", "wf", "completed", [
+    agent("own", "own", "completed", [attempt(1, "own-1")], { worktreeOwner: "owner" }),
+    agent("borrowed", "borrowed", "completed", [attempt(1, "b-1")], { worktreeOwner: banana }),
+  ], { parentRunId: "run-src" });
+  await store.worktree("owner");
+  await store.worktree(banana);
+  writeFileSync(join(store.directory, "worktrees.json"), "{not json");
+  const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home)).list();
+  const branchRow = (key: string): boolean => nodes.find((node) => node.key === key)?.details(PLAIN, Date.now()).some((line) => line.startsWith("branch:")) ?? false;
+  assert.equal(branchRow("run:run-child:borrowed"), true);
+  assert.equal(branchRow("run:run-child:own"), false);
 });

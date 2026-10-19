@@ -98,7 +98,7 @@ void test("waiting and retrying entries grow with now", () => {
 
 void test("a queued row stays readable when the bars are dropped", () => {
   const rows = formatAgentsTimeline([{ label: "delta", state: "queued" }, { label: "alpha", startedAt: 0, endedAt: 10, state: "completed" }], 10, 20, PLAIN);
-  assert.match(rows[1] ?? "", /queued/);
+  assert.match((rows[1] ?? "").trimEnd(), /○ queued$/);
   assert.ok(rows.every((row) => row.length <= 20));
 });
 
@@ -112,5 +112,15 @@ void test("an entry that never started reads as queued only when it is queued", 
       assert.match(row, /✗$/, `${String(width)}: ${row}`);
       assert.ok(visibleWidth(row) <= width, `${String(width)}: ${row}`);
     }
+  }
+});
+
+void test("a stopped entry is drawn in the error style of a stopped run", () => {
+  const tagged = { ...PLAIN, error: (text: string) => `<error>${text}</error>`, muted: (text: string) => `<muted>${text}</muted>` };
+  for (const width of [120, 70, 40]) {
+    const rows = formatAgentsTimeline([{ label: "alpha", startedAt: 0, endedAt: 10_000, state: "stopped" }], 10_000, width, tagged);
+    assert.match(rows[1] ?? "", /<error>✗<\/error>/, `${String(width)}: ${rows[1] ?? ""}`);
+    assert.doesNotMatch(rows[1] ?? "", /<muted>/);
+    assert.ok(visibleWidth(rows[1] ?? "") <= width);
   }
 });

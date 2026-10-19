@@ -1,4 +1,3 @@
-import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -6,7 +5,7 @@ import type { ActionUi, AgentsAction, AgentsActionProvider, AgentsActionTarget }
 import { failureDiagnosticsFrom, formatWorkflowFailureDelivery, formatWorkflowFailureDeliveryFallback } from "./host-delivery.js";
 import type { WorkflowNavigatorDependencies } from "./host-navigator.js";
 import { agentActionLabels, visibleAgentAttemptActions as visibleRegisteredAgentAttemptActions } from "./host-view.js";
-import { worktreeDiff } from "./agent-worktree.js";
+import { exists, worktreeDiff, worktreeHasUntracked } from "./agent-worktree.js";
 import { listRunIds, RunStore, type AwaitingCheckpoint, type PersistedRun, type WorktreeReference } from "./persistence.js";
 import { runDependencyIds } from "./retention.js";
 import type { AgentAttemptAction, AgentAttemptActionContext, AgentAttemptActionUi, AgentAttemptSummary, AgentRecord, JsonValue, LaunchSnapshot } from "./types.js";
@@ -206,7 +205,7 @@ export function agentActionOptions(deps: WorkflowActionDependencies, ctx: Extens
     openResult: ctx.mode === "tui" && view.agentResults.has(agent.id),
   });
   const at = labels.indexOf("Copy worktree path");
-  if (ctx.mode === "tui" && worktree && at >= 0 && existsSync(worktree.path)) labels.splice(at + 1, 0, "Open diff in editor");
+  if (ctx.mode === "tui" && worktree && at >= 0) labels.splice(at + 1, 0, "Open diff in editor");
   return labels;
 }
 /** Runs one of the agent's labels other than Back; a label it does not know does nothing. */
@@ -220,11 +219,11 @@ export async function runAgentAction(deps: WorkflowActionDependencies, ui: Actio
     return;
   }
   if (label === "Open diff in editor" && worktree) {
-    if (!existsSync(worktree.path)) { ui.notify("The worktree was removed.", "warning"); return; }
+    if (!await exists(worktree.path)) { ui.notify("The worktree was removed.", "warning"); return; }
     let diff: string;
     try { diff = await worktreeDiff(worktree); }
     catch (error) { ui.notify(`Cannot read the worktree diff: ${errorText(error)}`, "warning"); return; }
-    if (diff.trim() === "") ui.notify("No changes since the worktree was created.", "info");
+    if (diff.trim() === "") ui.notify(await worktreeHasUntracked(worktree).catch(() => false) ? "No tracked changes since the worktree was created; untracked files are not in the diff." : "No changes since the worktree was created.", "info");
     else await ui.openArtifact({ extension: ".diff", content: diff }, "worktree diff");
     return;
   }
@@ -482,7 +481,9 @@ export function createWorkflowActionProvider(deps: WorkflowActionDependencies, c
       const view = await loadView(target.runId);
       const agent = view?.run.agents.find((candidate) => candidate.id === target.agentId);
       if (!view || !agent) return undefined;
-      return { labels: agentActionOptions(deps, ctx, view, agent).filter((label) => label !== "Back"), perform: (label, ui) => runAgentAction(deps, ui, view, agent, label) };
+      const worktree = agentWorktree(view, agent);
+      const removed = worktree !== undefined && !await exists(worktree.path);
+      return { labels: agentActionOptions(deps, ctx, view, agent).filter((label) => label !== "Back" && !(removed && label === "Open diff in editor")), perform: (label, ui) => runAgentAction(deps, ui, view, agent, label) };
     }
     return undefined;
   };

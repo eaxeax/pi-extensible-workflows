@@ -17,7 +17,7 @@ function git(path: string, args: readonly string[]): Promise<string> {
     });
   });
 }
-async function exists(path: string): Promise<boolean> { return stat(path).then(() => true, () => false); }
+export async function exists(path: string): Promise<boolean> { return stat(path).then(() => true, () => false); }
 
 /** The worktree's change summary since its base; a path that no longer exists is `removed`, a failing git is `error`. */
 export async function worktreeChanges(reference: Pick<WorktreeReference, "path" | "base">): Promise<WorktreeChanges> {
@@ -31,4 +31,9 @@ export async function worktreeChanges(reference: Pick<WorktreeReference, "path" 
 /** The full `git diff` of the worktree against its base. */
 export function worktreeDiff(reference: Pick<WorktreeReference, "path" | "base">): Promise<string> {
   return git(reference.path, ["diff", reference.base, "--"]);
+}
+
+/** Whether the worktree holds files git does not track and does not ignore; `git diff` leaves them out. */
+export async function worktreeHasUntracked(reference: Pick<WorktreeReference, "path">): Promise<boolean> {
+  return (await git(reference.path, ["ls-files", "--others", "--exclude-standard"])).trim() !== "";
 }

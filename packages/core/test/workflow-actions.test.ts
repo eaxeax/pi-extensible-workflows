@@ -528,6 +528,16 @@ void test("Open diff in editor opens the worktree's diff as a .diff artifact, or
   assert.equal(labels(await provider.actions(target)).includes("Open diff in editor"), false);
 });
 
+void test("Open diff in editor says untracked files are not in the diff when the worktree holds only those", async () => {
+  const { f, path } = await agentFixture();
+  const provider = createWorkflowActionProvider(f.deps, f.ctx("tui"));
+  const ui = recordingUi();
+  writeFileSync(join(path, "fresh.txt"), "new\n");
+  await provider.run({ kind: "workflow-agent", runId: "agents", agentId: "agent-1" }, "Open diff in editor", ui);
+  assert.equal(ui.opened.length, 0);
+  assert.deepEqual(notices(ui), ["No tracked changes since the worktree was created; untracked files are not in the diff."]);
+});
+
 void test("Open diff in editor on a menu built earlier says when the worktree was removed or its diff cannot be read", async () => {
   const { f, store, path } = await agentFixture();
   const view = await loadWorkflowRunView(f.deps, f.ctx("tui"), store);
