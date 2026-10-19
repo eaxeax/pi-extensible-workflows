@@ -19,8 +19,19 @@ export class ForegroundDeliveryController {
   readonly pendingFailureDiagnostics = new Map<string, PendingFailureDiagnostic>();
   readonly foregroundResumeClaims = new WeakSet<RunStore>();
   readonly terminalDeliveryLanes = new WeakMap<RunStore, SerialLane>();
+  /** Terminal deliveries still running; session shutdown waits for them before the session's files may go. */
+  readonly #pendingDeliveries = new Set<Promise<unknown>>();
 
   constructor(private readonly options: ForegroundDeliveryControllerOptions) {}
+  /** Records a terminal delivery chain started for a settling run. A rejection still surfaces as an unhandled one, as before. */
+  trackDelivery = (delivery: Promise<unknown>): void => {
+    const tracked: Promise<unknown> = delivery.finally(() => { this.#pendingDeliveries.delete(tracked); });
+    this.#pendingDeliveries.add(tracked);
+  };
+  /** Resolves once every tracked delivery has settled, also those tracked while waiting. */
+  deliveriesSettled = async (): Promise<void> => {
+    while (this.#pendingDeliveries.size > 0) await Promise.allSettled([...this.#pendingDeliveries]);
+  };
   claimForegroundDelivery = async (store: RunStore, toolCallId: string): Promise<"claimed" | "delivered" | "detached"> => {
     let claim: "claimed" | "delivered" | "detached" = "detached";
     await store.updateState((current) => {

@@ -580,8 +580,17 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
   function finish() { settled = true; clearInterval(watchdog); signal?.removeEventListener("abort", cancel); killChild(); rmSync(childDir, { recursive: true, force: true }); }
   function stop(code: WorkflowErrorCode, message: string) { if (settled) return; controller.abort(); finish(); rejectResult(new WorkflowError(code, message)); }
   function branded(result: Record<string, JsonValue>): JsonValue { return { ...result, [WORK_RESULT_BRAND]: true }; }
+  // A phase update and the work the script starts after it arrive as separate RPCs handled concurrently. While a phase update
+  // is pending, later RPCs wait for it (not for each other), so work started after an unawaited phase(name) is recorded in that
+  // phase; with none pending they are dispatched at once, as before.
+  let phasePending: Promise<void> | undefined;
   async function handleRpc(id: number, method: string, values: JsonValue[]) {
     try {
+      if (method !== "phase" && phasePending) {
+        await phasePending;
+        // The run ended while this call waited: its worker is gone, there is nothing to answer.
+        if (controller.signal.aborted) return;
+      }
       encoded(values);
       let value: JsonValue = null;
       if (method === "agent") {
@@ -643,7 +652,12 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         value = await bridge.worktree(values[0], controller.signal);
       } else if (method === "phase") {
         if (typeof values[0] !== "string") fail("INTERNAL_ERROR", "phase name must be a string");
-        await bridge.phase?.(values[0]);
+        const name = values[0];
+        const update = (phasePending ?? Promise.resolve()).then(() => bridge.phase?.(name));
+        const settled = update.then(() => undefined, () => undefined);
+        phasePending = settled;
+        void settled.then(() => { if (phasePending === settled) phasePending = undefined; });
+        await update;
       } else if (method === "log") {
         if (typeof values[0] !== "string") fail("INTERNAL_ERROR", "log message must be a string");
         await bridge.log?.(values[0]);

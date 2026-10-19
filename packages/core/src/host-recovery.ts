@@ -41,6 +41,7 @@ export type WorkflowRecoveryDependencies = {
   cleanupTerminalRun: (runId: string) => Promise<void>;
   deliver: (content: string) => void;
   deliverTerminal: (store: RunStore, content: string | (() => string | Promise<string>), failure?: boolean) => Promise<void>;
+  trackDelivery: (delivery: Promise<unknown>) => void;
   workflowToolUpdate: (run: PersistedRun) => WorkflowToolUpdate;
   registry: WorkflowRegistryApi;
   modelSpec: (value: string, fallback: ModelSpec) => ModelSpec;
@@ -70,7 +71,7 @@ function assertExpectedWorkflowState(expectedState: string | undefined, actualSt
 export function persistedFailure(run: PersistedRun, error: WorkflowError): PersistedRun { const failedAt = workflowFailedAt(error); return { ...run, error: { code: error.code, message: error.message, ...(failedAt ? { failedAt } : {}) }, ...(failedAt ? { failedAt } : {}) }; }
 
 export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
-  const { pi, home, runs, scheduler, eventPublisher, persistRunState, projectTrusted, resumeHostContext, ensureSessionLease, createAgentExecutor, activeSnapshotTools, frozenResourcePolicy, resolveLaunchPrologue, workflowAgentHandler, shellForRun, toolForRun, resolveWorktree, checkpointBridge, phaseBridge, logBridge, lifecycleFor, createProviderErrorRecovery, cleanupTerminalRun, deliver, deliverTerminal, workflowToolUpdate, registry, modelSpec } = deps;
+  const { pi, home, runs, scheduler, eventPublisher, persistRunState, projectTrusted, resumeHostContext, ensureSessionLease, createAgentExecutor, activeSnapshotTools, frozenResourcePolicy, resolveLaunchPrologue, workflowAgentHandler, shellForRun, toolForRun, resolveWorktree, checkpointBridge, phaseBridge, logBridge, lifecycleFor, createProviderErrorRecovery, cleanupTerminalRun, deliver, deliverTerminal, trackDelivery, workflowToolUpdate, registry, modelSpec } = deps;
   const coordinateRunMutation = deps.coordinateRunMutation ?? (<T>(task: () => Promise<T>): Promise<T> => task());
   type BudgetDecisionResult = { state: "running" | "completed" | "budget_exhausted"; approved: boolean; value?: JsonValue; run?: PersistedRun; completion?: CompletionDeliveryResult };
   const budgetDecisionDelivery = (metadata: WorkflowMetadata, request: BudgetApprovalRequest) => `Workflow ${metadata.name} budget adjustment ${request.proposalId} for run ${request.runId} requires approval. Consumed usage: ${JSON.stringify(request.consumed)}. Previous limits: ${JSON.stringify(request.previous)}. Proposed limits: ${JSON.stringify(request.proposed)}. Respond with workflow_respond using proposalId ${request.proposalId}.`;
@@ -162,12 +163,12 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
     }).finally(() => cleanupTerminalRun(run.store.runId));
     run.completion = completion;
     if (!foreground || !waitForCompletion) {
-      void completion.then(async (result) => {
+      trackDelivery(completion.then(async (result) => {
         await deliverTerminal(run.store, async () => (await completionDeliveryFromStore({ mode: "background", name: run.metadata.name, runId: run.store.runId, value: result.value, resultPath: result.resultPath, resultBytes: result.resultBytes, store: run.store, ...(context === undefined ? {} : { context: context.deliveryContext }) })).content);
       }, async (error: unknown) => {
         const diagnostic = failureDiagnosticsFrom(error);
         await deliverTerminal(run.store, diagnostic ? formatWorkflowFailureDelivery(diagnostic) : formatWorkflowFailureDeliveryFallback(run.metadata.name, run.store.runId, run.store.directory, error), true);
-      });
+      }));
       return undefined;
     }
     const markDelivered = () => run.store.updateState((current) => current.delivery?.mode === "foreground" && (current.delivery.state === "attached" || current.delivery.state === "pending") ? { ...current, delivery: { ...current.delivery, state: "delivered" } } : current);

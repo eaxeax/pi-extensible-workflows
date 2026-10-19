@@ -2037,6 +2037,8 @@ test("stopping one background subagent leaves another running", async () => {
     assert.equal((await manager.stop({ id: first.id }, context)).state, "stopped");
     await waitFor(async () => (await manager.inspect({ id: first.id }, context)).state === "stopped");
     assert.equal((await manager.inspect({ id: second.id }, context)).state, "running");
+    // A run reads "running" before its executor is called: wait for the executor before settling it.
+    await waitFor(() => pending.has("second"));
     pending.get("second").resolve({ value: "second result", attempts: [], cwd });
     await waitFor(async () => (await manager.inspect({ id: second.id }, context)).state === "completed");
     assert.equal((await manager.inspect({ id: second.id }, context)).value, "second result");

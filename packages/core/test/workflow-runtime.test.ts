@@ -443,6 +443,26 @@ void test("workflow failure aborts in-flight bridge work", async () => {
   await aborted;
 });
 
+void test("work started after an unawaited phase(name) reaches the host after that phase is recorded; a failed phase still rejects phase()", async () => {
+  const events: string[] = [];
+  const bridge = {
+    async phase(name: string) { await new Promise((resolve) => setTimeout(resolve, 30)); if (name === "bad") throw new WorkflowError("CANCELLED", "phase refused"); events.push(`phase ${name}`); },
+    async shell(command: string) { events.push(`shell ${command}`); return { exitCode: 0, stdout: "", stderr: "" }; },
+  };
+  const ordered = runWorkflow(`phase("verify"); await shell("x"); return true;`, null, bridge);
+  assert.equal(await ordered.result, true);
+  assert.deepEqual(events, ["phase verify", "shell x"], "the shell waited for the phase update");
+  events.length = 0;
+  const failed = runWorkflow(`const refused = phase("bad").then(() => "recorded", () => "refused"); await shell("y"); return await refused;`, null, bridge);
+  assert.equal(await failed.result, "refused", "the phase's own rejection still reaches the script");
+  assert.deepEqual(events, ["shell y"], "work after a failed phase still runs, as before");
+  events.length = 0;
+  const aborted = runWorkflow(`phase("verify"); await Promise.all([shell("z"), Promise.reject(new Error("boom"))]);`, null, bridge);
+  await assert.rejects(aborted.result, /boom/);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.deepEqual(events, ["phase verify"], "a call waiting for the phase when the run failed starts no work");
+});
+
 void test("worker watchdog terminates a synchronous heartbeat stall after five seconds", { timeout: 7000 }, async () => {
   const run = runWorkflow(`export const meta={name:'x',description:'x'}; while(true){}`);
   const started = performance.now();
