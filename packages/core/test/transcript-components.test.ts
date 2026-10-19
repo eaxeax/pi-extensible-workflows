@@ -179,6 +179,28 @@ void test("tool calls of a message that stopped on an error or an abort show tha
   assert.equal(prepended.text(), rendered);
 });
 
+void test("the empty message an accepted workflow_result leaves when it ends the session is not drawn; any other stop is", () => {
+  const closing = (offset: number): TranscriptRecord => message(offset, { role: "assistant", content: [], stopReason: "error", errorMessage: "This operation was aborted" });
+  const { view, text } = setup();
+  view.append([
+    call(100, "w1", "workflow_result", { result: "DONE-VALUE" }),
+    entry(150, { type: "custom", customType: "pi-workflows:tool-timing", data: {} }),
+    result(200, "w1", "workflow_result", "Result accepted."),
+    closing(300),
+    user(400, "NEXT-MESSAGE"),
+    closing(500),
+    message(600, { role: "toolResult", toolCallId: "w2", toolName: "workflow_result", content: [{ type: "text", text: "Result does not match the required schema." }], isError: true }),
+    closing(700),
+  ]);
+  const rendered = text();
+  assertOrder(rendered, ["DONE-VALUE", "Result accepted.", "NEXT-MESSAGE", "This operation was aborted", "Result does not match", "This operation was aborted"]);
+  assert.equal(count(rendered, "This operation was aborted"), 2);
+  const prepended = setup();
+  prepended.view.append([closing(300)]);
+  prepended.view.prepend([call(100, "w1", "workflow_result", { result: "DONE-VALUE" }), result(200, "w1", "workflow_result", "Result accepted.")]);
+  assert.ok(!prepended.text().includes("aborted"));
+});
+
 void test("an earlier call prepended with the id of a later call leaves that call its results", () => {
   const older = [user(100, "OLDER"), call(200, "c1", "alpha", { query: "OLDER-ARGS" })];
   const newer = call(300, "c1", "beta", { query: "NEWER-ARGS" });

@@ -117,14 +117,17 @@ export const createTranscriptView: CreateTranscriptView = ({ ui, cwd }) => {
   let items: Item[] = [];
   let streaming: { readonly component: AssistantMessageComponent; message: AssistantMessage } | undefined;
   let expanded = false;
+  /** Records left undrawn: the empty message Pi records when an accepted workflow_result aborts its session (agent-execution.ts), which Pi's components would draw as an error. */
+  let hidden = new Set<Item>();
 
   function changed(): void {
-    root.children = [...items.map((item) => item.child), ...(streaming ? [streaming.component] : [])];
+    root.children = [...items.flatMap((item) => hidden.has(item) ? [] : [item.child]), ...(streaming ? [streaming.component] : [])];
     ui.requestRender();
   }
   function clear(): void {
     items = [];
     streaming = undefined;
+    hidden = new Set();
   }
   /** Pi's renderers print the arguments and details they get without removing terminal sequences: they reach them cleaned. */
   function tool(name: string, id: string, args: Fields): ToolExecutionComponent { return new ToolExecutionComponent(sanitizeDisplayText(name), id, args, undefined, definitions.get(name), ui, cwd); }
@@ -141,9 +144,18 @@ export const createTranscriptView: CreateTranscriptView = ({ ui, cwd }) => {
    * when that call has no result yet and no other call of that id comes between them. A call of a message that stopped
    * on an error or an abort shows that stop, as in Pi's chat, and takes no result. A result paired with no call has its
    * own block with empty args. A call whose result changes gets a new block; a result moves out of its own block or
-   * back into one.
+   * back into one. It also finds the records left undrawn (`hidden`), as they depend on the records before them.
    */
   function pair(): void {
+    hidden = new Set();
+    let accepted = false;
+    for (const item of items) {
+      const value = item.record.kind === "entry" ? item.record.value : undefined;
+      if (value && value.type !== "message") continue;
+      const message = object(value?.message) ? value.message : undefined;
+      if (accepted && message?.role === "assistant" && list(message.content).length === 0 && stopResult(message)) hidden.add(item);
+      accepted = message?.role === "toolResult" && message.toolName === "workflow_result" && message.isError !== true;
+    }
     const open = new Map<string, Call>();
     const paired = new Map<Call, Result>();
     for (const item of items) {
