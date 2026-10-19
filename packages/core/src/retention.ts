@@ -1,14 +1,13 @@
 import { lstat, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { isAtomicTemporary } from "./io.js";
 import { HARD_TERMINAL_RUN_STATES, WorkflowError, type LaunchSnapshot, type WorkflowRetentionSettings } from "./types.js";
 import { acquireSessionLease, listPersistedSessionIds, listRunIds, RunStore, type BorrowedWorktreeBinding, type PersistedRun, type SessionLease } from "./persistence.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const REQUIRED_FILES = new Set(["workflow.js", "state.json", "snapshot.json", "journal.json", "ownership.json", "worktrees.json", "borrowed-worktrees.json", "system-prompts.json"]);
 const OPTIONAL_FILES = new Set(["result.json", "summary.json"]);
-/** The name atomicWriteFile gives summary.json while it writes it, before the rename into place. */
-const SUMMARY_TEMPORARY = /^summary\.json\.\d+\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
 const REQUIRED_DIRECTORIES = new Set(["worktrees", ".system-prompts"]);
 const OPTIONAL_DIRECTORIES = new Set(["evidence"]);
 
@@ -35,7 +34,7 @@ async function validateInventory(store: RunStore, loaded: { run: PersistedRun; s
       if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error(`Run artifact is not a regular directory: ${join(store.directory, entry.name)}`);
       continue;
     }
-    if (!REQUIRED_FILES.has(entry.name) && !OPTIONAL_FILES.has(entry.name) && !SUMMARY_TEMPORARY.test(entry.name)) throw new Error(`Run inventory contains an unrecognized artifact: ${join(store.directory, entry.name)}`);
+    if (!REQUIRED_FILES.has(entry.name) && !OPTIONAL_FILES.has(entry.name) && !isAtomicTemporary(entry.name, "summary.json")) throw new Error(`Run inventory contains an unrecognized artifact: ${join(store.directory, entry.name)}`);
     if (!entry.isFile() || entry.isSymbolicLink()) throw new Error(`Run artifact is not a regular file: ${join(store.directory, entry.name)}`);
   }
   for (const name of REQUIRED_FILES) {

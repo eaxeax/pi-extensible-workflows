@@ -66,6 +66,10 @@ function signalProcess(pid: number, signal: NodeJS.Signals): void {
     if (!isNodeError(error, "ESRCH")) throw error;
   }
 }
+// As processLive: only ESRCH is gone; EPERM (a process outside a sandbox) still exists.
+function pidExists(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (error) { return !isNodeError(error, "ESRCH"); }
+}
 // Called right after /health named this pid; its start, read now, tells a later reuse of the pid apart before SIGKILL.
 // Returns only once the server is gone: a server that may still serve keeps its lock and port, so nothing replaces it.
 async function stopStaleServer(pid: number, port: number): Promise<void> {
@@ -81,7 +85,8 @@ async function stopStaleServer(pid: number, port: number): Promise<void> {
   }
   // Without a confirmed identity the pid may now be an unrelated process, so SIGTERM is never escalated.
   if (processConfirmed(server)) signalProcess(pid, "SIGKILL");
-  for (let attempt = 0; attempt < 50 && processLive(server); attempt += 1) await delay(20);
+  // The wait only asks whether the pid still exists: processLive reads the start time through a child process on macOS.
+  for (let attempt = 0; attempt < 50 && pidExists(pid); attempt += 1) await delay(20);
   if (processLive(server)) throw new Error(`Stale Trajectory server ${String(pid)} on port ${String(port)} did not stop; stop it and retry`);
 }
 

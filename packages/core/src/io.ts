@@ -36,6 +36,8 @@ export const gitIdentity = {
   GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
 };
 
+/** Whether `name` is the file atomicWriteFile writes beside the file named `target` before the rename into place. */
+export function isAtomicTemporary(name: string, target: string): boolean { return name.startsWith(`${target}.`) && /^\.\d+\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/.test(name.slice(target.length)); }
 export function atomicWriteFile(path: string, content: string): Promise<void>;
 export function atomicWriteFile(path: string, content: string, sync: true): void;
 export function atomicWriteFile(path: string, content: string, sync = false): Promise<void> | void {
