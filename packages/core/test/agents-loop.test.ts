@@ -15,7 +15,7 @@ function stateOf(selectedKey: string, overrides: Partial<AgentsWorkspaceState> =
   return { selectedKey, row: 2, expansion: [["run:R", false]], focus: "transcript", sidebarVisible: true, toolsExpanded: true, detailsShown: true, ...overrides };
 }
 function exitOf(label: string, provider: AgentsActionProvider, target: AgentsActionTarget = RUN, state: AgentsWorkspaceState = stateOf("run:R")): AgentsWorkspaceExit { return { target, label, provider, state }; }
-const NODE: SessionTreeNode = { key: "run:R", parentKey: undefined, depth: 0, kind: "run", initiallyExpanded: true, line: () => "Workflow", details: () => [], title: () => "Workflow", agent: undefined, target: RUN };
+const NODE: SessionTreeNode = { key: "run:R", parentKey: undefined, depth: 0, kind: "run", label: "Workflow", state: "running", initiallyExpanded: true, line: () => "Workflow", details: () => [], title: () => "Workflow", agent: undefined, target: RUN };
 
 
 /** Offers `offers(target)` now, counting the asks in `asked`; `perform` runs a label, after it is recorded as `<kind>:<label>`. */

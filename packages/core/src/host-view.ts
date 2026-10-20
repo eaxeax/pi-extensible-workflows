@@ -794,14 +794,14 @@ export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readon
   lines.push(`Agent sessions: ${String(run.agentSessions.length)}`);
   return lines.join("\n");
 }
-/** What a /workflow tree row shows of a node; `kind` is open so that /agents draws its Subagents group and their rows the same way. */
-export type WorkflowTreeLineNode = Pick<WorkflowPhaseTreeNode, "label" | "depth" | "state" | "agent" | "children"> & { readonly kind: string };
+/** What a /workflow tree row shows of a node; `kind` is open so that /agents draws its Subagents group and their rows the same way, and `quiet` draws the widget's muted `·` in place of the state glyph (an agent recorded running in a run that is not live). */
+export type WorkflowTreeLineNode = Pick<WorkflowPhaseTreeNode, "label" | "depth" | "state" | "agent" | "children"> & { readonly kind: string; readonly quiet?: boolean };
 /** A /workflow tree row: selection arrow, depth indent, ▾/▸ for an expanded/collapsed node with children, • for an agent, ◇ for a shell, the label, " · " and the state glyph. */
 export function formatWorkflowTreeLine(node: WorkflowTreeLineNode, selected: boolean, expanded: boolean, styles: WorkflowProgressStyles): string {
   const state = progressStyleForState(node.state, styles);
   const glyph = node.kind === "agent" && node.agent ? agentStateGlyph(node.agent.state, "⠦") : runStateGlyph(node.state, "⠦");
   const icon = node.children.length ? expanded ? "▾" : "▸" : node.kind === "agent" ? "•" : node.kind === "shell" ? "◇" : " ";
-  return `${selected ? "→" : " "} ${"  ".repeat(node.depth)}${icon} ${node.label} · ${state(glyph)}`;
+  return `${selected ? "→" : " "} ${"  ".repeat(node.depth)}${icon} ${node.label} · ${node.quiet ? styles.muted("·") : state(glyph)}`;
 }
 /** The agents of `node` and of every node below it. */
 function workflowTreeNodeAgents(tree: WorkflowPhaseTree, node: WorkflowPhaseTreeNode): AgentRecord[] {
