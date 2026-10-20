@@ -1,6 +1,7 @@
 import { copyToClipboard, type ExtensionCommandContext, getAgentDir, getSelectListTheme, rawKeyHint, SettingsManager, type KeybindingsManager, type Theme } from "@earendil-works/pi-coding-agent";
-import { getKeybindings, HStack, isKeyRelease, matchesKey, parseKey, ScrollView, SelectList, Text, TUI_KEYBINDINGS, truncateToWidth, TuiAltScreen, VStack, wrapTextWithAnsi, type Component, type Keybinding, type OverlayHandle, type OverlayOptions, type ScrollViewOptions, type SelectItem, type TuiInputListenerResult, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { getKeybindings, HStack, Input, isKeyRelease, matchesKey, parseKey, ScrollView, SelectList, Text, TUI_KEYBINDINGS, truncateToWidth, TuiAltScreen, visibleWidth, VStack, wrapTextWithAnsi, type Component, type Keybinding, type OverlayHandle, type OverlayOptions, type ScrollViewOptions, type SelectItem, type TuiInputListenerResult, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import type { ActionUi, AgentsAction, AgentsActionProvider, AgentsActionTarget } from "./agents-actions-contract.js";
+import { formatCost, formatTokens } from "./background-widget.js";
 import { workflowKeyMatches } from "./pi-action-ui.js";
 import { navigateWorkflowPhaseTree, workflowPhaseTreeVisibleNodes, type WorkflowPhaseTree, type WorkflowPhaseTreeDirection, type WorkflowPhaseTreeNode } from "./host-phases.js";
 import { navigatorSidebarWidth, progressStyleForState, themeWorkflowProgressStyles, type WorkflowProgressStyles } from "./host-view.js";
@@ -56,6 +57,10 @@ export interface AgentsWorkspaceState {
   readonly toolsExpanded: boolean;
   /** `d`: an agent's details shown instead of its transcript. */
   readonly detailsShown: boolean;
+  /** `f`: follow mode, the selection moving to the agent with the newest activity. */
+  readonly following?: boolean;
+  /** `/`: the sidebar filter text, when one is set. */
+  readonly filter?: string;
   /** Where the shown transcript was scrolled to, when it was not at its tail: the agent's identity and the rows below the lines in view. */
   readonly transcript?: TranscriptPlace;
 }
@@ -79,6 +84,8 @@ const SIDEBAR_MIN_COLUMNS = 80;
 const IDLE_POLL_MS = 5000;
 /** Title and hint: one row each above and below the body. */
 const FIXED_ROWS = 2;
+/** The sidebar filter's input row, under the title while it is open. */
+const FILTER_ROWS = 1;
 /** The action menu: half the width, 32 columns at least, centred a row and a column clear of the edges, so it never covers the title or the hint. */
 const MENU_OVERLAY: OverlayOptions = { width: "50%", minWidth: 32, margin: 1 };
 const MENU_TITLES: Readonly<Record<AgentsActionTarget["kind"], string>> = { run: "Run actions", "workflow-agent": "Agent actions", subagent: "Subagent actions", subagents: "Subagents" };
@@ -88,11 +95,19 @@ function sidebarWidth(columns: number): number { return navigatorSidebarWidth(co
 /** Where the sidebar fits: beside the transcript, above it on a portrait terminal (more rows than half the columns, a cell being about twice as tall as wide), or nowhere. */
 function sidebarFit({ columns, rows }: { readonly columns: number; readonly rows: number }): "side" | "top" | undefined { return columns >= SIDEBAR_MIN_COLUMNS ? "side" : rows * 2 > columns ? "top" : undefined; }
 function clean(text: string | undefined): string { return sanitizeDisplayText(text ?? "").replace(/\s+/g, " ").trim(); }
+/** The foreground or intensity resets that end a dim. */
+// eslint-disable-next-line no-control-regex
+const DIM_ENDS = /\x1b\[(?:22;)?39m|\x1b\[22m/g;
 /** An SGR mouse report: its 1-based column and row, M for a press or a motion, m for a release. */
 // eslint-disable-next-line no-control-regex
 const SGR_MOUSE = /^\x1b\[<\d+;(\d+);(\d+)([Mm])$/;
+/** A whole bracketed paste and its body, as Pi's terminal hands one over. */
+// eslint-disable-next-line no-control-regex
+const BRACKETED_PASTE = /^\x1b\[200~([\s\S]*)\x1b\[201~$/;
 /** A mouse report as the alt screen reads one: SGR, or the legacy six bytes. */
 function isMouse(data: string): boolean { return SGR_MOUSE.test(data) || (data.length === 6 && data.startsWith("\x1b[M")); }
+/** What a filter keeps: `direct` matches, `shown` adds their ancestors. */
+interface MatchSets { readonly direct: ReadonlySet<string>; readonly shown: ReadonlySet<string> }
 /** The alt screen's own scroll and search actions: it acts on them before any input listener. */
 const ALT_SCREEN_ACTIONS = (Object.keys(TUI_KEYBINDINGS) as (keyof typeof TUI_KEYBINDINGS)[]).filter((id) => id.startsWith("tui.altScreen."));
 /**
@@ -253,6 +268,15 @@ class Workspace {
   private expanded: boolean;
   /** d: an agent with details shows them instead of its transcript, for every agent selected until d again. */
   private detailsShown: boolean;
+  /** f: the selection stays on the followed agent while it runs, then moves to the running agent with the newest activity. */
+  private following: boolean;
+  /** Follow mode as the menu opened: opening a menu stops it, but a step-aside action hands it back through the state. */
+  private followingBeforeMenu = false;
+  /** The sidebar filter: the display text of what was typed into `filterInput`, the input row under the title while `filtering`. */
+  private filter: string;
+  private filtering = false;
+  private readonly filterInput = new Input({ prompt: "/ " });
+  private matchCache: { readonly nodes: readonly SessionTreeNode[]; readonly filter: string; readonly result: MatchSets } | undefined;
   private menu: Menu | undefined;
   /** The status row's notices (options.notices, an in-place action's), until the next key. */
   private notices: Notice[];
@@ -280,7 +304,9 @@ class Workspace {
   private readonly unsubscribeWorking: (() => void) | undefined;
   /** An agent's first read is in flight: no other agent's starts until it settles, then only the agent shown then is read. */
   private firstReading = false;
-  private readonly title = row(() => this.titleText());
+  private readonly title: Component = { render: (width) => [this.titleRow(Math.max(1, width))], invalidate() {} };
+  /** A click on the open input row places its cursor; the keys reach it through filterKey(). */
+  private readonly filterRow: Component = { render: (width) => this.filtering ? this.filterInput.render(Math.max(1, width)) : [], handleMouse: (event) => this.filtering && this.filterInput.handleMouse(event) ? { handled: true } : undefined, invalidate() {} };
   private readonly hint = row(() => this.hintText());
   private readonly status = row(() => this.statusText());
   private readonly sidebar: Component = { render: (width) => this.renderSidebar(width), handleMouse: (event) => this.sidebarMouse(event), invalidate() {} };
@@ -304,6 +330,12 @@ class Workspace {
     this.focus = this.sidebarVisible ? state?.focus ?? "sidebar" : "transcript";
     this.expanded = state?.toolsExpanded ?? toolsExpanded;
     this.detailsShown = state?.detailsShown ?? false;
+    this.following = state?.following ?? false;
+    this.filter = state?.filter ?? "";
+    // Input has no cursor setter: the restored filter goes in as a paste, which leaves the cursor after it.
+    if (this.filter) this.filterInput.handleInput(`\x1b[200~${this.filter}\x1b[201~`);
+    this.filterInput.onSubmit = () => { this.closeFilter(this.filter.trim()); };
+    this.filterInput.onEscape = () => { this.closeFilter(""); };
     this.notices = (options.notices ?? []).map((text) => ({ text: clean(text), level: undefined }));
     // Runs after the alt screen's viewport listener (pgup/pgdn, search, the wheel): the terminal openAgentsWorkspace gives the alt screen puts gate() before both.
     alt.addInputListener((data) => this.input(data));
@@ -376,22 +408,31 @@ class Workspace {
     if (menu) { this.menuKey(menu, data); this.alt.requestRender(); return { consume: true }; }
     // While an overlay (the search box) is open, every other key is its input.
     if (this.alt.hasOverlay()) return undefined;
+    if (this.filtering) { this.filterKey(data); this.alt.requestRender(); return { consume: true }; }
     const is = (keybinding: Keybinding): boolean => this.keybindings.matches(data, keybinding);
     // In the sidebar j, k, h and l move as the arrows do, as in /workflow.
     const sidebar = this.focus === "sidebar";
     const moves = (keybinding: Keybinding): boolean => sidebar ? workflowKeyMatches(this.keybindings, data, keybinding) : is(keybinding);
-    if (is("tui.select.cancel")) { this.leave(); return { consume: true }; }
+    if (is("tui.select.cancel")) {
+      if (this.filter) this.setFilter("");
+      else this.leave();
+      this.alt.requestRender();
+      return { consume: true };
+    }
     if (is("tui.input.tab")) { if (this.sidebarVisible) this.focus = sidebar ? "transcript" : "sidebar"; }
     else if (moves("tui.select.up") || moves("tui.select.down")) {
       const up = moves("tui.select.up");
       if (sidebar) this.navigate(up ? "up" : "down");
-      else this.alt.scrollBy(up ? -1 : 1);
+      else { this.following = false; this.alt.scrollBy(up ? -1 : 1); }
     } else if (sidebar && (moves("tui.editor.cursorLeft") || moves("tui.editor.cursorRight"))) this.navigate(moves("tui.editor.cursorLeft") ? "left" : "right");
     else if (sidebar && matchesKey(data, "space")) { const node = this.selectedNode(); if (node) this.toggle(node); }
     else if (matchesKey(data, "[") || matchesKey(data, "]")) this.jump(matchesKey(data, "[") ? -1 : 1);
+    else if (matchesKey(data, "n") || matchesKey(data, "shift+n")) this.jump(matchesKey(data, "n") ? 1 : -1, (node) => node.needsPerson !== undefined);
     // The alt screen binds its top/bottom actions to home/end only; ctrl+home/ctrl+end reach the transcript here.
-    else if (matchesKey(data, "ctrl+home")) this.alt.scrollToTop();
-    else if (matchesKey(data, "ctrl+end")) this.alt.scrollToBottom();
+    else if (matchesKey(data, "ctrl+home")) { this.following = false; this.alt.scrollToTop(); }
+    else if (matchesKey(data, "ctrl+end")) { this.following = false; this.alt.scrollToBottom(); }
+    else if (sidebar && matchesKey(data, "/")) this.filtering = this.filterInput.focused = true;
+    else if (matchesKey(data, "f")) this.toggleFollow();
     else if (matchesKey(data, "s")) {
       this.sidebarVisible = !this.sidebarVisible;
       this.sidebarHidden = !this.sidebarVisible && this.fit !== undefined;
@@ -432,7 +473,7 @@ class Workspace {
     // The sidebar sizes itself (basis auto); stack entries shrink by default, so fixed parts need shrink 0. It shows above or beside the transcript as the last resized() left it; visible() only reads.
     const sidebar = (top: boolean) => ({ component: this.sidebar, shrink: 0, visible: () => this.sidebarVisible && (this.fit === "top") === top });
     const body = new VStack([sidebar(true), { component: new HStack([sidebar(false), { component: transcript, grow: 1, basis: 0 }]), grow: 1, basis: 0 }]);
-    this.alt.setLayoutRoot(new VStack([{ component: this.title, shrink: 0 }, { component: body, grow: 1, basis: 0 }, { component: this.hint, shrink: 0 }]));
+    this.alt.setLayoutRoot(new VStack([{ component: this.title, shrink: 0 }, { component: this.filterRow, shrink: 0 }, { component: body, grow: 1, basis: 0 }, { component: this.hint, shrink: 0 }]));
     // Scroll keys and the wheel act on the primary view of the last frame: draw now, not on the next tick, so none reaches a stale layout.
     this.alt.renderNow();
   }
@@ -456,31 +497,127 @@ class Workspace {
       sidebarVisible: !this.sidebarHidden,
       toolsExpanded: this.expanded,
       detailsShown: this.detailsShown,
+      ...(this.following ? { following: true } : {}),
+      ...(this.filter ? { filter: this.filter } : {}),
       ...(shown && fromEnd > 0 ? { transcript: { identity: shown.identity, fromEnd } } : {}),
     };
     return state;
   }
-  private isExpanded(node: SessionTreeNode): boolean { return this.expansion.get(node.key) ?? node.initiallyExpanded; }
+  private rawExpanded(node: SessionTreeNode): boolean { return this.expansion.get(node.key) ?? node.initiallyExpanded; }
+  /** A filter shows every match under its ancestors, whatever the user collapsed. */
+  private isExpanded(node: SessionTreeNode): boolean { return this.filterActive() || this.rawExpanded(node); }
   private expandedKeys(): ReadonlySet<string> { return new Set(this.nodes.filter((node) => this.isExpanded(node)).map(({ key }) => key)); }
   /** The nodes whose ancestors are all expanded, in sidebar order. */
   private visible(): SessionTreeNode[] {
-    return workflowPhaseTreeVisibleNodes(this.tree, this.expandedKeys()).flatMap(({ id }) => this.byKey.get(id) ?? []);
+    return workflowPhaseTreeVisibleNodes(this.navTree(), this.expandedKeys()).flatMap(({ id }) => this.byKey.get(id) ?? []);
   }
-  /** Up, down, left and right as in /workflow: navigateWorkflowPhaseTree over the sidebar and its expansion. */
+  private fixedRows(): number { return FIXED_ROWS + (this.filtering ? FILTER_ROWS : 0); }
+  private filterActive(): boolean { return this.filter.trim() !== ""; }
+  /**
+   * The nodes the filter keeps: `direct` match (the node's label, which on a run root holds the run's name and short ID, or its
+   * ID containing the text, case-insensitive, or its state named by a "state:" prefix), `shown` adds their ancestors. Undefined without a filter.
+   */
+  private matches(): MatchSets | undefined {
+    if (!this.filterActive()) return undefined;
+    const cached = this.matchCache;
+    if (cached && cached.nodes === this.nodes && cached.filter === this.filter) return cached.result;
+    const result = this.computeMatches();
+    this.matchCache = { nodes: this.nodes, filter: this.filter, result };
+    return result;
+  }
+  private computeMatches(): MatchSets {
+    const text = this.filter.trim().replace(/\s+/g, " ").toLowerCase();
+    const wantedState = text.startsWith("state:") ? text.slice("state:".length).trim() : undefined;
+    const direct = new Set<string>();
+    for (const node of this.nodes) {
+      const label = clean(node.label);
+      // The Subagents group's state summarizes its children and is not matched itself.
+      const state = node.state.toLowerCase();
+      const id = (node.id ?? "").toLowerCase();
+      if (wantedState === undefined ? label.toLowerCase().includes(text) || id.includes(text) : node.kind !== "group" && state === wantedState) direct.add(node.key);
+    }
+    const shown = new Set(direct);
+    for (const key of direct) {
+      const seen = new Set<string>();
+      for (let parent = this.byKey.get(key)?.parentKey; parent !== undefined && !seen.has(parent); parent = this.byKey.get(parent)?.parentKey) { seen.add(parent); shown.add(parent); }
+    }
+    return { direct, shown };
+  }
+  /** The /workflow tree navigation runs on: the whole sidebar, or only the nodes a filter keeps. */
+  private navTree(): WorkflowPhaseTree {
+    const shown = this.matches()?.shown;
+    return shown === undefined ? this.tree : navigationTree(this.nodes.filter((node) => shown.has(node.key)));
+  }
+  /** The selection stays when its node still shows, else moves to the first match. No filter empties the input too. */
+  private setFilter(text: string): void {
+    this.filter = text;
+    if (!text) this.filterInput.setValue("");
+    this.keepSelectionShown();
+  }
+  private keepSelectionShown(): void {
+    const matches = this.matches();
+    if (!matches || !this.nodes.length || (matches.shown.has(this.selectedKey ?? "") && this.selectedNode())) return;
+    const first = this.nodes.find((node) => matches.direct.has(node.key));
+    if (first) this.select(first);
+  }
+  private filterKey(data: string): void {
+    // Pi's terminal hands over a whole paste: its body goes in as display text, so the input row draws no escape sequence.
+    const pasted = BRACKETED_PASTE.exec(data);
+    this.filterInput.handleInput(pasted ? `\x1b[200~${sanitizeDisplayText(pasted[1] ?? "")}\x1b[201~` : data);
+    // The filter is the input's text with each whitespace a space.
+    if (this.filtering) this.setFilter(sanitizeDisplayText(this.filterInput.getValue()).replace(/\s/g, " "));
+  }
+  private closeFilter(text: string): void {
+    this.filtering = this.filterInput.focused = false;
+    this.setFilter(text);
+  }
+  /** f: follow mode on or off; on, the selection moves at once. With no running agent, as the hint offers no f, it stays off. */
+  private toggleFollow(): void {
+    if (!this.following && !this.nodes.some((node) => node.agent?.running === true)) return;
+    this.following = !this.following;
+    if (this.following) this.follow();
+  }
+  /** Moves the selection to the follow target and keeps its transcript at the tail. */
+  private follow(): void {
+    const target = this.followTarget();
+    if (target && target.key !== this.selectedKey) { this.reveal(target); this.select(target); }
+    this.shown?.scroll.scrollToEnd();
+  }
+  /** The running agent with the newest activity; a tie or none keeps the selection. */
+  private followTarget(): SessionTreeNode | undefined {
+    const shown = this.matches()?.shown;
+    const running = this.nodes.filter((node) => node.agent?.running && node.agent.lastActivityAt !== undefined && (shown === undefined || shown.has(node.key)));
+    const newest = Math.max(...running.map((node) => node.agent?.lastActivityAt ?? 0));
+    const best = running.filter((node) => node.agent?.lastActivityAt === newest);
+    return best.length === 1 ? best[0] : undefined;
+  }
+  /** Under a filter every shown node is open: left goes to the parent, right to the first shown child, and the expansion stays as it is. */
+  private navigateShown(direction: "left" | "right"): void {
+    this.following = false;
+    const key = this.selectedKey;
+    const next = key === undefined ? undefined : direction === "left" ? this.byKey.get(key)?.parentKey : this.navTree().byId.get(key)?.children[0];
+    const node = next === undefined ? undefined : this.byKey.get(next);
+    if (node) this.select(node);
+  }
+  /** Up, down, left and right as in /workflow: navigateWorkflowPhaseTree over the sidebar and its expansion; under a filter, over the nodes it keeps. */
   private navigate(direction: WorkflowPhaseTreeDirection): void {
     if (this.nodes.length === 0) return;
+    if (this.filterActive() && (direction === "left" || direction === "right")) { this.navigateShown(direction); return; }
     const expanded = this.expandedKeys();
-    const next = navigateWorkflowPhaseTree(this.tree, this.selectedKey, expanded, direction);
+    this.following = false;
+    const next = navigateWorkflowPhaseTree(this.navTree(), this.selectedKey, expanded, direction);
     for (const node of this.nodes) {
       if (next.expandedNodeIds.has(node.key) !== expanded.has(node.key)) this.expansion.set(node.key, next.expandedNodeIds.has(node.key));
     }
     const node = next.nodeId === undefined ? undefined : this.byKey.get(next.nodeId);
     if (node && node.key !== this.selectedKey) this.select(node);
   }
-  /** [ and ]: the agent before or after the selected node in sidebar order, collapsed ones included, round at both ends; its ancestors are expanded. */
-  private jump(delta: number): void {
+  /** [ and ]: the agent (n and N: the node that needs a person) before or after the selected node in sidebar order, collapsed ones included and under a filter only the nodes it keeps, round at both ends; its ancestors are expanded. */
+  private jump(delta: number, wanted: (node: SessionTreeNode) => boolean = (node) => node.agent !== undefined): void {
     const index = this.nodes.findIndex((node) => node.key === this.selectedKey);
-    const others = [...this.nodes.slice(index + 1), ...this.nodes.slice(0, Math.max(0, index))].filter((node) => node.agent !== undefined);
+    this.following = false;
+    const shown = this.matches()?.shown;
+    const others = [...this.nodes.slice(index + 1), ...this.nodes.slice(0, Math.max(0, index))].filter((node) => (shown === undefined || shown.has(node.key)) && wanted(node));
     const next = delta > 0 ? others[0] : others.at(-1);
     if (!next) return;
     this.reveal(next);
@@ -495,7 +632,7 @@ class Workspace {
   }
   /** Space and a click on the ▾/▸ icon: a node with children collapses or expands; any other node stays as it is. */
   private toggle(node: SessionTreeNode): void {
-    if (this.hasChildren(node)) this.expansion.set(node.key, !this.isExpanded(node));
+    if (this.hasChildren(node) && !this.filterActive()) this.expansion.set(node.key, !this.rawExpanded(node));
   }
   private hasChildren(node: SessionTreeNode): boolean { return (this.tree.byId.get(node.key)?.children.length ?? 0) > 0; }
 
@@ -559,11 +696,18 @@ class Workspace {
     this.tree = navigationTree(nodes);
     // A node without children yet (a phase before its first agent) is not recorded: it takes its initiallyExpanded once it has some.
     for (const node of nodes) if (!this.expansion.has(node.key) && this.hasChildren(node)) this.expansion.set(node.key, node.initiallyExpanded);
-    let wanted = this.selectedNode();
+    // A transcript scrolled away from the tail (page keys, home, the wheel) ends follow mode; seen first, so a switch does not lose it.
+    if (this.following && this.shown && !this.shown.scroll.isFollowingEnd) this.following = false;
+    // Follow stays on its agent while it runs, as a switch reloads the transcript: only a settled or gone one gives way.
+    const followed = this.following && this.selectedNode()?.agent?.running !== true ? this.followTarget() : undefined;
+    if (followed) this.reveal(followed);
+    let wanted = followed ?? this.selectedNode();
     if (!wanted && this.selectedKey !== undefined) {
       const visible = this.visible();
       wanted = visible[Math.min(Math.max(0, row), visible.length - 1)];
     } else if (!wanted) wanted = this.firstSelection(nodes);
+    const matches = this.matches();
+    if (matches && wanted && !matches.shown.has(wanted.key)) wanted = this.nodes.find((node) => matches.direct.has(node.key)) ?? wanted;
     //NOTE: a refresh that moves the selected node under a node the user collapsed leaves it selected but hidden.
     const shown = this.shown;
     const agent = wanted?.agent;
@@ -590,6 +734,7 @@ class Workspace {
       menu.readFor = this.readFor(menuNode);
       this.loadMenu(menu);
     }
+    if (this.following && this.shown) this.shown.scroll.scrollToEnd();
     const rows = this.listedRows();
     if (rows === this.lastListedRows) return;
     this.lastListedRows = rows;
@@ -598,7 +743,7 @@ class Workspace {
   /** Every row a list can change outside the transcript: the title, the hint, the status row, the sidebar and the details pane. */
   private listedRows(): string {
     const columns = Math.max(1, this.alt.terminal.columns);
-    return [this.titleText(), this.hintText(), this.statusText(), ...(this.sidebarVisible ? this.renderSidebar(columns) : []), ...(this.detailsScroll ? this.detailsLines(this.transcriptWidth()) : [])].join("\n");
+    return [this.titleRow(columns), this.hintText(), this.statusText(), ...(this.sidebarVisible ? this.renderSidebar(columns) : []), ...(this.detailsScroll ? this.detailsLines(this.transcriptWidth()) : [])].join("\n");
   }
   private firstSelection(nodes: readonly SessionTreeNode[]): SessionTreeNode | undefined {
     const initial = this.initialKey === undefined ? undefined : this.byKey.get(this.initialKey);
@@ -641,14 +786,16 @@ class Workspace {
   private openMenu(node: SessionTreeNode): void {
     const target = node.target;
     if (!target || (this.options.actions ?? []).length === 0 || this.menu) return;
+    this.followingBeforeMenu = this.following;
+    this.following = false;
     // The list draws under the heading row: a mouse report on the menu reaches it a row up.
     const component: Component = { render: (width) => this.menuLines(width), handleMouse: (event) => this.menu?.list?.handleMouse({ ...event, y: event.y - 1 }), invalidate() {} };
     const menu: Menu = { key: node.key, target, readFor: this.readFor(node), handle: this.alt.showOverlay(component, MENU_OVERLAY), entries: undefined, list: undefined, label: undefined, generation: 0, failures: undefined };
     this.menu = menu;
     this.loadMenu(menu);
   }
-  /** What a node's labels depend on: its target and its state (which its title ends with). */
-  private readFor(node: SessionTreeNode): string { return `${JSON.stringify(node.target ?? null)} ${node.title(this.styles)}`; }
+  /** What a node's labels depend on: its target, its state (which its title ends with) and what waits for a person. */
+  private readFor(node: SessionTreeNode): string { return `${JSON.stringify(node.target ?? null)} ${node.title(this.styles)} ${node.needsPerson ?? ""}`; }
   private closeMenu(): void {
     const menu = this.menu;
     this.menu = undefined;
@@ -681,7 +828,7 @@ class Workspace {
   /** Pi's select list of the labels, in the rows the terminal leaves under the heading for them, the errors and the closing rule. */
   private menuList(menu: Menu, entries: readonly MenuEntry[], index: number, failures: number): SelectList {
     //NOTE: a resize while the menu is open keeps its rows until the next read.
-    const room = Math.max(1, this.alt.terminal.rows - FIXED_ROWS - 2 - failures);
+    const room = Math.max(1, this.alt.terminal.rows - this.fixedRows() - 2 - failures);
     const items = entries.map((entry, at): SelectItem => ({ value: String(at), label: clean(entry.action.label) }));
     // A list longer than its rows draws a "(n/m)" row under them.
     const list = new SelectList(items, entries.length > room ? Math.max(1, room - 1) : room, getSelectListTheme(), { truncatePrimary: ({ text, maxWidth }) => truncateToWidth(text, maxWidth, "…") });
@@ -713,7 +860,7 @@ class Workspace {
   private choose(menu: Menu, entry: MenuEntry): void {
     this.closeMenu();
     if (entry.action.inPlace) void this.runInPlace(menu.target, entry);
-    else this.leave({ target: menu.target, label: entry.action.label, provider: entry.provider, state: this.state() });
+    else this.leave({ target: menu.target, label: entry.action.label, provider: entry.provider, state: { ...this.state(), ...(this.followingBeforeMenu ? { following: true } : {}) } });
   }
   /** Keys and ticks wait until it settles; what it reports, a failure too, is the status row's notice. */
   private async runInPlace(target: AgentsActionTarget, entry: MenuEntry): Promise<void> {
@@ -904,14 +1051,40 @@ class Workspace {
 
   /** "#<position>/<count>" among the agent nodes, the name, state and summary for an agent; the label and state for any other node. */
   private titleText(): string {
+    const matches = this.matches();
+    const parts = [
+      this.baseTitle(),
+      ...(this.following ? [this.styles.muted("following")] : []),
+      ...(matches ? [this.styles.muted(`${String(matches.direct.size)} ${matches.direct.size === 1 ? "match" : "matches"}`)] : []),
+    ];
+    return parts.join(" · ");
+  }
+  private baseTitle(): string {
     const agent = this.shown?.agent;
     const failure = this.failure ? ` ${this.styles.warning(clean(this.failure))}` : "";
     const node = this.selectedNode();
     if (!agent) return node ? `${node.title(this.styles)}${failure}` : `${this.styles.bold(this.listed ? "no agents" : "agents")}${failure}`;
     const agents = this.nodes.filter((candidate) => candidate.agent !== undefined);
     const position = `#${String(agents.findIndex((candidate) => candidate.key === this.selectedKey) + 1)}/${String(agents.length)}`;
-    const state = clean(agent.state);
-    return [position, this.styles.bold(clean(agent.name)), progressStyleForState(state, this.styles)(state), this.styles.muted(clean(agent.summary))].filter((part) => part).join(" ") + failure;
+    // An agent a crash left active in a run that is not live is not running: no state, as the widget's mark draws none.
+    const state = agent.leftover ? "" : clean(agent.state);
+    return [position, this.styles.bold(clean(agent.name)), state && progressStyleForState(state, this.styles)(state), this.styles.muted(clean(agent.summary))].filter((part) => part).join(" ") + failure;
+  }
+  /** The session's totals over the listed agents: "running/total agents · tokens · cost"; parts without data are left out. */
+  private totalsText(): string {
+    const agents = this.nodes.flatMap((node) => node.agent ?? []);
+    if (agents.length === 0) return "";
+    const tokens = agents.reduce((sum, { tokens: value }) => sum + (value ?? 0), 0);
+    const cost = agents.reduce((sum, { cost: value }) => sum + (value ?? 0), 0);
+    return [`${String(agents.filter(({ running }) => running).length)}/${String(agents.length)} running`, formatTokens(tokens), formatCost(cost)].filter((part) => part).join(" · ");
+  }
+  /** The title, with the totals at the right end when they fit beside it; the title keeps its width first. */
+  private titleRow(width: number): string {
+    const title = this.titleText();
+    const totals = this.totalsText();
+    const gap = width - visibleWidth(title) - visibleWidth(totals);
+    if (!totals || gap < 2) return truncateToWidth(title, width, "…");
+    return `${title}${" ".repeat(gap)}${this.styles.muted(totals)}`;
   }
   /** The selected node's details as /workflow shows them, wrapped to the pane. */
   private detailsLines(width: number): string[] {
@@ -921,15 +1094,25 @@ class Workspace {
   private hintText(): string {
     // Pi's keyHint over the keybindings Pi handed the workspace (Pi's own reads the keybindings of its own pi-tui).
     const keyHint = (keybinding: Keybinding, description: string): string => rawKeyHint(this.keybindings.getKeys(keybinding).join("/"), description);
-    // A move names the first key of each direction; [ ] a d s and space are fixed keys.
+    // A move names the first key of each direction; [ ] n a d s f / and space are fixed keys.
     const first = (keybinding: Keybinding): string => this.keybindings.getKeys(keybinding)[0] ?? "";
     const separator = this.styles.dim(" · ");
     const node = this.selectedNode();
+    // ctrl+c leaves before the filter sees it (key()), so it is no clear key.
+    //NOTE: a cancel bound only to ctrl+c names no clear key.
+    const clear = rawKeyHint(this.keybindings.getKeys("tui.select.cancel").filter((key) => key !== "ctrl+c").join("/"), "clear");
+    if (this.filtering) return [keyHint("tui.input.submit", "keep filter"), clear].join(separator);
     // back right after the move, so a narrow terminal keeps it.
     return [
+      ...(this.filterActive() ? [rawKeyHint("/", `filter: ${clean(this.filter)}`), clear] : []),
       this.focus === "sidebar" ? rawKeyHint(`${first("tui.editor.cursorLeft")}/${first("tui.editor.cursorRight")}`, "fold") : rawKeyHint(`${first("tui.select.up")}/${first("tui.select.down")}`, "scroll"),
       keyHint("tui.select.cancel", "back"),
+      // f and / are named before they are on: nothing else on screen tells that follow and the filter exist. Space also folds; left/right keep the fold hint short.
+      ...(this.following ? [rawKeyHint("f", "stop following")] : this.nodes.some((candidate) => candidate.agent?.running === true) ? [rawKeyHint("f", "follow")] : []),
       rawKeyHint("[ ]", "agent"),
+      ...(this.nodes.some((candidate) => candidate.needsPerson !== undefined) ? [rawKeyHint("n", "next")] : []),
+      // Ahead of what 120 columns cut when every hint shows: search, sidebar and tools.
+      ...(!this.filterActive() && this.focus === "sidebar" && this.sidebarVisible ? [rawKeyHint("/", "filter")] : []),
       ...((this.options.actions ?? []).length > 0 ? [rawKeyHint("a", "menu")] : []),
       ...(node?.agent && this.hasDetails(node) ? [rawKeyHint("d", "details")] : []),
       ...(this.sidebarVisible ? [keyHint("tui.input.tab", "focus")] : []),
@@ -952,6 +1135,29 @@ class Workspace {
     return shown.agent.running && shown.agent.activity ? this.styles.dim(clean(shown.agent.activity)) : "";
   }
 
+  private nodeLine(node: SessionTreeNode, matches: MatchSets | undefined, cell: number): string {
+    const selected = node.key === this.selectedKey;
+    const line = node.line(this.styles, selected, this.isExpanded(node));
+    if (matches === undefined) return this.marked(node, line, cell);
+    if (!matches.direct.has(node.key)) return this.dimLine(this.marked(node, line, cell));
+    return this.marked(node, line, cell);
+  }
+  /**
+   * The row and its mark when the mark fits whole in `cell`: the row cut before it with "…" as rows are, if that keeps the
+   * first character of the label (at display column 4 + 2 * depth); otherwise the row without the mark.
+   */
+  private marked(node: SessionTreeNode, line: string, cell: number): string {
+    const mark = node.mark?.(this.styles) ?? "";
+    const room = cell - visibleWidth(mark);
+    if (!mark || visibleWidth(line) <= room) return `${line}${mark}`;
+    return room >= 6 + 2 * node.depth ? `${truncateToWidth(line, room, "…")}${mark}` : line;
+  }
+  /** Dims a line whose inner colours would otherwise end the dim early: it is opened again after each foreground or intensity reset. */
+  private dimLine(line: string): string {
+    const probe = this.styles.dim("\u0000");
+    const open = probe.slice(0, Math.max(0, probe.indexOf("\u0000")));
+    return this.styles.dim(open === "" ? line : line.replace(DIM_ENDS, (reset) => `${reset}${open}`));
+  }
   /**
    * The visible nodes as their rows, scrolled to keep the selection in view: beside the transcript as wide as sidebarWidth of the
    * terminal and as tall as the body; above it as wide as the terminal and at most a third of the body. A dim rule
@@ -961,7 +1167,7 @@ class Workspace {
     const top = this.fit === "top";
     const total = top ? Math.max(1, width) : Math.min(Math.max(1, width), sidebarWidth(Math.max(1, this.alt.terminal.columns)));
     const cell = top ? total : Math.max(0, total - SEPARATOR.length);
-    const body = Math.max(1, this.alt.terminal.rows - FIXED_ROWS);
+    const body = Math.max(1, this.alt.terminal.rows - this.fixedRows());
     // A rule is a row without a node: nothing selects it, and the scroll counts it.
     const rows = this.visible().flatMap((node, index): { readonly node: SessionTreeNode | undefined }[] => index > 0 && node.parentKey === undefined ? [{ node: undefined }, { node }] : [{ node }]);
     // Above the transcript the last row of the tree's third is a rule, so the tree's end shows where the side-by-side layout has " │ ".
@@ -972,10 +1178,11 @@ class Workspace {
     this.sidebarTop = Math.max(0, Math.min(this.sidebarTop, rows.length - height));
     const visible = rows.slice(this.sidebarTop, this.sidebarTop + height);
     this.sidebarKeys = visible.map(({ node }) => node?.key);
+    const matches = this.matches();
     const lines = Array.from({ length: height }, (_, index) => {
       const shown = visible[index];
       const node = shown?.node;
-      const text = node ? node.line(this.styles, node.key === this.selectedKey, this.isExpanded(node)) : shown ? this.styles.dim("─".repeat(cell)) : "";
+      const text = node ? this.nodeLine(node, matches, cell) : shown ? this.styles.dim("─".repeat(cell)) : "";
       return truncateToWidth(`${truncateToWidth(text, cell, "…", true)}${top ? "" : this.styles.dim(SEPARATOR)}`, total, "", true);
     });
     return top && height > 0 ? [...lines, this.styles.dim("─".repeat(total))] : lines;
@@ -991,7 +1198,7 @@ class Workspace {
     const rows = [...(menu.list?.render(cell) ?? []), ...(menu.failures?.render(cell) ?? [])];
     if (rows.length === 0) rows.push(this.styles.muted(menu.entries ? "no actions" : "loading…"));
     //NOTE: below 5 rows the heading and the rule leave no row for the labels: the overlay is cut.
-    const room = Math.max(1, this.alt.terminal.rows - FIXED_ROWS - 2);
+    const room = Math.max(1, this.alt.terminal.rows - this.fixedRows() - 2);
     const heading = truncateToWidth(`${this.styles.dim("─ ")}${this.styles.bold(MENU_TITLES[menu.target.kind])}${this.styles.dim(` ${"─".repeat(cell)}`)}`, cell, "");
     return [heading, ...rows.slice(0, room).map((line) => truncateToWidth(line, cell, "…")), this.styles.dim("─".repeat(cell))];
   }
@@ -1006,6 +1213,7 @@ class Workspace {
       const node = key === undefined ? undefined : this.byKey.get(key);
       if (node) {
         this.focus = "sidebar";
+        this.following = false;
         // Runs from pi-tui's mouse dispatch, outside input()'s try/catch: a throw here would escape uncaught.
         try {
           // Every row, a header too, draws its icon at column 2 + 2 * depth (SessionTreeNode.line).

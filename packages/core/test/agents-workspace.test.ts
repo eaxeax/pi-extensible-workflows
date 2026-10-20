@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager, stripTerminalSequences, TUI_KEYBINDINGS, visibleWidth } from "@earendil-works/pi-tui";
 import type { ActionUi, AgentsAction, AgentsActionProvider, AgentsActionTarget } from "../src/agents-actions-contract.js";
 import { formatWorkflowPhaseDashboard, type AgentRecord, type PersistedRun, type RunState } from "../src/index.js";
@@ -11,7 +11,7 @@ import { openAgentsWorkspace, type AgentsWorkspaceState } from "../src/agents-wo
 import { FakeTerminal } from "./agents-workspace-harness.js";
 import { navigatorSidebarWidth } from "../src/host-view.js";
 import { createSessionAgentsSource, type SessionTreeNode } from "../src/session-agents.js";
-import { advance, agent, createRun, KEYBINDINGS, launch, click, entries, entry, ESC, escapes, FakeLive, KEY, leave, menu, MENU_HEADING, menuRows, open, opened, paste, polled, polls, rowOf, rule, settle, sidebarColumn, sidebarRows, statusRow as status, timers, title, topRow, project, temporary, tree, until, type FakePi, type Listed, type Spec } from "./agents-workspace-harness.js";
+import { advance, agent, createRun, KEYBINDINGS, launch, click, entries, entry, ESC, escapes, FakeLive, KEY, leave, menu, MENU_HEADING, menuRows, nodesOf, open, opened, paste, polled, polls, rowOf, rule, settle, sidebarColumn, sidebarRows, statusRow as status, timers, title as titleRow, topRow, project, temporary, tree, until, type FakePi, type Listed, type Spec } from "./agents-workspace-harness.js";
 
 const AGENTS = (): Listed[] => [agent("alpha"), agent("beta", { depth: 1, state: "completed", running: false }), agent("scout", { group: "Subagents", state: "failed", running: false })];
 /**
@@ -31,6 +31,9 @@ const TREE = (): Spec[] => [
   { key: "subagents", kind: "group", label: "Subagents" },
   { key: "s", parent: "subagents", agent: agent("s") },
 ];
+
+/** The title row without the session totals at its right end. */
+function title(pi: FakePi): string { return titleRow(pi).replace(/ {2,}\d+\/\d+ running.*$/, ""); }
 
 void test("the workspace opens over Pi on the alternate screen and restores Pi on esc, ctrl+c and abort", async (t) => {
   timers(t);
@@ -67,7 +70,7 @@ void test("the layout shows the title, the sidebar tree and the transcript at 12
   assert.match(lines[0] ?? "", /^#1\/3 alpha running gpt-5 1\.2k tok/);
   assert.deepEqual(sidebarColumn(wide).slice(0, 6), ["  ▾ build a1b2 · ⠦", "→   ▾ alpha · ⠦", "      • beta · ✓", rule(42), "  ▾ Subagents · ⠦", "    • scout · ✗"], "the first agent selected, every row in the /workflow format, a rule above the group");
   assert.match(lines[1] ?? "", /│ alpha record 0/);
-  assert.equal((lines.at(-1) ?? "").trimEnd(), "left/right fold · escape/ctrl+c back · [ ] agent · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools", "the whole hint fits 120 columns");
+  assert.equal((lines.at(-1) ?? "").trimEnd(), "left/right fold · escape/ctrl+c back · f follow · [ ] agent · / filter · tab focus · ctrl+shift+f search · s sidebar · …", "at 120 columns the hint loses only ctrl+o tools, Pi's own key");
   await leave(wide);
 
   const narrow = await open(AGENTS(), { columns: 70, setup: (source) => { source.polls.push(polled(entries(0, 5))); } });
@@ -188,6 +191,9 @@ void test("on a portrait terminal the tree stands above the transcript in at mos
   assert.ok(resized.slice(1, 1 + 16).every((line) => !line.includes("│")) && resized.slice(1, 1 + 16).some((line) => line.startsWith("→")), "a resize to a portrait shape moves the shown tree above the transcript");
   assert.ok(resized[1 + 16]?.startsWith("a0 record"), "the transcript starts right under the tree");
   assert.match(resized.at(-1) ?? "", /^left\/right fold/, "with its focus");
+  wide.send("/");
+  const filtered = wide.screen();
+  assert.ok(filtered[2 + Math.floor((50 - 3) / 3)]?.startsWith("a0 record"), "with the filter row open the tree takes a third of the smaller body");
   await leave(wide);
   // Wider than twice its rows, a terminal under 80 columns is not portrait: the tree above hides, the transcript takes the body.
   const square = await open(many, { columns: 30, rows: 20, setup: (source) => { source.polls.push(polled(entries(0, 100))); } });
@@ -942,7 +948,7 @@ void test("a node that is not an agent shows its details: no source, no polling,
   harness.send(KEY.up);
   await settle();
   const lines = harness.screen();
-  assert.equal((lines[0] ?? "").trimEnd(), "O running", "the title is the node's label and state");
+  assert.equal((lines[0] ?? "").replace(/ {2,}\d+\/\d+ running.*$/, ""), "O running", "the title is the node's label and state");
   assert.match(lines[1] ?? "", /│ details of O\s*$/);
   assert.match(lines[2] ?? "", /│ state running\s*$/);
   assert.equal(status(harness), "", "no status line");
@@ -1211,13 +1217,14 @@ void test("on a short terminal the sidebar keeps the selected row in view, rules
   await leave(harness);
 });
 
-void test("with the sidebar focused the hint names the fold and agent keys; with the transcript focused it is as before", async (t) => {
+void test("with the sidebar focused the hint names the fold, agent and filter keys; with the transcript focused it is as before", async (t) => {
   timers(t);
   const harness = await open(AGENTS(), { columns: 200 });
   const hint = (): string => (harness.screen().at(-1) ?? "").trimEnd();
-  assert.equal(hint(), "left/right fold · escape/ctrl+c back · [ ] agent · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools");
+  // alpha runs, so f is named before follow is on.
+  assert.equal(hint(), "left/right fold · escape/ctrl+c back · f follow · [ ] agent · / filter · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools");
   harness.send(KEY.tab);
-  assert.equal(hint(), "up/down scroll · escape/ctrl+c back · [ ] agent · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools");
+  assert.equal(hint(), "up/down scroll · escape/ctrl+c back · f follow · [ ] agent · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools");
   await leave(harness);
 });
 
@@ -1247,11 +1254,11 @@ void test("a run's sidebar rows are its /workflow tree rows, its nodes show the 
   assert.match(title(harness), /^#1\/4 Planner completed/);
   // The /workflow rows one level deeper, the first agent selected; the root is a header that names the run, as the sidebar can hold several.
   assert.deepEqual(rows.slice(0, 3), ["  ▾ Workflow · ⠦", "  ▾ plan · ✓", "→   • Planner · ✓"]);
-  assert.deepEqual(sidebarRows(harness), ["  ▾ review flow run  ⠦ 2/4 agents", ...rows.slice(1).map((row) => `${row.slice(0, 2)}  ${row.slice(2)}`)]);
+  assert.deepEqual(sidebarRows(harness), ["  ▾ review flow run  ⠦ 2/4", ...rows.slice(1).map((row) => `${row.slice(0, 2)}  ${row.slice(2)}`)]);
   harness.send(KEY.down);
   await settle();
   const lines = harness.screen();
-  assert.equal((lines[0] ?? "").trimEnd(), "review running");
+  assert.equal((lines[0] ?? "").replace(/ {2,}\d+\/\d+ running.*$/, ""), "review running");
   const details = lines.slice(1, 9).map((line) => line.slice(line.indexOf("│") + 1).trim());
   assert.deepEqual(details.slice(0, 4), ["Selected phase: review", "Status: running", "agents completed=1 running=1 failed=0 cancelled=0 pending=1", "Agents: 3"]);
   assert.ok(details.some((line) => line.startsWith("Elapsed:")), "the phase's usage");
@@ -1662,7 +1669,7 @@ void test("the menu is Pi's select list: the wheel on it moves the selection, a 
   click(harness, 2, rowOf(harness, "  ▾ Subagents"));
   await settle();
   assert.deepEqual(menuRows(harness), ["Run actions", "  Pause", "→ Stop", "  Delete"], "the wheel and a click off the menu did nothing");
-  assert.match(title(harness), /^O running/, "and selected nothing");
+  assert.match(titleRow(harness), /^O running /, "and selected nothing");
   click(harness, ...at("Delete"));
   await harness.done;
   assert.deepEqual(harness.exit && { target: harness.exit.target, label: harness.exit.label }, { target: RUN, label: "Delete" }, "the click ran the label");
@@ -2256,7 +2263,7 @@ void test("a state's sidebar stays hidden below 80 columns; its tools and d hold
   timers(t);
   const narrow = await open([], { columns: 70, nodes: tree(TREE()), state: stateOf({ sidebarVisible: true, focus: "sidebar" }) });
   assert.ok(!narrow.screen().some((line) => line.includes("Subagents")), "sidebar hidden");
-  assert.match(narrow.screen().at(-1) ?? "", /^up\/down scroll · escape\/ctrl\+c back · \[ \] agent · ctrl\+shi/, "the transcript has the focus and tab moves nothing");
+  assert.match(narrow.screen().at(-1) ?? "", /^up\/down scroll · escape\/ctrl\+c back · f follow · \[ \] agent · ctrl\+shi/, "the transcript has the focus and tab moves nothing");
   await leave(narrow);
   const hidden = await open([], { nodes: tree(TREE()), state: stateOf({ sidebarVisible: false, focus: "sidebar" }) });
   assert.ok(!hidden.screen().some((line) => line.includes("Subagents")), "a hidden sidebar stays hidden");
@@ -2432,19 +2439,494 @@ void test("the hint names a menu with providers, d details on an agent with deta
   const actions = [new FakeProvider({})];
   const harness = await open([], { columns: 160, nodes: tree(specs), actions });
   const hint = (): string => (harness.screen().at(-1) ?? "").trimEnd();
-  assert.equal(hint(), "left/right fold · escape/ctrl+c back · [ ] agent · a menu · d details · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools");
+  assert.equal(hint(), "left/right fold · escape/ctrl+c back · f follow · [ ] agent · / filter · a menu · d details · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools");
   harness.send(KEY.tab);
-  assert.equal(hint(), "up/down scroll · escape/ctrl+c back · [ ] agent · a menu · d details · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools");
+  assert.equal(hint(), "up/down scroll · escape/ctrl+c back · f follow · [ ] agent · a menu · d details · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools");
   harness.send(KEY.tab, KEY.up);
   await settle();
-  assert.equal(hint(), "left/right fold · escape/ctrl+c back · [ ] agent · a menu · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools", "no d details on a node that is not an agent");
+  assert.equal(hint(), "left/right fold · escape/ctrl+c back · f follow · [ ] agent · / filter · a menu · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools", "no d details on a node that is not an agent");
   harness.send("s");
-  assert.equal(hint(), "up/down scroll · escape/ctrl+c back · [ ] agent · a menu · ctrl+shift+f search · s sidebar · ctrl+o tools", "no tab focus without the sidebar");
+  assert.equal(hint(), "up/down scroll · escape/ctrl+c back · f follow · [ ] agent · a menu · ctrl+shift+f search · s sidebar · ctrl+o tools", "no tab focus without the sidebar");
   await leave(harness);
 
   const plain = await open([], { columns: 160, nodes: tree(specs) });
-  assert.equal((plain.screen().at(-1) ?? "").trimEnd(), "left/right fold · escape/ctrl+c back · [ ] agent · d details · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools", "no a menu without providers");
+  assert.equal((plain.screen().at(-1) ?? "").trimEnd(), "left/right fold · escape/ctrl+c back · f follow · [ ] agent · / filter · d details · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools", "no a menu without providers");
   await leave(plain);
+});
+
+type Needs = NonNullable<SessionTreeNode["needsPerson"]>;
+function needing(nodes: SessionTreeNode[], needs: Readonly<Record<string, Needs>>): SessionTreeNode[] {
+  return nodes.map((node) => { const needsPerson = needs[node.key]; return needsPerson === undefined ? node : { ...node, needsPerson }; });
+}
+const NEEDY = (): Listed[] => [agent("a", { tokens: 1_000_000, cost: 3 }), agent("b", { depth: 1, running: false, state: "failed", tokens: 200_000, cost: 0.41 }), agent("c", { running: false, state: "completed" }), agent("d", { group: "Subagents" })];
+
+void test("n and N visit the nodes that need a person, wrap, expand hidden ancestors and do nothing without any", async (t) => {
+  timers(t);
+  const nodes = needing(nodesOf(NEEDY()), { "run:build a1b2": "awaiting_input", b: "failed", d: "stalled" });
+  const harness = await open([], { nodes, initialKey: "a" });
+  harness.send("n");
+  await settle();
+  assert.match(title(harness), /^#2\/4 b/, "n goes to the next node that needs a person");
+  harness.send("n");
+  await settle();
+  assert.match(title(harness), /^#4\/4 d/);
+  harness.send("n");
+  await settle();
+  assert.match(title(harness), /^build a1b2 running/, "n wraps round to the first");
+  harness.send("N");
+  await settle();
+  assert.match(title(harness), /^#4\/4 d/, "N wraps back");
+  harness.send("N");
+  await settle();
+  assert.match(title(harness), /^#2\/4 b/, "N goes to the previous one");
+  harness.send(KEY.tab, "n");
+  await settle();
+  assert.match(title(harness), /^#4\/4 d/, "works with the transcript focused");
+  await leave(harness);
+
+  const hidden = await open([], { nodes: needing(nodesOf(NEEDY()), { b: "failed" }), initialKey: "c", state: { selectedKey: "c", row: 0, expansion: [["a", false]], focus: "sidebar", sidebarVisible: true, toolsExpanded: false, detailsShown: false } });
+  assert.equal(sidebarRows(hidden).some((row) => /\bb\b/.test(row)), false, "b is hidden under the collapsed a");
+  hidden.send("n");
+  await settle();
+  assert.match(title(hidden), /^#2\/4 b/);
+  assert.ok(sidebarRows(hidden).some((row) => /\bb\b/.test(row)), "its ancestors were expanded");
+  await leave(hidden);
+
+  const none = await open(NEEDY(), { initialKey: "a" });
+  none.send("n", "N");
+  await settle();
+  assert.match(title(none), /^#1\/4 a/, "no node needs a person: n and N do nothing");
+  assert.doesNotMatch((none.screen().at(-1) ?? ""), /n next/);
+  await leave(none);
+});
+
+void test("at the narrowest sidebar a row mark shows whole: after the row, after the row cut with …, or not at all", async (t) => {
+  timers(t);
+  const marks: Readonly<Record<string, string>> = { "run:build a1b2": "  ◆ waiting: ship", b: "  ⚠ quiet 4m", "reviewer-of-the-api": "  ⚠ stalled 12m", "run:deploy c3d4": "  ◆ waiting: approve it!" };
+  const nodes = nodesOf([agent("b"), agent("reviewer-of-the-api"), agent("x", { group: "deploy c3d4" })]).map((node) => { const mark = marks[node.key]; return mark === undefined ? node : { ...node, mark: () => mark }; });
+  // 80 columns is the narrowest terminal with the sidebar beside the transcript: 29 columns of rows. Beside the 24 columns of deploy's mark the row would keep no character of its label.
+  const harness = await open([], { nodes, initialKey: "x", columns: 80 });
+  assert.deepEqual(sidebarRows(harness), [
+    "  ▾ build a…  ◆ waiting: ship",
+    "    • b · ⠦  ⚠ quiet 4m",
+    "    • reviewe…  ⚠ stalled 12m",
+    "  ▾ deploy c3d4 · ⠦",
+    "→   • x · ⠦",
+  ]);
+  await leave(harness);
+});
+
+void test("the hint shows n next only while some node needs a person", async (t) => {
+  timers(t);
+  const harness = await open([], { nodes: needing(nodesOf(NEEDY()), { b: "failed" }) });
+  assert.match(harness.screen().at(-1) ?? "", /\[ \] agent · n next · /);
+  harness.nodes = nodesOf(NEEDY());
+  await advance(t);
+  await settle();
+  assert.doesNotMatch(harness.screen().at(-1) ?? "", /n next/);
+  await leave(harness);
+});
+
+void test("the title ends with the session totals and drops them first when narrow", async (t) => {
+  timers(t);
+  const listed = (): Listed[] => [agent("a", { tokens: 1000, cost: 3, summary: "s".repeat(40) }), agent("b", { depth: 1, running: false, state: "failed", tokens: 200, cost: 0.41 }), agent("c", { running: false, state: "completed" })];
+  const totals = "1/3 running · 1.2kt · $3.41";
+  for (const columns of [120, 70, 40]) {
+    const harness = await open(listed(), { initialKey: "a", columns });
+    const line = titleRow(harness);
+    assert.match(line, /^#1\/3 a /);
+    if (columns === 120) assert.ok(line.trimEnd().endsWith(totals), "the totals end the row");
+    else assert.ok(!line.includes("running ·") && !line.includes("$3.41"), `no totals at ${String(columns)} columns`);
+    await leave(harness);
+  }
+  const bare = await open([agent("a")], { initialKey: "a" });
+  assert.ok(titleRow(bare).trimEnd().endsWith("1/1 running"), "parts without data are left out");
+  await leave(bare);
+});
+
+const ACTIVE = (a: number, b: number, c: number): Listed[] => [agent("a", { lastActivityAt: a }), agent("b", { lastActivityAt: b }), agent("c", { lastActivityAt: c, running: false, state: "completed" })];
+/** ACTIVE with b settled too: only a runs. */
+const B_SETTLED = (a: number): Listed[] => [agent("a", { lastActivityAt: a }), agent("b", { running: false, state: "completed" }), agent("c", { running: false, state: "completed" })];
+
+void test("f follows the running agent with the newest activity, stays on it while it runs and stops on navigation", async (t) => {
+  timers(t);
+  const harness = await open(ACTIVE(10, 20, 99), { initialKey: "a" });
+  assert.doesNotMatch(title(harness), /following/);
+  assert.match(harness.screen().at(-1) ?? "", / · f follow · /, "a running agent: the hint names f before it is on");
+  harness.send("f");
+  assert.match(title(harness), /^#2\/3 b .*following/);
+  assert.match(harness.screen().at(-1) ?? "", /f stop following/);
+  for (const [a, b] of [[30, 20], [30, 40], [50, 40]] as const) {
+    harness.agents = ACTIVE(a, b, 99);
+    await advance(t);
+    assert.match(title(harness), /^#2\/3 b .*following/, `b runs: activity a ${String(a)}, b ${String(b)} keeps it`);
+  }
+  assert.deepEqual(harness.opened, ["a", "b"], "no other transcript was opened while b ran");
+  harness.agents = B_SETTLED(50);
+  await advance(t);
+  assert.match(title(harness), /^#1\/3 a .*following/, "b settled: the running agent with the newest activity");
+  harness.send(KEY.down);
+  assert.doesNotMatch(title(harness), /following/, "an arrow stops it");
+  for (const key of ["j", "[", "n", "]"]) {
+    harness.send("f");
+    assert.match(title(harness), /following/);
+    harness.send(key);
+    assert.doesNotMatch(title(harness), /following/, `${key} stops it`);
+  }
+  await leave(harness);
+});
+
+void test("f with no running agent does nothing, and a click stops it", async (t) => {
+  timers(t);
+  // b is left running in a run a crash interrupted: recorded as running, not running.
+  const harness = await open([agent("a", { running: false, state: "completed", lastActivityAt: 5 }), agent("b", { running: false })], { initialKey: "b" });
+  assert.doesNotMatch(harness.screen().at(-1) ?? "", /f follow/, "nothing runs: the hint does not offer follow");
+  harness.send("f");
+  assert.match(title(harness), /^#2\/2 b /);
+  assert.doesNotMatch(title(harness), /following/, "nothing to follow: f stays off");
+  assert.doesNotMatch(harness.screen().at(-1) ?? "", /f stop following/);
+  await leave(harness);
+  const two = await open(ACTIVE(10, 20, 1), { initialKey: "a" });
+  two.send("f");
+  click(two, 4, 2);
+  assert.doesNotMatch(title(two), /following/);
+  await leave(two);
+});
+
+void test("the title names no state for an agent recorded as running in a run that is not live", async (t) => {
+  timers(t);
+  const harness = await open([agent("a", { running: false, leftover: true }), agent("b")], { initialKey: "a" });
+  assert.equal(title(harness), "#1/2 a gpt-5 1.2k tok", "a crash left a recorded as running in an interrupted run: no running in its title");
+  harness.send("]");
+  assert.equal(title(harness), "#2/2 b running gpt-5 1.2k tok", "b runs");
+  await leave(harness);
+  const themed = await open([agent("a", { running: false, leftover: true })], { initialKey: "a", theme: MARKED });
+  assert.match(titleRow(themed), /^#1\/1 <bold:a> <muted:gpt-5 1\.2k tok>/, "no styled empty state between the name and the summary");
+  await leave(themed);
+});
+
+void test("opening a menu stops follow mode; a state with following opens following", async (t) => {
+  timers(t);
+  const provider = new FakeProvider({ "workflow-agent": steps("Stop") });
+  const specs = TARGETED().map((spec) => spec.agent ? { ...spec, agent: agent(spec.key, { lastActivityAt: spec.key === "c" ? 9 : 1 }) } : spec);
+  const harness = await open([], { nodes: tree(specs), actions: [provider], initialKey: "a" });
+  harness.send("f");
+  assert.match(title(harness), /^#3\/4 c .*following/);
+  harness.send("a");
+  await settle();
+  assert.doesNotMatch(title(harness), /following/);
+  await leave(harness);
+  const again = await open([], { nodes: tree(specs), actions: [provider], initialKey: "a", state: { selectedKey: "a", row: 0, expansion: [], focus: "sidebar", sidebarVisible: true, toolsExpanded: false, detailsShown: false, following: true } });
+  assert.match(title(again), /^#3\/4 c .*following/);
+  await leave(again);
+
+  const aside = await open([], { nodes: tree(specs), actions: [provider], initialKey: "a" });
+  aside.send("f");
+  aside.send("a");
+  await settle();
+  assert.doesNotMatch(title(aside), /following/, "the open menu stops it");
+  aside.send(KEY.enter);
+  await aside.done;
+  assert.equal(aside.exit?.state.following, true, "a step-aside hands follow mode back");
+  const resumed = await open([], { nodes: tree(specs), actions: [provider], initialKey: "a", state: aside.exit.state });
+  assert.match(title(resumed), /^#3\/4 c .*following/);
+  await leave(resumed);
+
+  const closed = await open([], { nodes: tree(specs), actions: [provider], initialKey: "a" });
+  closed.send("f", "a");
+  await settle();
+  closed.send(KEY.escape);
+  assert.doesNotMatch(title(closed), /following/, "closing the menu leaves it off");
+  await leave(closed);
+});
+
+const FILTERED = (): Listed[] => [agent("alpha"), agent("beta", { depth: 1, state: "failed", running: false }), agent("gamma", { depth: 1 }), agent("scout", { group: "Subagents", state: "failed", running: false })];
+
+void test("/ filters the sidebar by text with ancestors, shows the count and keeps or moves the selection", async (t) => {
+  timers(t);
+  const harness = await open(FILTERED(), { initialKey: "gamma" });
+  harness.send("/");
+  assert.ok((harness.screen()[1] ?? "").startsWith("/ "), "the input row opens under the title");
+  assert.equal((harness.screen().at(-1) ?? "").trimEnd(), "enter keep filter · escape clear", "ctrl+c leaves, so the hint names it for no clear");
+  harness.send("B", "E", "T");
+  assert.deepEqual(sidebarRows(harness).map((line) => line.replace(/^[^\w]*/, "").split(" ")[0]), ["build", "alpha", "beta"], "ancestors kept, case-insensitive");
+  assert.match(title(harness), /^build a1b2 .* 1 match$/, "the selection stays on the run, shown as an ancestor; the count has no ancestors");
+  harness.send("\x7f", "\x7f", "\x7f");
+  harness.send("g", "a", "m");
+  assert.match(title(harness), /^build a1b2 .* 1 match$/, "the selection stays on the run: it still shows as an ancestor");
+  harness.send(KEY.enter);
+  assert.ok(!(harness.screen()[1] ?? "").startsWith("/ "), "the input row closes");
+  assert.match(harness.screen().at(-1) ?? "", /^\/ filter: gam · escape clear/);
+  harness.send(KEY.escape);
+  assert.equal(sidebarRows(harness).length, 6, "esc cleared it");
+  assert.doesNotMatch(harness.screen().at(-1) ?? "", /filter:/);
+  await leave(harness);
+});
+
+void test("the filter is Pi's input: ← moves its cursor, backspace takes a whole emoji, a click places the cursor, a paste is filtered as text, a restored filter is edited at its end", async (t) => {
+  timers(t);
+  const harness = await open(FILTERED(), { initialKey: "gamma" });
+  const hint = (): string => (harness.screen().at(-1) ?? "").trimEnd();
+  harness.send("/", "g", "m", KEY.left, "a", "👩‍💻", "\x7f", KEY.enter);
+  assert.match(hint(), /^\/ filter: gam · /, "a typed between g and m, the emoji taken back whole");
+  harness.send("/");
+  assert.ok((harness.screen()[1] ?? "").startsWith("/ gam"), "the input opens with the filter");
+  click(harness, 2, 1);
+  harness.send("x", KEY.enter);
+  assert.match(hint(), /^\/ filter: xgam · /, "the click put the cursor before g");
+  harness.send(KEY.escape, "/", paste(`al${ESC}[31mp`));
+  assert.match(titleRow(harness), / · 1 match /);
+  harness.alt().renderNow();
+  assert.ok(!(harness.alt().getScreenLines()[1] ?? "").includes(`${ESC}[31m`), "the open input row draws the paste without its escape sequence");
+  harness.send(KEY.enter);
+  assert.match(hint(), /^\/ filter: alp · /, "the paste's escape sequence is not in the filter");
+  await leave(harness);
+  const state: AgentsWorkspaceState = { selectedKey: "gamma", row: 0, expansion: [], focus: "sidebar", sidebarVisible: true, toolsExpanded: false, detailsShown: false, filter: "ga" };
+  const restored = await open(FILTERED(), { state });
+  restored.send("/", "m", KEY.enter);
+  assert.match((restored.screen().at(-1) ?? "").trimEnd(), /^\/ filter: gam · /, "typing goes after the restored text");
+  await leave(restored);
+});
+
+void test("the filter takes a state: prefix, escapes with esc while open, and keeps the selection that still shows", async (t) => {
+  timers(t);
+  const harness = await open(FILTERED(), { initialKey: "scout" });
+  harness.send("/");
+  for (const char of "state:failed") harness.send(char);
+  assert.equal(sidebarRows(harness).filter((line) => /alpha|beta|scout/.test(line)).length, 3, "failed agents and the ancestor of beta");
+  assert.doesNotMatch(sidebarRows(harness).join("\n"), /gamma/);
+  assert.match(title(harness), /^#4\/4 scout .*2 matches/, "the selection stays");
+  harness.send(KEY.escape);
+  assert.equal(sidebarRows(harness).filter((line) => /gamma/.test(line)).length, 1);
+  assert.equal(harness.left, false, "esc closed the filter, not the workspace");
+  await leave(harness);
+});
+
+/** A theme that wraps text in visible markers: <dim:...>, <accent:...> and <bold:...>. */
+const MARKED = { fg: (color: string, text: string) => `<${color}:${text}>`, bold: (text: string) => `<bold:${text}>` } as unknown as Theme;
+
+/** With `query` typed in the filter (none when empty), the first sidebar row holding `row` matches `expected` and not `absent`. */
+const HIGHLIGHTS: readonly { readonly name: string; readonly agents: () => Listed[]; readonly initialKey?: string; readonly query: string; readonly row: string; readonly expected: RegExp; readonly absent?: RegExp }[] = [
+  { name: "no filter dims nothing", agents: FILTERED, initialKey: "scout", query: "", row: "build", expected: /build/, absent: /<dim:/ },
+  { name: "the run is dimmed as an ancestor", agents: FILTERED, initialKey: "scout", query: "Gam", row: "build", expected: /^<dim:.*build.*>/ },
+  { name: "so is alpha", agents: FILTERED, initialKey: "scout", query: "Gam", row: "alpha", expected: /^<dim:.*alpha/ },
+  { name: "the match is not dimmed and has no accent in its label", agents: FILTERED, initialKey: "scout", query: "Gam", row: "gam", expected: /gamma/, absent: /<dim:|<accent:gam/ },
+  { name: "a bold header label is drawn whole", agents: FILTERED, query: "bui", row: "build", expected: /build/, absent: /<dim:|<accent:bui>/ },
+  { name: "the Subagents group label is drawn whole", agents: FILTERED, query: "agen", row: "Subagents", expected: /Subagents/, absent: /<accent:agen>/ },
+  { name: "a match in another case has no accent", agents: () => [agent("Gamma")], query: "gAm", row: "Gamma", expected: /Gamma/, absent: /<accent:Gam>/ },
+  { name: "the dimmed selected ancestor keeps →", agents: FILTERED, initialKey: "alpha", query: "gam", row: "alpha", expected: /^<dim:→/ },
+  { name: "the selected match keeps →", agents: FILTERED, initialKey: "gamma", query: "gam", row: "gamma", expected: /^→/, absent: /<dim:|<accent:gam>/ },
+  { name: "a state: match keeps its line", agents: FILTERED, query: "state:failed", row: "scout", expected: /scout/, absent: /<dim:|<bold:(?:state|failed|scout)>|<accent:/ },
+  { name: "a short id match keeps its line", agents: () => [agent("id77", { name: "delta" })], query: "id77", row: "delta", expected: /delta/, absent: /<bold:|<dim:|<accent:delta/ },
+];
+
+void test("a filter dims the ancestors and leaves the matching rows undimmed, with no accent inside a label", async (t) => {
+  timers(t);
+  for (const { name, agents, initialKey, query, row, expected, absent } of HIGHLIGHTS) {
+    const harness = await open(agents(), { theme: MARKED, ...(initialKey === undefined ? {} : { initialKey }) });
+    if (query) {
+      harness.send("/");
+      for (const char of query) harness.send(char);
+    }
+    // The sidebar row, not the title or the filter row, without the separator drawn after it.
+    const line = harness.screen().find((candidate) => candidate.includes(row) && !/^[#/]/.test(candidate))?.replace(/\s+<di\S*\s*$/, "").trimEnd() ?? "";
+    assert.match(line, expected, name);
+    if (absent) assert.doesNotMatch(line, absent, name);
+    await leave(harness);
+  }
+});
+
+// eslint-disable-next-line no-control-regex
+const ESCAPES = /\x1b\[[0-9;]*m/g;
+// eslint-disable-next-line no-control-regex
+const UNDIMMED_AFTER_RESET = /\x1b\[(?:22;)?39m(?!\x1b\[38;2;9;9;9m)[^\s\x1b]/;
+const DIM_OPEN = "\x1b[38;2;9;9;9m";
+const ANSI = {
+  fg: (color: string, text: string) => `${color === "dim" ? DIM_OPEN : "\x1b[38;2;1;2;3m"}${text}\x1b[39m`,
+  bold: (text: string) => `\x1b[1m${text}\x1b[22m`,
+} as unknown as Theme;
+
+void test("a dimmed ancestor stays dim after the coloured parts of its line", async (t) => {
+  timers(t);
+  const harness = await open(FILTERED(), { initialKey: "scout", theme: ANSI });
+  harness.send("/", "g", "a", "m");
+  const index = harness.screen().findIndex((line) => line.includes("build"));
+  assert.ok(index >= 0, "the run header shows");
+  const header = harness.alt().getScreenLines()[index] ?? "";
+  assert.ok(header.includes(`${DIM_OPEN}  ▾ build`), "the run header opens dim before its text");
+  assert.ok(header.includes(`\x1b[39m${DIM_OPEN}`), "the dim colour is back after the coloured state glyph");
+  assert.ok((header.match(ESCAPES) ?? []).length > 4, "the header holds coloured parts of its own");
+  assert.doesNotMatch(header, UNDIMMED_AFTER_RESET, "no text follows a reset without the dim colour");
+  await leave(harness);
+});
+
+void test("the filter survives a step-aside at 120, 70 and 40 columns", async (t) => {
+  timers(t);
+  const provider = new FakeProvider({ "workflow-agent": steps("Stop") });
+  const specs = TARGETED();
+  const harness = await open([], { nodes: tree(specs), actions: [provider], initialKey: "c" });
+  harness.send("/", "c", KEY.enter);
+  harness.send("a");
+  await settle();
+  harness.send(KEY.enter);
+  await harness.done;
+  const state = harness.exit?.state;
+  assert.equal(state?.filter, "c");
+  for (const columns of [120, 70, 40]) {
+    const again = await open([], { nodes: tree(specs), actions: [provider], state: state, columns });
+    assert.match(again.screen().at(-1) ?? "", /filter: c/);
+    assert.match(titleRow(again), /\d+ match/, "the count shows");
+    assert.ok(sidebarRows(again).length < TARGETED().length, "the restored sidebar is filtered");
+    await leave(again);
+  }
+});
+
+void test("a tie keeps a selection that is not the first of the tied nodes", async (t) => {
+  timers(t);
+  const harness = await open(ACTIVE(30, 30, 1), { initialKey: "b" });
+  harness.send("f");
+  assert.match(title(harness), /^#2\/3 b .*following/);
+  harness.agents = ACTIVE(40, 40, 1);
+  await advance(t);
+  assert.match(title(harness), /^#2\/3 b /, "still b");
+  await leave(harness);
+});
+
+void test("scrolling the transcript away from the tail stops following and the view stays put", async (t) => {
+  timers(t);
+  const harness = await open(ACTIVE(10, 20, 1), { initialKey: "a", setup: (source) => { source.polls.push(polled(entries(0, 100))); } });
+  harness.send("f");
+  await settle();
+  harness.screen();
+  const end = harness.alt().viewportTop;
+  assert.ok(end > 0, "a transcript to scroll");
+  harness.send(KEY.pageUp);
+  harness.screen();
+  const top = harness.alt().viewportTop;
+  assert.ok(top < end);
+  await advance(t);
+  harness.screen();
+  assert.doesNotMatch(title(harness), /following/);
+  assert.equal(harness.alt().viewportTop, top, "the tick does not jump back");
+  harness.send("f", KEY.ctrlHome);
+  await advance(t);
+  assert.doesNotMatch(title(harness), /following/, "ctrl+home stops it");
+  await leave(harness);
+});
+
+void test("a scroll-away seen on the refresh where the followed agent settles stops following without a switch", async (t) => {
+  timers(t);
+  const harness = await open(ACTIVE(10, 20, 1), { initialKey: "a", setup: (source) => { source.polls.push(polled(entries(0, 100))); } });
+  harness.send("f");
+  await settle();
+  harness.screen();
+  harness.send(KEY.pageUp);
+  harness.screen();
+  harness.agents = B_SETTLED(30);
+  await advance(t);
+  assert.doesNotMatch(title(harness), /following/);
+  assert.match(title(harness), /^#2\/3 b /, "the selection stays on b");
+  assert.deepEqual(harness.opened, ["a", "b"], "a's transcript was not opened");
+  await leave(harness);
+});
+
+void test("a state word without the state: prefix does not match, and pasted whitespace is normalized", async (t) => {
+  timers(t);
+  const harness = await open(FILTERED(), { initialKey: "gamma" });
+  harness.send("/");
+  for (const char of "fail") harness.send(char);
+  assert.doesNotMatch(sidebarRows(harness).join("\n"), /alpha|beta|scout/, "fail names no node");
+  harness.send(KEY.escape);
+  harness.send("/", paste("build \t\n  a1b2"));
+  assert.match(sidebarRows(harness).join("\n"), /build a1b2/, "tabs, newlines and repeated spaces match single spaces");
+  assert.doesNotMatch(sidebarRows(harness).join("\n"), /gamma/);
+  await leave(harness);
+});
+
+void test("the filter matches a node's label, ID and state, not what its title adds to them: a glyph, counts and cost", async (t) => {
+  timers(t);
+  // The run root's title carries what its header row shows after the label.
+  const nodes = nodesOf([agent("alpha"), agent("b7", { name: "beta", state: "failed", running: false })])
+    .map((node) => node.agent ? node : { ...node, id: "R1d2", title: () => `${node.label} ⠦ 1/2 $0.12 ${node.state}` });
+  const harness = await open([], { nodes, initialKey: "alpha" });
+  const matches = (query: string): string => {
+    harness.send("/", paste(query), KEY.enter);
+    const count = / (\d+) match/.exec(titleRow(harness))?.[1] ?? "none";
+    harness.send(KEY.escape);
+    return count;
+  };
+  for (const query of ["⠦", "1/2", "$0.12"]) assert.equal(matches(query), "0", query);
+  assert.deepEqual(["build", "a1b2", "r1d", "alp", "b7", "bet", "state:failed", "state:running"].map(matches), ["1", "1", "1", "1", "1", "1", "1", "2"]);
+  await leave(harness);
+});
+
+void test("under a filter left and right move to the parent and the first shown child and space leaves the expansion alone", async (t) => {
+  timers(t);
+  const harness = await open(FILTERED(), { initialKey: "gamma" });
+  harness.send("/", "g", "a", "m", KEY.enter);
+  harness.send(KEY.left);
+  assert.match(title(harness), /^#1\/4 alpha/, "left goes to the parent");
+  harness.send("l");
+  assert.match(title(harness), /^#3\/4 gamma/, "l goes to the first shown child, skipping the hidden beta");
+  harness.send("h", "h");
+  assert.match(title(harness), /^build /, "h again reaches the run");
+  harness.send("l", " ");
+  assert.match(title(harness), /^#1\/4 alpha/);
+  harness.send(KEY.escape);
+  assert.equal(sidebarRows(harness).length, 6, "space changed nothing once the filter is cleared");
+  await leave(harness);
+});
+
+void test("a refresh that takes the selected node out of the filter moves the selection to the first match", async (t) => {
+  timers(t);
+  const specs = (second: string): Spec[] => [{ key: "k1", agent: agent("one") }, { key: "k2", agent: agent(second) }, { key: "k3", agent: agent("other") }, { key: "k4", agent: agent("gamut") }];
+  const harness = await open([], { nodes: tree(specs("gamma")), initialKey: "k2" });
+  harness.send("/", paste("gam"), KEY.enter);
+  assert.match(title(harness), /^#2\/4 gamma .*2 matches/);
+  harness.nodes = tree(specs("delta"));
+  await advance(t);
+  assert.match(title(harness), /^#4\/4 gamut .*1 match$/, "the selected node stays listed but no longer matches: the first match is selected");
+  assert.doesNotMatch(sidebarRows(harness).join("\n"), /other|delta/, "the sidebar stays filtered");
+  await leave(harness);
+});
+
+void test("a filter of only spaces filters nothing and esc leaves the workspace", async (t) => {
+  timers(t);
+  const harness = await open(FILTERED(), { initialKey: "alpha" });
+  const rows = sidebarRows(harness);
+  harness.send("/", " ", KEY.enter);
+  assert.deepEqual(sidebarRows(harness), rows, "every row stays");
+  assert.doesNotMatch(titleRow(harness), /match/, "no match count");
+  harness.send(KEY.escape);
+  await harness.done;
+  assert.equal(harness.left, true);
+});
+
+void test("under a filter ] and n visit only the shown nodes, and N goes back", async (t) => {
+  timers(t);
+  const nodes = needing(nodesOf(FILTERED()), { alpha: "failed", beta: "failed", gamma: "failed", scout: "failed" });
+  for (const next of ["]", "n"]) {
+    const harness = await open([], { nodes, initialKey: "alpha" });
+    harness.send("/", paste("state:failed"), KEY.enter);
+    harness.send(next);
+    assert.match(title(harness), /^#2\/4 beta/, next);
+    harness.send(next);
+    assert.match(title(harness), /^#4\/4 scout/, `${next}: gamma is skipped`);
+    if (next === "n") {
+      harness.send("N");
+      assert.match(title(harness), /^#2\/4 beta/);
+    }
+    await leave(harness);
+  }
+});
+
+void test("state: does not match the Subagents group, whose state summarizes its children", async (t) => {
+  timers(t);
+  const nodes = tree([{ key: "subagents", kind: "group", label: "Subagents", state: "failed" }, { key: "scout", parent: "subagents", agent: agent("scout", { state: "failed", running: false }) }]);
+  const harness = await open([], { nodes, initialKey: "scout" });
+  harness.send("/", paste("state:failed"), KEY.enter);
+  assert.match(titleRow(harness), / 1 match\b/);
+  await leave(harness);
 });
 
 void test("a live event replayed while an agent opens that throws is reported in the title", async (t) => {
@@ -2453,9 +2935,19 @@ void test("a live event replayed while an agent opens that throws is reported in
   live.replay.push({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "x" } });
   const harness = await open([agent("alpha"), agent("beta", { live })], { failLive: "beta" });
   harness.send(KEY.down);
-  assert.match(title(harness), /agents workspace failed: live failed/);
+  assert.match(titleRow(harness), /agents workspace failed: live failed/);
   await leave(harness);
 });
+
+void test("follow only picks among the shown nodes of a filter", async (t) => {
+  timers(t);
+  const harness = await open(ACTIVE(10, 20, 1), { initialKey: "a" });
+  harness.send("/", "a", KEY.enter);
+  harness.send("f");
+  assert.match(title(harness), /^#1\/3 a .*following/, "b is filtered out");
+  await leave(harness);
+});
+
 
 void test("the hint names the keys the user's bindings resolve to", async (t) => {
   timers(t);
@@ -2464,7 +2956,9 @@ void test("the hint names the keys the user's bindings resolve to", async (t) =>
   const hint = (): string => (harness.screen().at(-1) ?? "").trimEnd();
   assert.match(hint(), /h\/l fold/, "the sidebar's fold pair follows the bindings");
   harness.send(KEY.tab);
-  assert.equal(hint(), "u/d scroll · ctrl+q back · [ ] agent · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools");
+  assert.equal(hint(), "u/d scroll · ctrl+q back · f follow · [ ] agent · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools");
+  harness.send(KEY.tab, "/");
+  assert.equal(hint(), "enter keep filter · ctrl+q clear", "the input submits with Pi's submit key");
   await leave(harness);
 });
 
