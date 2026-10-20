@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### New capabilities
+
+- `/agents` opens a full-screen workspace over Pi's TUI: a sidebar with this session's workflow runs (phases, operation scopes, shells, and agents) and its subagents, and beside it the selected agent's full transcript, drawn as Pi's chat draws it and updated live while the agent runs. Other nodes show their details. The hint row lists the keys; `esc` gives Pi its screen back (#332).
+
 ### CLI
 
 - `piewf --version` (`-v`) prints the CLI version, and `piewf --help` (`-h`, `help`) prints structured help with the commands and global options. Every command, including `inspect` and `transcript`, answers `--help`. With no arguments `piewf` prints the help on stderr, and with an unknown command `Unknown command: <name>` followed by the help, instead of the one-line usage on stdout; the exit code stays 1.
@@ -24,7 +28,7 @@
 
 ### Internal
 
-- Core reads a Pi session file in bounded chunks while its agent appends to it, and draws its records with Pi's own chat components, for an agents transcript pane (#331).
+- Core reads a Pi session file in bounded chunks while its agent appends to it, and draws its records with Pi's own chat components, for the `/agents` transcript pane (#331).
 
 ## [6.2.2] - 2026-10-18
 

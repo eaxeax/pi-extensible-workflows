@@ -7,7 +7,7 @@ import { listRunIds, RunStore, type AwaitingCheckpoint, type CompletedOperation,
 import { navigatorAttentionSortByState } from "./host-view.js";
 import type { AgentAttemptSummary, AgentRecord, JsonValue, LaunchSnapshot, RunState, WorkflowAgentSessionReference, WorkflowBudgetUsage, WorkflowErrorCode, WorkflowScriptCall } from "./types.js";
 import { normalizeSubagentRunRequest, type SubagentProgress, type SubagentRunRequest, type SubagentStatus } from "../subagents/src/contracts.js";
-import { statusValue, subagentErrorValue } from "../subagents/src/decode.js";
+import { safeSubagentId, statusValue, subagentErrorValue } from "../subagents/src/decode.js";
 import { isNodeError, jsonValue, object, resourcePatternHasMagic, selectResourcesByLayers } from "./utils.js";
 import type { TrajectoryAction, TrajectoryTarget } from "./trajectory-contracts.js";
 import { canonicalPath, sameFilesystemPath } from "./paths.js";
@@ -485,7 +485,6 @@ export function createTrajectorySubagentMetadataLoader(cwd: string, sessionId: s
     }));
   };
 }
-function safeTrajectorySubagentId(id: string): boolean { return id !== "." && id !== ".." && /^[A-Za-z0-9._-]+$/.test(id); }
 export function createTrajectoryTranscriptLoader(cwd: string, sessionId: string, home = homedir(), agentDir: string, resolveSubagentSession?: TrajectorySubagentSessionResolver): TrajectoryTranscriptLoader {
   return async (request) => {
     let path: string | undefined;
@@ -494,7 +493,7 @@ export function createTrajectoryTranscriptLoader(cwd: string, sessionId: string,
         const value = await new RunStore(cwd, sessionId, request.runId, home).load();
         path = sessionFile(value.run.agents.find((agent) => agent.id === request.agentId)?.attemptDetails?.at(-1)?.session);
       } else if (request.subagentId !== undefined && request.runId === undefined && request.agentId === undefined) {
-        if (!safeTrajectorySubagentId(request.subagentId)) return { status: "missing", revision: 0, entries: [], error: "Transcript not found" };
+        if (!safeSubagentId(request.subagentId)) return { status: "missing", revision: 0, entries: [], error: "Transcript not found" };
         const rawStatus = await readSubagentJson(join(agentDir, "subagents", request.subagentId, "status.json"));
         const status = statusValue(rawStatus);
         const statusRecord = object(rawStatus) ? rawStatus : undefined;
