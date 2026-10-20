@@ -102,7 +102,7 @@ void test("a selected agent shows its details and hint, or the action menu inste
     "      ▸ b · \x1b[32m✓\x1b[39m                              |",
     "    ship · \x1b[90m○\x1b[39m                               |",
   ]);
-  assert.deepEqual(dashboard(120, { nodeId: "phase/review%231/operation/p/a/agent/api", actions: { title: "Agent actions", options: ["Copy agent ID", "Back"], index: 1 } }), [
+  assert.deepEqual(dashboard(120, { nodeId: "phase/review%231/operation/p/a/agent/api", actions: { title: "Agent actions", options: ["Back"], index: 0 } }), [
     ...HEADER,
     "Tree                                       | State: running",
     "  ▾ Workflow · ⠦                           | Structural path: p > a",
@@ -112,8 +112,8 @@ void test("a selected agent shows its details and hint, or the action menu inste
     "    ◇ shell [running] (2 active) · ⠦       | Tokens: ∑900 ↑800 ↓100 ⇢0 ⇠0",
     "    ▾ p · ⠦                                | Cost: $0.25",
     "      ▾ a · ⠦                              | Agent actions",
-    "→       ▾ api · ⠦                          |   Copy agent ID",
-    "          • helper · ○                     | → Back",
+    "→       ▾ api · ⠦                          | → Back",
+    "          • helper · ○                     |",
     "      ▾ b · ✓                              |",
     "        • ui · ✓                           |",
     "    ship · ○                               |",

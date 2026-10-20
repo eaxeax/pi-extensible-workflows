@@ -3,8 +3,9 @@ import { mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { SubagentPresentation, SubagentPresenter } from "../src/agents-actions-contract.js";
 import { buildWorkflowPhaseModel, buildWorkflowPhaseTree, workflowPhaseTreeInitialExpanded, workflowPhaseTreeVisibleNodes } from "../src/host-phases.js";
-import { formatWorkflowTreeLine, type WorkflowProgressStyles } from "../src/host-view.js";
+import { formatWorkflowNodeDetails, formatWorkflowTreeLine, type WorkflowProgressStyles } from "../src/host-view.js";
 import { formatWorkflowPhaseDashboard, PLAIN_WORKFLOW_PROGRESS_STYLES, type AgentAttemptSummary, type AgentRecord, type PersistedRun, RunStore, type WorkflowAgentSession } from "../src/index.js";
 import { createSessionAgentsSource, type SessionAgentsDependencies, type SessionAgent, type SessionTreeNode } from "../src/session-agents.js";
 import type { SubagentManager, SubagentManagerContext } from "../subagents/src/contracts.js";
@@ -77,6 +78,19 @@ function fakeManager(listed: readonly Record<string, unknown>[], inspected: Read
     ...extra,
   };
 }
+/** A presenter that names the ids of `names` and records each describe() call; its details name the id and the time. */
+function fakePresenter(names: Readonly<Record<string, string>>, calls: (readonly string[])[] = []): SubagentPresenter {
+  return {
+    async describe(ids) {
+      calls.push(ids);
+      return new Map(ids.flatMap((id): [string, SubagentPresentation][] => {
+        const name = names[id];
+        return name === undefined ? [] : [[id, { name, details: (styles, now) => [styles.bold(`Subagent ${id}`), `at ${String(now)}`] }]];
+      }));
+    },
+  };
+}
+
 void test("lists this session's workflow runs in attention order, each as its /workflow tree, with the agents' summary, attempt and keys", async () => {
   const { home, cwd } = project("session-agents");
   // Whatever order readdir returns: the running run first, then the settled runs by the time they settled, newest first.
@@ -180,7 +194,7 @@ void test("a run with phases, a shell and parallel scopes gives the /workflow tr
   assert.deepEqual(details(review), ["Selected phase: review", "Status: running", "agents completed=1 running=1 failed=0 cancelled=0 pending=1", "Agents: 3", "Tokens: ∑1.2k ↑1.2k ↓0 ⇢0 ⇠0", "Cost: $0.38", "Elapsed: 30s"]);
   assert.deepEqual(details(`${review}/operation/p/b`), ["Selected operation: p > b", "Phase: review", "Status: completed", "agents completed=1 running=0 failed=0 cancelled=0 pending=0", "Agents: 1", "Tokens: ∑400 ↑400 ↓0 ⇢0 ⇠0", "Cost: $0.13", "Elapsed: 10s"]);
   assert.deepEqual(details(`${review}/shell`).slice(0, 1), ["Selected shell"]);
-  assert.deepEqual(details("run:run:api"), [], "an agent shows its transcript, not details");
+  assert.deepEqual(details("run:run:api"), ["State: running", "Structural path: p > a", "Model: openai/gpt", "Tools: (none)", "Duration: 30s", "Tokens: ∑800 ↑800 ↓0 ⇢0 ⇠0", "Cost: $0.25"], "what d shows for an agent: /workflow's agent details");
   const title = (key: string): string | undefined => nodes.find((node) => node.key === key)?.title(PLAIN);
   assert.equal(title("run:run"), "review flow run running");
   assert.equal(title(`${review}/operation/p`), "p running");
@@ -627,21 +641,206 @@ void test("an agent id that starts like a tree node's key part gets its own key,
   const keys = nodes.map(({ key }) => key);
   assert.equal(new Set(keys).size, keys.length, keys.join(", "));
   for (const node of nodes) assert.ok(node.parentKey === undefined || keys.includes(node.parentKey), node.key);
-  const agentNodes = nodes.filter(({ kind }) => kind === "agent");
+  assert.deepEqual(nodes.flatMap(({ target }) => target?.kind === "workflow-agent" ? [target.agentId] : []).sort(), ["node:phase/unassigned", "plain", "~node:phase/unassigned"]);
+  const agentNodes = nodes.filter(({ target }) => target?.kind === "workflow-agent");
   assert.equal(agentNodes.length, 3);
   for (const node of agentNodes) assert.equal(node.agent?.key, node.key);
 });
 
-void test("an inspection that names another id is not checked for: the listed row keeps its own id for its key and name", async () => {
+void test("the workflows scope lists only the runs and the subagents scope only the Subagents group, without reading the other side", async () => {
+  const { home, cwd } = project("session-agents");
+  await createRun({ home, cwd }, "run", "running", { workflowName: "flow", agents: [agent("a", "a", "running", [attempt(1, "a-1")])] });
+  const row = { id: "sub", sessionId: "session", state: "running", startedAt: 1, attempts: 1, progress: { accounting: ZERO, toolCalls: [] } };
+  const list = async (scope?: "all" | "workflows" | "subagents"): Promise<{ keys: string[]; overlaid: string[]; inspections: number; described: number }> => {
+    const manager = fakeManager([row]);
+    const overlaid: string[] = [];
+    const described: (readonly string[])[] = [];
+    const deps = dependencies(home, { overlayRun: (run) => { overlaid.push(run.id); return run; }, subagents: () => manager, subagentPresenter: () => fakePresenter({ sub: "named" }, described) });
+    const nodes = await createSessionAgentsSource(commandContext(cwd), deps, scope).list();
+    return { keys: nodes.map(({ key }) => key), overlaid, inspections: manager.contexts.length, described: described.length };
+  };
+  const runKeys = ["run:run", "run:run:node:phase/unassigned", "run:run:a"];
+  const subagentKeys = ["subagents", "subagent:sub"];
+  const all = { keys: [...runKeys, ...subagentKeys], overlaid: ["run"], inspections: 2, described: 1 };
+  assert.deepEqual(await list(), all, "the default scope lists both");
+  assert.deepEqual(await list("all"), all);
+  assert.deepEqual(await list("workflows"), { keys: runKeys, overlaid: ["run"], inspections: 0, described: 0 }, "no subagent is read or described");
+  assert.deepEqual(await list("subagents"), { keys: subagentKeys, overlaid: [], inspections: 2, described: 1 }, "no run is read");
+});
+
+void test("every node carries the target its actions apply to, with the run's and the agents' own ids", async () => {
+  const { home, cwd } = project("session-agents");
+  const phased = launch({ phases: ["plan", "review"] });
+  // Keys join ids with ":", so an id with one cannot be read back from its key; the target keeps it whole.
+  await createRun({ home, cwd }, "run", "running", { workflowName: "flow\u001b[31m", agents: [
+    agent("planner", "planner", "completed", [attempt(1, "planner-1")]),
+    agent("api:1", "api", "running", [attempt(1, "api-1")], { structuralPath: ["p"] }),
+  ], phase: "review", phaseHistory: [{ phase: "plan", afterAgent: 0 }, { phase: "review", afterAgent: 1 }] }, phased);
+  const overlayRun = (run: PersistedRun): PersistedRun => ({ ...run, activeShellsByPhase: [{ phaseIndex: 1, active: 1, startedAt: Date.now() }] });
+  const manager = fakeManager([{ id: "sub:1", sessionId: "session", state: "running", startedAt: 1, attempts: 1, progress: { accounting: ZERO, toolCalls: [] } }]);
+  const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home, { overlayRun, subagents: () => manager })).list();
+  const run = { kind: "run", runId: "run" } as const;
+  const review = "run:run:node:phase/review%231";
+  assert.deepEqual(nodes.map(({ key, kind, target }) => [key, kind, target]), [
+    ["run:run", "run", run],
+    ["run:run:node:phase/plan%231", "phase", run],
+    ["run:run:planner", "agent", { kind: "workflow-agent", runId: "run", agentId: "planner" }],
+    [review, "phase", run],
+    [`${review}/shell`, "shell", run],
+    [`${review}/operation/p`, "operation", run],
+    ["run:run:api:1", "agent", { kind: "workflow-agent", runId: "run", agentId: "api:1" }],
+    ["subagents", "group", { kind: "subagents" }],
+    ["subagent:sub:1", "agent", { kind: "subagent", id: "sub:1" }],
+  ]);
+});
+
+void test("a workflow agent's details are /workflow's details of its node, without the enter hints", async () => {
+  const { home, cwd } = project("session-agents");
+  const now = Date.now();
+  const phased = launch({ phases: ["plan", "review"] });
+  await createRun({ home, cwd }, "run", "running", { workflowName: "flow", agents: [
+    agent("planner", "planner", "completed", [attempt(1, "planner-1")], { label: "Planner", accounting: { input: 100, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.5 }, startedAt: now - 60_000, durationMs: 20_000 }),
+    agent("api", "api", "failed", [attempt(1, "api-1"), { ...attempt(2, "api-2"), error: { code: "E_FAIL", message: "boom" } }], { structuralPath: ["p", "a"], tools: ["read", "bash"], startedAt: now - 30_000 }),
+    agent("helper", "helper", "running", [attempt(1, "helper-1")], { parentId: "api", structuralPath: ["p", "a"], model: { ...MODEL, thinking: "high" }, startedAt: now - 5000 }),
+  ], phase: "review", phaseHistory: [{ phase: "plan", afterAgent: 0 }, { phase: "review", afterAgent: 1 }] }, phased);
+  const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home)).list();
+  const { run, snapshot: loaded } = await new RunStore(cwd, "session", "run", home).load();
+  const tree = buildWorkflowPhaseTree(buildWorkflowPhaseModel(run, loaded));
+  const agentNodes = tree.nodes.filter(({ kind }) => kind === "agent");
+  assert.equal(agentNodes.length, 3);
+  for (const treeNode of agentNodes) {
+    const node = nodes.find(({ key }) => key === `run:run:${treeNode.agentId ?? ""}`);
+    assert.ok(node, treeNode.id);
+    assert.deepEqual(node.details(TAGGED, now), formatWorkflowNodeDetails(run, tree, treeNode, TAGGED, now, false), treeNode.id);
+  }
+  assert.deepEqual(nodes.find(({ key }) => key === "run:run:api")?.details(TAGGED, now), ["State: <error>failed</error>", "Structural path: p > a", "Model: openai/gpt", "Tools: read, bash", "Attempts: 2", "Duration: 30s", "<error>Error: E_FAIL: boom</error>"], "the latest attempt's error last, no enter hint");
+});
+
+void test("a workflow agent's details show its strings as display text and keep the styles' escapes", async () => {
+  const { home, cwd } = project("session-agents");
+  await createRun({ home, cwd }, "run", "running", { workflowName: "flow", agents: [
+    agent("api", "api", "failed", [{ ...attempt(1, "api-1"), error: { code: "E\u001b[31m", message: "bad\u0007\nline" } }], { structuralPath: ["p\u001b]0;title\u0007", "q\u0008"], tools: ["read\u001b[2J", "bash"], model: { provider: "open\u0007ai", model: "g\u001b[1mpt" } }),
+  ] });
+  const overlayRun = (run: PersistedRun): PersistedRun => ({ ...run, agents: run.agents.map((record) => ({ ...record, activity: { kind: "tool", text: "grep\u001b[31m" } })) });
+  const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home, { overlayRun })).list();
+  const red = (text: string): string => `\u001b[31m${text}\u001b[39m`;
+  const styles: WorkflowProgressStyles = { ...PLAIN, error: red };
+  assert.deepEqual(nodes.find(({ key }) => key === "run:run:api")?.details(styles, Date.now()), [
+    "Activity: grep",
+    `State: ${red("failed")}`,
+    "Structural path: p > q ",
+    "Model: open ai/gpt",
+    "Tools: read, bash",
+    red("Error: E: bad  line"),
+  ]);
+});
+
+void test("a subagent takes its name and details from the subagents presenter, asked once per list with this session's subagents", async () => {
+  const { home, cwd } = project("session-agents");
+  const row = (id: string, state: string, extra: Record<string, unknown> = {}): Record<string, unknown> => ({ id, sessionId: "session", state, startedAt: 1, attempts: 1, progress: { accounting: ZERO, toolCalls: [] }, ...extra });
+  const longId = "0f0e0d0c-0b0a-4908-8706-050403020100";
+  const manager = fakeManager([row("sub-named", "running"), row(longId, "completed", { finishedAt: 2 }), row("sub-foreign", "running", { sessionId: "other-session" })]);
+  const described: (readonly string[])[] = [];
+  // The presenter knows the foreign subagent too, but it is not this session's; it cannot read the long id's request.
+  const presenter = fakePresenter({ "sub-named": "review\u001b[31m (sub-name)", "sub-foreign": "foreign" }, described);
+  const source = createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => manager, subagentPresenter: () => presenter }));
+  const nodes = await source.list();
+  assert.deepEqual(described.map((ids) => [...ids].sort()), [[longId, "sub-named"].sort()], "one call, with this session's subagents only");
+  const children = nodes.filter(({ parentKey }) => parentKey === "subagents");
+  assert.deepEqual(children.map(({ key, agent: shown }) => [key, shown?.name]), [["subagent:sub-named", "review (sub-name)"], [`subagent:${longId}`, "0f0e0d0c"]], "the presentation's name as display text; an id it left out keeps its short id");
+  assert.deepEqual(children.map((node) => node.line(PLAIN, false, false)), ["    • review (sub-name) · ⠦", "    • 0f0e0d0c · ✓"]);
+  assert.deepEqual(children.map((node) => node.title(PLAIN)), ["review (sub-name) running", "0f0e0d0c completed"]);
+  assert.deepEqual(children.map((node) => node.details(TAGGED, 42)), [["<bold>Subagent sub-named</bold>", "at 42"], []], "the presentation's details with the styles and time asked for");
+  await source.list();
+  assert.equal(described.length, 2, "each list asks again");
+});
+
+void test("without a presenter, with a presenter getter that throws, or with a describe() that rejects or throws, a subagent keeps its short id and no details, and the list succeeds", async () => {
+  const { home, cwd } = project("session-agents");
+  const longId = "0f0e0d0c-0b0a-4908-8706-050403020100";
+  const manager = fakeManager(["sub-short", longId].map((id) => ({ id, sessionId: "session", state: "running", startedAt: 1, attempts: 1, progress: { accounting: ZERO, toolCalls: [] } })));
+  const rejecting: SubagentPresenter = { describe: async () => { throw new Error("cannot read the requests"); } };
+  const throwing: SubagentPresenter = { describe: () => { throw new Error("cannot read the requests"); } };
+  const throwingGetter = (): SubagentPresenter | undefined => { throw new Error("no presenter for this context"); };
+  for (const [name, subagentPresenter] of [["no dependency", undefined], ["no presenter", () => undefined], ["a presenter getter that throws", throwingGetter], ["a rejecting describe()", () => rejecting], ["a describe() that throws", () => throwing]] as const) {
+    const deps = dependencies(home, { subagents: () => manager, ...(subagentPresenter === undefined ? {} : { subagentPresenter }) });
+    const nodes = await createSessionAgentsSource(commandContext(cwd), deps).list();
+    assert.deepEqual(nodes.map(({ key }) => key), ["subagents", "subagent:sub-short", `subagent:${longId}`], name);
+    const children = nodes.slice(1);
+    assert.deepEqual(children.map(({ agent: shown }) => shown?.name), ["sub-short", "0f0e0d0c"], name);
+    assert.deepEqual(children.map((node) => node.details(PLAIN, Date.now())), [[], []], name);
+  }
+});
+
+void test("a subagent whose presentation name is blank after sanitizing keeps its short id, as /subagents does with a blank label, and details that throw show none", async () => {
+  const { home, cwd } = project("session-agents");
+  const longId = "0f0e0d0c-0b0a-4908-8706-050403020100";
+  const names: Readonly<Record<string, string>> = { [longId]: "", "sub-bel": "\u0007", "sub-space": "   ", "sub-escape": "\u001b[31m", "sub-padded": "  padded\u0007 " };
+  const manager = fakeManager([...Object.keys(names), "sub-broken"].map((id) => ({ id, sessionId: "session", state: "running", startedAt: 1, attempts: 1, progress: { accounting: ZERO, toolCalls: [] } })));
+  const presenter: SubagentPresenter = {
+    describe: async () => new Map<string, SubagentPresentation>([
+      ...Object.entries(names).map(([id, name]): [string, SubagentPresentation] => [id, { name, details: () => ["kept"] }]),
+      ["sub-broken", { name: "broken", details: () => { throw new Error("cannot draw"); } }],
+    ]),
+  };
+  const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => manager, subagentPresenter: () => presenter })).list();
+  const children = new Map(nodes.filter(({ parentKey }) => parentKey === "subagents").map((node) => [node.key, node]));
+  assert.deepEqual([longId, "sub-bel", "sub-space", "sub-escape", "sub-padded"].map((id) => children.get(`subagent:${id}`)?.agent?.name), ["0f0e0d0c", "sub-bel", "sub-space", "sub-escape", "padded"], "an empty, BEL-only, whitespace-only or escape-only name falls back to the short id; a name is trimmed");
+  assert.deepEqual(children.get(`subagent:${longId}`)?.details(PLAIN, 1), ["kept"]);
+  assert.equal(children.get("subagent:sub-broken")?.agent?.name, "broken");
+  assert.deepEqual(children.get("subagent:sub-broken")?.details(PLAIN, 1), [], "a presenter that throws while drawing shows no details");
+});
+
+void test("the presenter is asked for every subagent this Pi session lists with a safe id, whatever its inspection shows, as /subagents names its rows; owned still follows the inspection", async () => {
+  const { home, cwd } = project("session-agents");
+  const row = (id: string): Record<string, unknown> => ({ id, sessionId: "session", state: "running", startedAt: 1, attempts: 1, progress: { accounting: ZERO, toolCalls: [] } });
+  const ids = ["sub-safe", "bad/id", "..", "sub-foreign", "sub-away", "sub-rejected"];
+  // The list rows all claim this session; the inspected records name another session and another cwd, and one inspection rejects.
+  const base = fakeManager(ids.map(row), { "sub-foreign": { ...row("sub-foreign"), sessionId: "other-session" }, "sub-away": { ...row("sub-away"), cwd: join(cwd, "elsewhere") } });
+  const manager: SubagentManager = { ...base, inspect: async (request, context) => request.id === "sub-rejected" ? Promise.reject(new Error("unreadable record")) : base.inspect(request, context) };
+  const described: (readonly string[])[] = [];
+  const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => manager, subagentPresenter: () => fakePresenter(Object.fromEntries(ids.map((id) => [id, `named ${id}`])), described) })).list();
+  assert.deepEqual(described.map((asked) => [...asked].sort()), [["sub-away", "sub-foreign", "sub-rejected", "sub-safe"]], "one call, with the session-listed safe ids only");
+  assert.deepEqual(nodes.filter(({ parentKey }) => parentKey === "subagents").map(({ agent: shown }) => [shown?.name, shown?.owned]).sort(), [
+    ["..", false],
+    ["bad/id", false],
+    ["named sub-away", false],
+    ["named sub-foreign", false],
+    ["named sub-rejected", false],
+    ["named sub-safe", true],
+  ]);
+});
+
+void test("a presentation for an id the source did not ask for is ignored: the listed row keeps its own id for its key, name, details and target", async () => {
   const { home, cwd } = project("session-agents");
   const row = (id: string, sessionId = "session", state = "running"): Record<string, unknown> => ({ id, sessionId, state, startedAt: 1, attempts: 1, progress: { accounting: ZERO, toolCalls: [] } });
   const manager = fakeManager([row("sub-safe"), row("bad/id"), row(".."), row("sub-other", "other-session"), row("sub-moved")]);
-  const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => manager })).list();
+  const described: (readonly string[])[] = [];
+  // A presenter that answers for every id it knows, asked or not.
+  const presenter: SubagentPresenter = {
+    async describe(asked) {
+      described.push(asked);
+      return new Map(["sub-safe", "bad/id", "..", "sub-other", "sub-moved", "sub-elsewhere"].map((id): [string, SubagentPresentation] => [id, { name: `named ${id}`, details: () => [`details ${id}`] }]));
+    },
+  };
+  const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => manager, subagentPresenter: () => presenter })).list();
+  assert.deepEqual(described.map((asked) => [...asked].sort()), [["sub-moved", "sub-safe"]]);
   const children = nodes.filter(({ parentKey }) => parentKey === "subagents");
-  assert.deepEqual(children.map(({ key, agent: shown }) => [key, shown?.key, shown?.name]).sort(), [["subagent:..", "subagent:..", ".."], ["subagent:bad/id", "subagent:bad/id", "bad/id"], ["subagent:sub-moved", "subagent:sub-moved", "sub-moved"], ["subagent:sub-safe", "subagent:sub-safe", "sub-safe"]]);
+  assert.deepEqual(children.map(({ key, agent: shown }) => [key, shown?.key, shown?.name]).sort(), [["subagent:..", "subagent:..", ".."], ["subagent:bad/id", "subagent:bad/id", "bad/id"], ["subagent:sub-moved", "subagent:sub-moved", "named sub-moved"], ["subagent:sub-safe", "subagent:sub-safe", "named sub-safe"]]);
+  assert.deepEqual(children.map((node) => [node.key, node.details(PLAIN, 1)]).sort(), [["subagent:..", []], ["subagent:bad/id", []], ["subagent:sub-moved", ["details sub-moved"]], ["subagent:sub-safe", ["details sub-safe"]]]);
   const moved = children.find(({ key }) => key === "subagent:sub-moved");
   assert.ok(moved);
-  assert.ok(nodes.every(({ key, agent: shown }) => !key.includes("sub-elsewhere") && !shown?.key.includes("sub-elsewhere")), "no node names the id the list never named");
+  assert.deepEqual(moved.target, { kind: "subagent", id: "sub-moved" }, "its actions address the listed subagent");
+  assert.ok(nodes.every(({ key, agent: shown, target }) => !key.includes("sub-elsewhere") && !shown?.key.includes("sub-elsewhere") && !(target?.kind === "subagent" && target.id === "sub-elsewhere")), "no node names or targets the id the list never named");
+});
+
+void test("when no subagent this Pi session lists has a safe id, the presenter is never asked and every row keeps its id", async () => {
+  const { home, cwd } = project("session-agents");
+  const manager = fakeManager(["bad/id", ".."].map((id) => ({ id, sessionId: "session", state: "running", startedAt: 1, attempts: 1, progress: { accounting: ZERO, toolCalls: [] } })));
+  const described: (readonly string[])[] = [];
+  const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => manager, subagentPresenter: () => fakePresenter({ "bad/id": "named bad", "..": "named dots" }, described) })).list();
+  assert.deepEqual(described, [], "describe() is not called");
+  assert.deepEqual(nodes.map(({ key, agent: shown }) => [key, shown?.name]), [["subagents", undefined], ["subagent:bad/id", "bad/id"], ["subagent:..", ".."]]);
 });
 
 void test("a subagent storage failure keeps the run nodes and lists the Subagents group, unavailable, without children", async () => {
