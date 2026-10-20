@@ -5,6 +5,7 @@ import { agentsAction, type ActionUi, type AgentsActionProvider, type AgentsActi
 import { failureDiagnosticsFrom, formatWorkflowFailureDelivery, formatWorkflowFailureDeliveryFallback } from "./host-delivery.js";
 import type { WorkflowNavigatorDependencies } from "./host-navigator.js";
 import { agentActionLabels, visibleAgentAttemptActions as visibleRegisteredAgentAttemptActions } from "./host-view.js";
+import { worktreeDiff, worktreeHasUntracked } from "./agent-worktree.js";
 import { listRunIds, RunStore, type AwaitingCheckpoint, type PersistedRun, type WorktreeReference } from "./persistence.js";
 import { runDependencyIds } from "./retention.js";
 import type { AgentAttemptAction, AgentAttemptActionContext, AgentAttemptActionUi, AgentRecord, JsonValue, LaunchSnapshot } from "./types.js";
@@ -206,13 +207,17 @@ export function visibleAgentAttemptActions(deps: Pick<WorkflowActionDependencies
 }
 /** The agent's labels in menu order, Back last. */
 export function agentActionOptions(deps: WorkflowActionDependencies, ctx: ExtensionContext, view: WorkflowRunView, agent: AgentRecord): string[] {
-  return agentActionLabels({
+  const worktree = agentWorktree(view, agent);
+  const labels = agentActionLabels({
     extensionLabels: visibleAgentAttemptActions(deps, view, agent).map(([, action]) => action.label),
-    hasWorktree: agentWorktree(view, agent) !== undefined,
+    hasWorktree: worktree !== undefined,
     openPrompt: ctx.mode === "tui" && agent.prompt !== undefined,
     openSystemPrompt: ctx.mode === "tui" && agent.systemPrompt !== undefined,
     openResult: ctx.mode === "tui" && view.agentResults.has(agent.id),
   });
+  const at = labels.indexOf("Copy worktree path");
+  if (ctx.mode === "tui" && worktree && at >= 0) labels.splice(at + 1, 0, "Open diff in editor");
+  return labels;
 }
 /** Runs one of the agent's labels other than Back; a label it does not know does nothing. `detached` (the TUI workspace): a registered action is started, not awaited. */
 export async function runAgentAction(deps: WorkflowActionDependencies, ui: ActionUi, view: WorkflowRunView, agent: AgentRecord, label: string, detached = false): Promise<void> {
@@ -222,6 +227,14 @@ export async function runAgentAction(deps: WorkflowActionDependencies, ui: Actio
   if (label === "Open result in editor") {
     const result = view.agentResults.get(agent.id);
     if (result !== undefined) await ui.openArtifact(workflowResultArtifact(result), "agent result");
+    return;
+  }
+  if (label === "Open diff in editor" && worktree) {
+    let diff: string;
+    try { diff = await worktreeDiff(worktree); }
+    catch (error) { ui.notify(`Cannot read the worktree diff: ${errorText(error)}`, "warning"); return; }
+    if (diff.trim() === "") ui.notify(await worktreeHasUntracked(worktree).catch(() => false) ? "No tracked changes since the worktree was created; untracked files are not in the diff." : "No changes since the worktree was created.", "info");
+    else await ui.openArtifact({ extension: ".diff", content: diff }, "worktree diff");
     return;
   }
   if (label === "Copy agent ID") { await copyArtifact(deps.clipboard, ui, agent.id, "agent ID"); return; }
