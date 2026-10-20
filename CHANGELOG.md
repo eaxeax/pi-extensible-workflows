@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### Documentation
+
+- The settings reference lists `codemodeTools` (global settings only) and `retention`, and says that `workflow.js` and the other files opened in the external editor are temporary copies whose edits are not kept (#331).
+
 ## [6.2.2] - 2026-10-18
 
 ### Fixes
