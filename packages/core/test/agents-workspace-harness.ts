@@ -169,7 +169,7 @@ export class FakeLive implements Pick<WorkflowAgentSession, "subscribe"> {
  * agent shows on d (none by default); `target` its action target (none by default).
  */
 export interface Spec { readonly key: string; readonly parent?: string; readonly kind?: SessionTreeNode["kind"]; readonly label?: string; readonly state?: RunState; readonly expanded?: boolean; readonly agent?: SessionAgent; readonly details?: readonly string[]; readonly target?: AgentsActionTarget }
-/** Nodes drawn with the /workflow row formatter, as the source draws them; a node that is not an agent details itself as "details of <label>" and "state <state>". */
+/** Nodes drawn with the /workflow row formatter, as the source draws them; a node that is not an agent details itself as "details of <label>" and "state <state>"; an agent's ID is its key. */
 export function tree(specs: readonly Spec[]): SessionTreeNode[] {
   const depths = new Map<string, number>();
   return specs.map((spec) => {
@@ -181,6 +181,7 @@ export function tree(specs: readonly Spec[]): SessionTreeNode[] {
     const children = specs.filter((child) => child.parent === spec.key).map(({ key }) => key);
     return {
       key: spec.key, parentKey: spec.parent, depth, kind, initiallyExpanded: spec.expanded ?? children.length > 0, agent: spec.agent,
+      label, state: spec.agent?.state ?? state, ...(spec.agent ? { id: spec.key } : {}),
       line: (styles, selected, expanded) => formatWorkflowTreeLine({ kind, label, depth, state, children }, selected, expanded, styles),
       details: () => spec.agent ? spec.details ?? [] : [`details of ${label}`, `state ${state}`],
       title: () => `${label} ${state}`,
@@ -266,7 +267,7 @@ export interface FakePi {
  * `fail` makes opening fail before the workspace exists (the cursor query) or after it was built (the terminal's start);
  * `context` adds fields to the command context (cwd, mode, sessionManager, ...).
  */
-export function fakePi(options: { columns?: number | undefined; rows?: number | undefined; signal?: AbortSignal | undefined; fail?: "cursor" | "start" | undefined; keybindings?: PiKeybindings | undefined; toolsExpanded?: boolean | undefined; context?: Readonly<Record<string, unknown>> | undefined } = {}): FakePi {
+export function fakePi(options: { columns?: number | undefined; rows?: number | undefined; signal?: AbortSignal | undefined; fail?: "cursor" | "start" | undefined; keybindings?: PiKeybindings | undefined; theme?: Theme | undefined; toolsExpanded?: boolean | undefined; context?: Readonly<Record<string, unknown>> | undefined } = {}): FakePi {
   const terminal = new FakeTerminal(options.columns ?? 120, options.rows ?? 20);
   if (options.fail === "start") terminal.failStart = new Error("terminal unavailable");
   const parent: string[] = [];
@@ -314,7 +315,7 @@ export function fakePi(options: { columns?: number | undefined; rows?: number | 
           // Pi hands a custom component the keybindings it installed as pi-tui's.
           const keybindings = options.keybindings ?? KEYBINDINGS;
           setKeybindings(keybindings);
-          const component = factory(parentTui, THEME, keybindings, done);
+          const component = factory(parentTui, options.theme ?? THEME, keybindings, done);
           assert.ok(component.render(40).every((line) => visibleWidth(line) <= 40));
           // A component closed while it was built is not shown.
           if (!state.closed) { entry = { component, options: customOptions, close: () => { done(undefined as T); } }; customs.push(entry); }
@@ -385,6 +386,8 @@ export interface OpenOptions {
   notices?: readonly string[];
   editorCommand?: () => string | undefined;
   keybindings?: PiKeybindings;
+  /** Pi's theme; the default draws text as it is. */
+  theme?: Theme;
   /** What Pi's ctx.ui.getToolsExpanded answers; false by default. */
   toolsExpanded?: boolean;
   /** Fields added to the command context (cwd, ...). */
@@ -399,7 +402,7 @@ export interface OpenOptions {
  * `actions`, `state`, `notices` and `editorCommand` go to the workspace as they are.
  */
 export async function open(agents: Listed[], options: OpenOptions = {}): Promise<Harness> {
-  const pi = fakePi({ columns: options.columns, rows: options.rows, signal: options.signal, fail: options.fail, keybindings: options.keybindings, toolsExpanded: options.toolsExpanded, context: options.context });
+  const pi = fakePi({ columns: options.columns, rows: options.rows, signal: options.signal, fail: options.fail, keybindings: options.keybindings, theme: options.theme, toolsExpanded: options.toolsExpanded, context: options.context });
   const harness: Harness = Object.assign(pi, {
     agents, nodes: options.nodes, listError: undefined, listThrow: options.listThrow, listCalls: 0, opened: [], sources: [], views: [], left: false,
     done: Promise.resolve(), exit: undefined, parentAtExit: undefined,
@@ -511,7 +514,8 @@ export function menuRows(pi: FakePi): string[] {
 export const POLLS = 2000;
 /** The workspace is Pi's custom component, drawn as its placeholder, and reads the terminal: not stepped aside, not in its external editor. */
 export function workspaceOpen(pi: FakePi): boolean { return pi.terminal.input !== undefined && pi.customs.some(({ component }) => component.render(40)[0] === "opening agents…"); }
-export function titleOf(pi: FakePi): string { return (pi.screen()[0] ?? "").trimEnd(); }
+/** The title row without the session totals the workspace right-aligns after two or more spaces. */
+export function titleOf(pi: FakePi): string { return (pi.screen()[0] ?? "").replace(/ {2,}\S.*$/, "").trimEnd(); }
 /** Waits until the workspace is open, listed, with `title` in its title row. */
 export async function shown(pi: FakePi, title: RegExp): Promise<void> {
   await until(() => workspaceOpen(pi) && title.test(titleOf(pi)), () => `the workspace open on ${String(title)}; it shows:\n${workspaceOpen(pi) ? pi.screen().join("\n") : "nothing"}\nPi saw:\n${pi.events.join("\n")}`, POLLS);
