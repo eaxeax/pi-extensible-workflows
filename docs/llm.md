@@ -100,7 +100,7 @@ Trajectory also publishes current-session durable standalone subagents as first-
 
 ### Background workflow widget
 
-`backgroundWidget` is a global boolean that defaults to `true`. Set it to `false` to disable the live background-run tree and durable background-run transcript receipts. Foreground workflow rendering is unchanged. Headless and non-TUI hosts do not draw the widget or append receipts.
+`backgroundWidget` is a global boolean that defaults to `true`. Set it to `false` to disable the live background-run tree and the transcript receipts workflow runs leave (background subagents' receipts are written regardless). Foreground workflow rendering is unchanged. Headless and non-TUI hosts do not draw the widget or append receipts. Background subagents show in the same widget as a "Subagents" group; the cursor and `enter` open `/agents` on any row (a run, a phase, an agent, the Subagents group, or a subagent). While an agents workspace is open the widget is quiet. Live background subagent rows show only in this widget; the subagents extension draws no frame of its own. With the workflow extension not loaded or `backgroundWidget: false`, no live subagent rows show, only the receipt each background subagent leaves in the transcript when it settles. Rows that do not fit collapse into one `… N more` row. `Alt+O` scrolls the widget only while its `Alt+O to scroll` hint shows; otherwise the key passes through. It is not a Pi shortcut and cannot be rebound.
 
 ### Models and aliases
 
