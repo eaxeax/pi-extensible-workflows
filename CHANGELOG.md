@@ -8,6 +8,7 @@
   - `/subagents`: the run list beside the details, the narrow drill-down, `enter` or `a` for actions, the inline Steer editor, and the inline confirmation. The bulk deletes are in the Subagents group's menu.
   - Both: in the workspace `a` opens a node's menu; `enter` on an agent does not. Stop and deletions confirm in Pi's dialog. Outside the TUI both pickers stay.
 - `createInlineConfirm` is no longer exported. `WorkflowTui.stop()` may return `false` to cancel: `openWorkflowArtifact` then starts no editor and returns `undefined` (#333).
+- Background subagents show live only in the workflow widget: with the workflow extension not loaded, or with `backgroundWidget: false`, no live background subagent rows are shown, only the receipt each leaves when it settles. Alt+O is no longer registered as a Pi shortcut, so `/hotkeys` does not list it and it cannot be rebound: the widget takes it only while its `Alt+O to scroll` hint shows (a narrow title cuts its counts to keep the hint), otherwise the key goes on to the editor (#336).
 
 ### New capabilities
 
@@ -15,6 +16,7 @@
 - In `/agents`, `a` opens the selected node's action menu: a run's actions, then `Model aliases` and the bulk deletes; an agent's actions, registered ones such as Herdr's included; a subagent's actions; the Subagents group's bulk deletes. Copies and the external editors run in place; registered actions run detached in the TUI workspace, their working message and failure notice show in its status row (Pi's own working message is cleared when the workspace opens, and an action that settles after `/reload` or `/new` shows nothing), and their dialogs are refused there, and any other action closes the workspace, runs with Pi's dialogs, and opens it again on the same node. `d` shows an agent's details instead of its transcript. Steer opens Pi's editor dialog, also in the `/subagents` picker outside the TUI (#333).
 - `/agents` marks what needs a person: `⚠ quiet` or `⚠ stalled` on a running agent or subagent without a sign of life for 3 or 10 minutes, and `◆ waiting` on a run awaiting input. `n`/`N` select the next or previous such node, failed agents and runs that have used up their budget included. The title shows the session totals (running, tokens, cost). `f` follows a running agent with its transcript at the tail, and `/` filters the sidebar by name, ID, or `state:<state>` (#334).
 - In `/agents`, the menu of a workflow agent that owns a worktree offers `Open diff in editor` (#335).
+- The workflow widget shows this session's running background subagents as a "Subagents" group after the runs, and when its tree does not fit it keeps the rows that need attention. In scroll mode Alt+O leaves scroll mode and `enter` opens `/agents` on the row's run, phase, agent, or subagent. The widget draws nothing while an agents workspace is open (#336).
 
 ### CLI
 
@@ -23,6 +25,7 @@
 ### Fixes
 
 - Stopping a run (`workflow_stop`, `/workflow`) while one of its agents waits on the provider error dialog (Retry, Change model, Abort workflow) no longer waits for an answer: the attempt ends as cancelled and the dialog closes, as does Pi's searchable model picker opened from "Change model", so the next agent's provider error dialog is no longer held behind it.
+- The workflow widget no longer repaints every 125 ms: one tick a second, only while background work is live, moves its spinner and clocks, and Pi's renders on keystrokes and streamed tokens read no run file; an interrupted, paused, or budget-exhausted run, which nothing ticks, shows the runtime it recorded, as `/agents` does (#336).
 - A failed run releases its retry lineage before its `failed` state becomes visible, so a `workflow_retry` issued as soon as the state reads `failed` is no longer rejected with "An active retry already owns lineage".
 - Retention no longer stops with "Run inventory contains an unrecognized artifact" when it meets a `summary.json` that is being written. Only the exact temporary name that the atomic write uses is accepted.
 - Session shutdown waits for the terminal delivery of background runs that settled just before it, so a run's files are no longer removed while its delivery state is still being written.
