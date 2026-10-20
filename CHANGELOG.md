@@ -18,6 +18,10 @@
 
 - The Trajectory server no longer drops a publisher whose TCP chunk carries several complete WebSocket frames that together exceed the frame limit. Only the unfinished frame left after parsing is bounded, and an oversized receive buffer is trimmed after each chunk.
 
+### Documentation
+
+- The settings reference lists `codemodeTools` (global settings only) and `retention`, and says that `workflow.js` and the other files opened in the external editor are temporary copies whose edits are not kept (#331).
+
 ## [6.2.2] - 2026-10-18
 
 ### Fixes
