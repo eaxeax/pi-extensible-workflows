@@ -43,7 +43,7 @@ void test("the shared helpers: the latest attempt in any order, the short id of 
   assert.equal(latestAttempt(undefined), undefined);
   assert.equal(shortSubagentId("0123456789abc"), "01234567");
   assert.equal(shortSubagentId("0123456789ab"), "0123456789ab");
-  assert.deepEqual(["Copy run ID", "Copy agent ID", "Steer"].map(agentsAction), [{ label: "Copy run ID", inPlace: true }, { label: "Copy agent ID", inPlace: true }, { label: "Steer" }]);
+  assert.deepEqual(["Open diff in editor", "Copy run ID", "Copy agent ID", "Steer"].map(agentsAction), [{ label: "Open diff in editor", inPlace: true }, { label: "Copy run ID", inPlace: true }, { label: "Copy agent ID", inPlace: true }, { label: "Steer" }]);
 });
 
 void test("offers each subagent today's /subagents labels for its state, without Back, and marks the in-place ones", async () => {

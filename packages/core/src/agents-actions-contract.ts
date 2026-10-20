@@ -34,7 +34,7 @@ export interface AgentsAction {
 }
 
 /** The labels every provider runs inside the workspace: the copies and the external editors. */
-const IN_PLACE_LABELS: ReadonlySet<string> = new Set(["Copy run path", "Copy run ID", "Copy agent ID", "Copy branch", "Copy worktree path", "Open script in editor", "Open prompt in editor", "Open system prompt in editor", "Open result in editor"]);
+const IN_PLACE_LABELS: ReadonlySet<string> = new Set(["Copy run path", "Copy run ID", "Copy agent ID", "Copy branch", "Copy worktree path", "Open script in editor", "Open diff in editor", "Open prompt in editor", "Open system prompt in editor", "Open result in editor"]);
 /** A provider's label as a menu action, marked in place when it is one of IN_PLACE_LABELS. */
 export function agentsAction(label: string): AgentsAction { return IN_PLACE_LABELS.has(label) ? { label, inPlace: true } : { label }; }
 
