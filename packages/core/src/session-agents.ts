@@ -1,14 +1,15 @@
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { SubagentManager, SubagentManagerContext, SubagentStatus } from "../subagents/src/contracts.js";
-import { attemptValue, safeSubagentId, statusValue } from "../subagents/src/decode.js";
+import type { SubagentManager, SubagentStatus } from "../subagents/src/contracts.js";
+import { attemptValue, latestAttempt, managerContext, safeSubagentId, shortSubagentId, statusValue, SUBAGENT_ATTENTION_ORDER } from "../subagents/src/decode.js";
+import type { AgentsActionTarget, SubagentPresentation, SubagentPresenter } from "./agents-actions-contract.js";
 import { formatCost, formatTokens } from "./background-widget.js";
 import { buildWorkflowPhaseModel, buildWorkflowPhaseTree, workflowPhaseTreeInitialExpanded, workflowPhaseTreeVisibleNodes, type WorkflowPhaseTreeNode } from "./host-phases.js";
 import { agentActivityLabel, formatWorkflowNodeDetails, formatWorkflowRuntime, formatWorkflowTreeLine, navigatorAttentionSort, navigatorAttentionSortByState, progressStyleForState, runStateGlyph, type WorkflowProgressStyles } from "./host-view.js";
 import { sameFilesystemPath } from "./paths.js";
 import { listRunIds, RunStore, type PersistedRun } from "./persistence.js";
-import { isHardTerminalRunState, SETTLED_AGENT_STATES, type AgentAccounting, type AgentAttemptSummary, type AgentRecord, type LaunchSnapshot, type ModelSpec, type WorkflowAgentSession, type WorkflowAgentSessionReference } from "./types.js";
+import { isHardTerminalRunState, SETTLED_AGENT_STATES, type AgentAccounting, type AgentAttemptError, type AgentAttemptSummary, type AgentRecord, type LaunchSnapshot, type ModelSpec, type WorkflowAgentSession, type WorkflowAgentSessionReference } from "./types.js";
 import { budgetUsage } from "./budget.js";
 import { errorText, isObject, sanitizeDisplayText } from "./utils.js";
 
@@ -57,12 +58,18 @@ export interface SessionTreeNode {
    * group's counts and cost). Every other node is its /workflow tree row at `depth`: arrow, indent, ▾/▸/•/◇ icon, label, " · ", state glyph.
    */
   line(styles: WorkflowProgressStyles, selected: boolean, expanded: boolean): string;
-  /** What the right pane shows for a node that is not an agent, as /workflow details it without its enter hints; empty for an agent, which shows its transcript. */
+  /**
+   * What the right pane shows for a node that is not an agent, as /workflow details it without its enter hints. For an
+   * agent, what `d` shows instead of its transcript (/workflow's agent details, the /subagents detail rows); empty when
+   * there is nothing to show.
+   */
   details(styles: WorkflowProgressStyles, now: number): readonly string[];
   /** The title row of a node that is not an agent: its label and state. */
   title(styles: WorkflowProgressStyles): string;
   /** Set only for kind "agent". */
   readonly agent: SessionAgent | undefined;
+  /** What the node's actions apply to; a node without one has no action menu. */
+  readonly target?: AgentsActionTarget;
 }
 
 export interface SessionAgentsSource {
@@ -77,18 +84,13 @@ export interface SessionAgentsDependencies {
   /** The in-process session of a workflow agent, whatever attempt it runs. */
   liveAgent(runId: string, agentId: string): WorkflowAgentSession | undefined;
   subagents(): SubagentManager | undefined;
+  /** Names and details of the subagents, from the subagents extension when it publishes them. */
+  readonly subagentPresenter?: () => SubagentPresenter | undefined;
 }
 
-/** The order of the /subagents dashboard (subagents/src/navigator.ts). */
-const SUBAGENT_ATTENTION_ORDER: Readonly<Record<SubagentStatus["state"], number>> = { running: 0, failed: 1, stopped: 2, completed: 3 };
+/** What a source lists: /agents both, /workflow its runs, /subagents its group. */
+export type SessionAgentsScope = "all" | "workflows" | "subagents";
 
-/** The /subagents dashboard's manager context; per-agent inspections carry the attempt metadata and live activity. */
-function managerContext(context: ExtensionCommandContext, includeAttemptMetadata: boolean): SubagentManagerContext {
-  return { toolCallId: "agents-command", signal: undefined, onUpdate: undefined, ...(includeAttemptMetadata ? { includeAttemptMetadata: true, includeActivity: true } : {}), extensionContext: context };
-}
-function latestAttempt(attempts: readonly AgentAttemptSummary[] | undefined): AgentAttemptSummary | undefined {
-  return (attempts ?? []).reduce<AgentAttemptSummary | undefined>((latest, candidate) => !latest || candidate.attempt > latest.attempt ? candidate : latest, undefined);
-}
 /** The in-process session, only when it runs `attempt` (same transport and session id). */
 function attemptLiveSession(session: WorkflowAgentSession | undefined, attempt: AgentAttemptSummary | undefined): WorkflowAgentSession | undefined {
   const reference = attempt?.session;
@@ -113,9 +115,21 @@ const RUN_NODE_KIND: Readonly<Record<WorkflowPhaseTreeNode["kind"], SessionTreeN
 function nodeTitle(label: string, state: string, styles: WorkflowProgressStyles): string {
   return `${styles.bold(label)} ${progressStyleForState(state, styles)(state)}`;
 }
+function displayError(error: AgentAttemptError): AgentAttemptError { return { code: sanitizeDisplayText(error.code), message: sanitizeDisplayText(error.message) }; }
+/** The strings an agent's /workflow details show, as display text; its states and numbers stay as they are. */
+function displayAgent(agent: AgentRecord): AgentRecord {
+  return {
+    ...agent,
+    model: { ...agent.model, provider: sanitizeDisplayText(agent.model.provider), model: sanitizeDisplayText(agent.model.model) },
+    tools: agent.tools.map(sanitizeDisplayText),
+    ...(agent.structuralPath ? { structuralPath: agent.structuralPath.map(sanitizeDisplayText) } : {}),
+    ...(agent.activity ? { activity: { ...agent.activity, text: sanitizeDisplayText(agent.activity.text) } } : {}),
+    ...(agent.attemptDetails ? { attemptDetails: agent.attemptDetails.map((attempt) => attempt.error ? { ...attempt, error: displayError(attempt.error) } : attempt) } : {}),
+  };
+}
 /** The text a /workflow tree node shows, as display text; its id, and so its key, stays the run's own. */
 function displayNode(node: WorkflowPhaseTreeNode): WorkflowPhaseTreeNode {
-  return { ...node, label: sanitizeDisplayText(node.label), phaseId: sanitizeDisplayText(node.phaseId), operationPath: node.operationPath.map(sanitizeDisplayText), ...(node.phase ? { phase: { ...node.phase, name: sanitizeDisplayText(node.phase.name) } } : {}) };
+  return { ...node, label: sanitizeDisplayText(node.label), phaseId: sanitizeDisplayText(node.phaseId), operationPath: node.operationPath.map(sanitizeDisplayText), ...(node.phase ? { phase: { ...node.phase, name: sanitizeDisplayText(node.phase.name) } } : {}), ...(node.agent ? { agent: displayAgent(node.agent) } : {}) };
 }
 /** The /subagents dashboard's header counts (headerRows in subagents/src/navigator.ts): the count of each state and the total cost. */
 function subagentsCounts(statuses: readonly SubagentStatus[]): string {
@@ -146,6 +160,7 @@ function unavailableGroup(reason: string): SessionTreeNode {
     details: (styles) => [styles.bold(styles.accent("Subagents")), text],
     title: (styles) => nodeTitle("Subagents", "failed", styles),
     agent: undefined,
+    target: { kind: "subagents" },
   };
 }
 
@@ -166,11 +181,11 @@ async function summaryIsFresh(directory: string): Promise<boolean> {
 /** What a listing reads of a run; createdAt is NaN without a readable summary. */
 type ReadRun = { readonly loaded: { readonly run: PersistedRun; readonly snapshot: Readonly<LaunchSnapshot> }; readonly resolvedAt: number | undefined; readonly createdAt: number };
 
-export function createSessionAgentsSource(context: ExtensionContext, deps: SessionAgentsDependencies): SessionAgentsSource {
+export function createSessionAgentsSource(context: ExtensionContext, deps: SessionAgentsDependencies, scope: SessionAgentsScope = "all"): SessionAgentsSource {
   /** Every run read: its state, snapshot and summary are read again only when its stamp changes. */
   const runs = new Map<string, ReadRun & { readonly stamp: string }>();
-  /** Every subagent inspected: a settled one is inspected again only when its listed state or finishedAt changes. */
-  const subagentsSeen = new Map<string, { readonly state: SubagentStatus["state"]; readonly finishedAt: number | undefined; readonly record: unknown }>();
+  /** Every subagent inspected and described: a settled one is inspected and described again only when its listed state or finishedAt changes. */
+  const subagentsSeen = new Map<string, { readonly state: SubagentStatus["state"]; readonly finishedAt: number | undefined; readonly record: unknown; readonly described: boolean; readonly presentation: SubagentPresentation | undefined }>();
   const runAgent = (run: PersistedRun, agent: AgentRecord): SessionAgent => {
     const attempt = latestAttempt(agent.attemptDetails);
     const running = !SETTLED_AGENT_STATES.has(agent.state);
@@ -196,6 +211,7 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
     const expanded = workflowPhaseTreeInitialExpanded(tree);
     const key = (node: WorkflowPhaseTreeNode): string => node.kind === "workflow" ? `run:${run.id}` : node.kind === "agent" && node.agent ? `run:${run.id}:${agentKeyPart(node.agent.id)}` : `run:${run.id}:node:${node.id}`;
     const shownRun = { workflowName: sanitizeDisplayText(run.workflowName), id: sanitizeDisplayText(run.id) };
+    const runTarget: AgentsActionTarget = { kind: "run", runId: run.id };
     // Every node expanded: the sidebar order, a parent before its children.
     return workflowPhaseTreeVisibleNodes(tree, new Set(tree.nodes.map(({ id }) => id))).map((node) => {
       const parent = node.parentId === undefined ? undefined : tree.byId.get(node.parentId);
@@ -213,9 +229,10 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
         // A finished run starts collapsed; inside a run the nodes start as in /workflow.
         initiallyExpanded: root ? !isHardTerminalRunState(run.state) : expanded.has(node.id),
         line: (styles, selected, open) => root ? headerLine(shown.label, runSummary(run, styles), selected, open, node.children.length > 0, styles) : formatWorkflowTreeLine(shown, selected, open, styles),
-        details: (styles, now) => agent ? [] : formatWorkflowNodeDetails(shownRun, tree, shown, styles, now, false),
+        details: (styles, now) => formatWorkflowNodeDetails(shownRun, tree, shown, styles, now, false),
         title: (styles) => nodeTitle(shown.label, node.state, styles),
         agent: agent && runAgent(run, agent),
+        target: agent ? { kind: "workflow-agent", runId: run.id, agentId: agent.id } : runTarget,
       };
     });
   };
@@ -254,13 +271,14 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
     }));
     return navigatorAttentionSort(loaded.filter((entry) => entry !== undefined)).flatMap(({ loaded: { run, snapshot } }) => runNodes(run, snapshot));
   };
-  /** The row of the listed subagent `id`: its key and name address that id; `status` gives its state and attempt. */
-  const subagent = (manager: SubagentManager, id: string, status: SubagentStatus, owned: boolean): SessionTreeNode => {
+  /** The row of the listed subagent `id`: its key, name and target address that id; `status` gives its state and attempt. */
+  const subagent = (manager: SubagentManager, id: string, status: SubagentStatus, owned: boolean, presentation: SubagentPresentation | undefined): SessionTreeNode => {
     const liveData = manager.getAttemptActionData?.(id);
     const attempt = attemptValue(liveData?.attempt) ?? latestAttempt(status.attemptDetails);
     const running = status.state === "running";
-    // The label lives in the run's request.json under the manager's storage directory, which this source does not read.
-    const name = sanitizeDisplayText(id.length > 12 ? id.slice(0, 8) : id);
+    // The label lives in the run's request.json under the manager's storage directory: only the subagents extension's presenter reads it.
+    // A presentation name that is blank after sanitizing (empty, controls, whitespace or an escape only) keeps the short id, as /subagents does with a blank label.
+    const name = sanitizeDisplayText(presentation?.name ?? "").trim() || sanitizeDisplayText(shortSubagentId(id));
     const agent: SessionAgent = {
       key: `subagent:${id}`,
       name,
@@ -282,9 +300,13 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
       initiallyExpanded: false,
       // The /subagents list row, one level down.
       line: (styles, selected, expanded) => formatWorkflowTreeLine({ kind: "agent", label: name, depth: 1, state: status.state, children: [] }, selected, expanded, styles),
-      details: () => [],
+      details: (styles, now) => {
+        // A presenter that throws while drawing must not break the pane.
+        try { return presentation?.details(styles, now) ?? []; } catch { return []; }
+      },
       title: (styles) => nodeTitle(name, status.state, styles),
       agent,
+      target: { kind: "subagent", id },
     };
   };
   const subagentNodes = async (): Promise<SessionTreeNode[]> => {
@@ -294,14 +316,17 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
     // managerContext types its context as a command's but only hands it on as the manager's ExtensionContext.
     const command = context as ExtensionCommandContext;
     let listed: unknown;
-    try { listed = await manager.inspect({}, managerContext(command, false)); } catch (error) { return [unavailableGroup(errorText(error))]; }
+    try { listed = await manager.inspect({}, managerContext("agents-command", command)); } catch (error) { return [unavailableGroup(errorText(error))]; }
     if (!Array.isArray(listed)) return [];
     const statuses = listed.map((value) => statusValue(value)).filter((status): status is SubagentStatus => status?.sessionId === sessionId);
-    for (const id of [...subagentsSeen.keys()]) if (!statuses.some((status) => status.id === id)) subagentsSeen.delete(id);
+    // A row kept without a presentation (no presenter, or describe() failed) is described again from its cached record.
+    let changed = [...subagentsSeen.values()].some(({ described }) => !described);
+    for (const id of [...subagentsSeen.keys()]) if (!statuses.some((status) => status.id === id)) { subagentsSeen.delete(id); changed = true; }
     const entries = await Promise.all(statuses.map(async (row) => {
       const seen = subagentsSeen.get(row.id);
       const fresh = seen === undefined || row.state === "running" || seen.state !== row.state || seen.finishedAt !== row.finishedAt;
-      const record = fresh ? await manager.inspect({ id: row.id }, managerContext(command, true)).catch(() => undefined) : seen.record;
+      if (fresh) changed = true;
+      const record = fresh ? await manager.inspect({ id: row.id }, managerContext("agents-command", command, true)).catch(() => undefined) : seen.record;
       //NOTE: an inspection names the id it was asked for: one naming another id is not checked for here.
       const own = statusValue(record);
       // The inspected record, not the list row, proves the owner; the storage directory proves nothing (it may be a custom storageDir).
@@ -309,11 +334,20 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
       const owned = own !== undefined && own.sessionId === sessionId && safeSubagentId(row.id) && (typeof cwd !== "string" || sameFilesystemPath(cwd, context.cwd));
       return { id: row.id, row, status: own ?? row, owned, record };
     }));
+    // As /subagents names its rows (loadEntries): every subagent this Pi session lists with a safe id, whatever its
+    // inspection shows; owned decides only the transcript and the live stream. The presenter gets what was read here.
+    const requested = new Map(entries.filter(({ id }) => safeSubagentId(id)).map(({ id, record }) => [id, record]));
+    // Without presentations (no presenter, or a getter or describe() that fails) every subagent keeps its short id.
+    // All are described again on any change: a twin name depends on the other subagents.
+    // null: no presenter, or describe() failed.
+    const presentations = !changed ? new Map([...subagentsSeen].map(([id, { presentation }]) => [id, presentation]))
+      : requested.size > 0 ? await Promise.resolve().then(() => deps.subagentPresenter?.()?.describe([...requested.keys()], statuses, requested) ?? null).catch(() => null) : undefined;
     // A failed inspection is kept as one: it is inspected again only when its listed state or finishedAt changes.
-    for (const { id, row, record } of entries) subagentsSeen.set(id, { state: row.state, finishedAt: row.finishedAt, record });
+    if (changed) for (const { id, row, record } of entries) subagentsSeen.set(id, { state: row.state, finishedAt: row.finishedAt, record, described: presentations !== null, presentation: requested.has(id) ? presentations?.get(id) : undefined });
     const sorted = navigatorAttentionSortByState(entries, ({ status }) => status.state, ({ status }) => status.finishedAt, SUBAGENT_ATTENTION_ORDER);
     if (sorted.length === 0) return [];
-    const children = sorted.map(({ id, status, owned }) => subagent(manager, id, status, owned));
+    // Each row is its listed id: its key, name, presentation and target; a presentation for an id not asked for is ignored.
+    const children = sorted.map(({ id, status, owned }) => subagent(manager, id, status, owned, requested.has(id) ? presentations?.get(id) : undefined));
     // The group summarizes its subagents: running while one runs, else failed if one failed, else done.
     const states = sorted.map(({ status }) => status.state);
     const state = states.includes("running") ? "running" : states.includes("failed") ? "failed" : states.every((value) => value === "stopped") ? "stopped" : "completed";
@@ -329,13 +363,14 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
       details: (styles) => [styles.bold(styles.accent("Subagents")), counts],
       title: (styles) => nodeTitle("Subagents", state, styles),
       agent: undefined,
+      target: { kind: "subagents" },
     };
     return [group, ...children];
   };
   return {
     list: async () => {
       const now = Date.now();
-      const [workflows, subagents] = await Promise.all([workflowNodes(now), subagentNodes()]);
+      const [workflows, subagents] = await Promise.all([scope === "subagents" ? [] : workflowNodes(now), scope === "workflows" ? [] : subagentNodes()]);
       return [...workflows, ...subagents];
     },
   };

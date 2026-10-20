@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager, stripTerminalSequences, TUI_KEYBINDINGS, visibleWidth } from "@earendil-works/pi-tui";
+import type { ActionUi, AgentsAction, AgentsActionProvider, AgentsActionTarget } from "../src/agents-actions-contract.js";
 import { formatWorkflowPhaseDashboard, type AgentRecord, type PersistedRun, type RunState } from "../src/index.js";
-import { openAgentsWorkspace } from "../src/agents-workspace.js";
+import { openAgentsWorkspace, type AgentsWorkspaceState } from "../src/agents-workspace.js";
+import { FakeTerminal } from "./agents-workspace-harness.js";
 import { navigatorSidebarWidth } from "../src/host-view.js";
-import { createSessionAgentsSource } from "../src/session-agents.js";
-import { advance, agent, createRun, KEYBINDINGS, launch, click, entries, entry, ESC, escapes, FakeLive, KEY, leave, open, opened, polled, polls, rowOf, rule, settle, sidebarColumn, sidebarRows, statusRow as status, timers, title, topRow, until, project, tree, type FakePi, type Listed, type Spec } from "./agents-workspace-harness.js";
+import { createSessionAgentsSource, type SessionTreeNode } from "../src/session-agents.js";
+import { advance, agent, createRun, KEYBINDINGS, launch, click, entries, entry, ESC, escapes, FakeLive, KEY, leave, menu, MENU_HEADING, menuRows, open, opened, paste, polled, polls, rowOf, rule, settle, sidebarColumn, sidebarRows, statusRow as status, timers, title, topRow, project, temporary, tree, until, type FakePi, type Listed, type Spec } from "./agents-workspace-harness.js";
 
 const AGENTS = (): Listed[] => [agent("alpha"), agent("beta", { depth: 1, state: "completed", running: false }), agent("scout", { group: "Subagents", state: "failed", running: false })];
 /**
@@ -617,6 +619,7 @@ void test("a shutdown closes the open workspace at once: Pi's screen back with m
   const closed = harness.terminal.written.slice(opened);
   assert.ok(closed.includes(`${ESC}[?1006l${ESC}[?1004l${ESC}[?1003l${ESC}[?1002l${ESC}[?1000l`), "mouse tracking off");
   assert.ok(closed.endsWith(`${ESC}[?1049l${ESC}[?25h${ESC}[?2026l`), "the alternate screen left with Pi's screen kept");
+  assert.equal(harness.exit, undefined);
   assert.deepEqual(harness.parent, ["stop:true"], "Pi is not started again: a quit stopped it before session_shutdown, a signal stops it after");
   assert.equal(harness.source("alpha").calls.at(-1), "close");
   assert.equal(live.unsubscribed, 1);
@@ -1268,6 +1271,543 @@ void test("a run's sidebar rows are its /workflow tree rows, its nodes show the 
   await leave(narrow);
 });
 
+function describeTarget(target: AgentsActionTarget): string {
+  switch (target.kind) {
+    case "run": return `run:${target.runId}`;
+    case "workflow-agent": return `agent:${target.runId}/${target.agentId}`;
+    case "subagent": return `subagent:${target.id}`;
+    case "subagents": return "subagents";
+  }
+}
+/** A provider whose labels the test sets by target kind; it records each run as "<target> <label>" and runs `onRun` for it. */
+class FakeProvider implements AgentsActionProvider {
+  readonly runs: string[] = [];
+  /** The actions() calls so far. */
+  reads = 0;
+  /** The next actions() call waits for it, then reads the labels. */
+  hold: Promise<void> | undefined;
+  /** Every actions() call rejects with it while set. */
+  failure: Error | undefined;
+  constructor(public labels: Partial<Record<AgentsActionTarget["kind"], readonly AgentsAction[]>>, readonly onRun: (label: string, ui: ActionUi) => Promise<void> | void = () => undefined) {}
+  async actions(target: AgentsActionTarget): Promise<readonly AgentsAction[]> {
+    this.reads += 1;
+    const hold = this.hold;
+    if (hold) await hold;
+    if (this.failure) throw this.failure;
+    return this.labels[target.kind] ?? [];
+  }
+  async run(target: AgentsActionTarget, label: string, ui: ActionUi): Promise<{ readonly select?: string }> {
+    this.runs.push(`${describeTarget(target)} ${label}`);
+    await this.onRun(label, ui);
+    return {};
+  }
+}
+function steps(...labels: string[]): AgentsAction[] { return labels.map((label) => ({ label })); }
+function inPlace(...labels: string[]): AgentsAction[] { return labels.map((label) => ({ label, inPlace: true })); }
+const RUN: AgentsActionTarget = { kind: "run", runId: "R" };
+/** TREE with the targets the session source gives: the run's nodes the run, its agents themselves, the group and its subagent. */
+const TARGETED = (): Spec[] => TREE().map((spec): Spec => ({ ...spec, target: spec.key === "subagents" ? { kind: "subagents" } : spec.key === "s" ? { kind: "subagent", id: "s" } : spec.agent ? { kind: "workflow-agent", runId: "R", agentId: spec.key } : RUN }));
+/** TARGETED with the run's nodes on run `runId`: the target their menu reads changes. */
+const RETARGETED = (runId: string): SessionTreeNode[] => tree(TARGETED().map((spec): Spec => spec.target?.kind === "run" ? { ...spec, target: { kind: "run", runId } } : spec));
+
+void test("a opens the action menu on every node with a target, titled by its kind, with every provider's labels in provider order", async (t) => {
+  timers(t);
+  const first = new FakeProvider({ run: steps("Pause", "Stop"), "workflow-agent": inPlace("Copy agent ID"), subagent: steps("Steer"), subagents: steps("Delete all completed") });
+  const second = new FakeProvider({ run: steps("Model aliases"), subagent: inPlace("Copy branch") });
+  const specs = TARGETED().map((spec) => spec.key === "c" ? { key: spec.key, parent: "P", agent: agent("c") } : spec);
+  const harness = await open([], { nodes: tree(specs), actions: [first, second] });
+  const opened = async (keys: readonly string[]): Promise<string[]> => {
+    harness.send(...keys, "a");
+    await settle();
+    const rows = menuRows(harness);
+    harness.send(KEY.escape);
+    await settle();
+    assert.deepEqual(menu(harness), [], "esc closed the menu");
+    return rows;
+  };
+  assert.deepEqual(await opened([]), ["Agent actions", "→ Copy agent ID"], "on a workflow agent");
+  assert.equal(harness.left, false, "esc closed only the menu");
+  assert.deepEqual(await opened([KEY.up]), ["Run actions", "→ Pause", "  Stop", "  Model aliases"], "on an operation scope");
+  assert.deepEqual(await opened([KEY.up]), ["Run actions", "→ Pause", "  Stop", "  Model aliases"], "on a phase");
+  assert.deepEqual(await opened([KEY.up]), ["Run actions", "→ Pause", "  Stop", "  Model aliases"], "on the run header");
+  assert.equal(title(harness).trimEnd(), "Workflow running");
+  harness.send(KEY.down, KEY.down, KEY.down, KEY.down, KEY.down);
+  await settle();
+  assert.match(title(harness), /^#3\/4 c/);
+  harness.send("a");
+  await settle();
+  assert.deepEqual(menu(harness), [], "no menu on a node without a target");
+  assert.equal(harness.alt().hasOverlay(), false);
+  assert.deepEqual(await opened([KEY.down]), ["Subagents", "→ Delete all completed"], "on the group");
+  assert.deepEqual(await opened([KEY.down, KEY.tab]), ["Subagent actions", "→ Steer", "  Copy branch"], "on a subagent, with the transcript focused");
+  assert.deepEqual([...first.runs, ...second.runs], []);
+  await leave(harness);
+});
+
+void test("the menu shows loading… until the labels come and no actions when there are none", async (t) => {
+  timers(t);
+  let release = (): void => undefined;
+  const provider = new FakeProvider({ run: steps("Pause") });
+  provider.hold = new Promise<void>((resolve) => { release = resolve; });
+  const harness = await open([], { nodes: tree(TARGETED()), initialKey: "O", actions: [provider] });
+  harness.send("a");
+  await settle();
+  assert.deepEqual(menuRows(harness), ["Run actions", "loading…"]);
+  harness.send(KEY.enter);
+  await settle();
+  assert.equal(harness.left, false, "enter does nothing while the labels load");
+  provider.hold = undefined;
+  release();
+  await settle();
+  assert.deepEqual(menuRows(harness), ["Run actions", "→ Pause"]);
+  harness.send(KEY.escape, KEY.down, KEY.down, KEY.down, KEY.down, "a");
+  await settle();
+  assert.equal(title(harness).trimEnd(), "Subagents running");
+  assert.deepEqual(menuRows(harness), ["Subagents", "no actions"]);
+  harness.send(KEY.enter);
+  await settle();
+  assert.equal(harness.left, false);
+  await leave(harness);
+});
+
+void test("labels that cannot be read show actions unavailable and take no key; they are read again once the node's target or state changes", async (t) => {
+  timers(t);
+  const provider = new FakeProvider({ run: steps("Pause", "Stop") });
+  provider.failure = new Error("store locked");
+  const harness = await open([], { nodes: tree(TARGETED()), initialKey: "O", actions: [provider] });
+  harness.send("a");
+  await settle();
+  assert.deepEqual(menuRows(harness), ["Run actions", "actions unavailable: store locked"], "at the first read");
+  harness.send(KEY.enter);
+  await settle();
+  assert.equal(harness.left, false, "enter runs nothing");
+  provider.failure = undefined;
+  await advance(t);
+  assert.deepEqual(menuRows(harness), ["Run actions", "actions unavailable: store locked"], "a refresh with the same target reads nothing");
+  harness.nodes = tree(TARGETED().map((spec): Spec => spec.key === "O" ? { ...spec, state: "paused" } : spec));
+  await advance(t);
+  assert.deepEqual(menuRows(harness), ["Run actions", "→ Pause", "  Stop"], "the labels of the node's new state");
+  harness.send(KEY.down);
+  provider.failure = new Error("store gone");
+  harness.nodes = RETARGETED("R3");
+  await advance(t);
+  assert.deepEqual(menuRows(harness), ["Run actions", "actions unavailable: store gone"], "a failed read shows its error instead of the labels it read before");
+  harness.send(KEY.up, KEY.enter);
+  await settle();
+  assert.equal(harness.left, false, "enter runs nothing");
+  provider.failure = undefined;
+  harness.nodes = RETARGETED("R4");
+  await advance(t);
+  assert.deepEqual(menuRows(harness), ["Run actions", "  Pause", "→ Stop"], "the next read keeps the label selected before");
+  assert.deepEqual(provider.runs, []);
+  await leave(harness);
+});
+
+void test("a provider whose labels cannot be read costs only its own: the others' labels show in provider order and take the keys, then a row with its error", async (t) => {
+  timers(t);
+  const first = new FakeProvider({ run: steps("Pause", "Stop") });
+  const second = new FakeProvider({ run: steps("Model aliases") });
+  const third = new FakeProvider({ run: steps("Delete all completed") });
+  second.failure = new Error("aliases locked");
+  const harness = await open([], { nodes: tree(TARGETED()), initialKey: "O", actions: [first, second, third] });
+  harness.send("a");
+  await settle();
+  assert.deepEqual(menuRows(harness), ["Run actions", "→ Pause", "  Stop", "  Delete all completed", "actions unavailable: aliases locked"], "the labels read, then the error");
+  harness.send(KEY.up);
+  await settle();
+  assert.deepEqual(menuRows(harness), ["Run actions", "  Pause", "  Stop", "→ Delete all completed", "actions unavailable: aliases locked"], "↑ wraps over the labels, not onto the error row");
+  second.failure = undefined;
+  harness.nodes = RETARGETED("R2");
+  await advance(t);
+  assert.deepEqual(menuRows(harness), ["Run actions", "  Pause", "  Stop", "  Model aliases", "→ Delete all completed"], "a read that gets them puts them in provider order and keeps the selected label");
+  harness.send(KEY.up);
+  first.failure = new Error("store gone");
+  harness.nodes = RETARGETED("R3");
+  await advance(t);
+  assert.deepEqual(menuRows(harness), ["Run actions", "→ Model aliases", "  Delete all completed", "actions unavailable: store gone"], "the selected label of a provider still read stays selected");
+  harness.send(KEY.enter);
+  await harness.done;
+  assert.deepEqual(harness.exit && { target: harness.exit.target, label: harness.exit.label }, { target: { kind: "run", runId: "R3" }, label: "Model aliases" }, "enter runs it");
+  assert.deepEqual([...first.runs, ...second.runs, ...third.runs], []);
+});
+
+void test("enter with the sidebar focused opens the menu on a node that is not an agent; on an agent it opens none", async (t) => {
+  timers(t);
+  const provider = new FakeProvider({ run: steps("Pause"), "workflow-agent": steps("Stop") });
+  const harness = await open([], { nodes: tree(TARGETED()), actions: [provider], setup: (source) => { source.polls.push(polled([entry(0)])); } });
+  assert.match(title(harness), /^#1\/4 a/);
+  harness.send(KEY.enter);
+  await settle();
+  assert.deepEqual(menu(harness), [], "no menu on an agent");
+  harness.send(KEY.up, KEY.enter);
+  await settle();
+  assert.deepEqual(menuRows(harness), ["Run actions", "→ Pause"], "enter on the operation scope");
+  harness.send(KEY.escape, KEY.tab, KEY.enter);
+  await settle();
+  assert.deepEqual(menu(harness), [], "not with the transcript focused");
+  harness.send("a");
+  await settle();
+  assert.deepEqual(menuRows(harness), ["Run actions", "→ Pause"], "a still opens it there");
+  await leave(harness);
+});
+
+void test("without providers a does nothing, enter on a node that is not an agent does nothing, and the hint names no menu", async (t) => {
+  timers(t);
+  for (const actions of [undefined, []]) {
+    const harness = await open([], { nodes: tree(TARGETED()), ...(actions === undefined ? {} : { actions }) });
+    harness.send("a");
+    await settle();
+    assert.equal(harness.alt().hasOverlay(), false);
+    harness.send(KEY.up, KEY.enter, "a");
+    await settle();
+    assert.equal(harness.alt().hasOverlay(), false);
+    assert.equal(title(harness).trimEnd(), "O running");
+    assert.doesNotMatch(harness.screen().at(-1) ?? "", /a menu/);
+    await leave(harness);
+  }
+});
+
+void test("in the menu ↑↓ and j/k move round, other keys belong to it, esc, ← and h close it, and ctrl+c leaves with no action", async (t) => {
+  timers(t);
+  const provider = new FakeProvider({ run: steps("One", "Two", "Three") });
+  const harness = await open([], { nodes: tree(TARGETED()), initialKey: "O", actions: [provider] });
+  const selected = (): string | undefined => menuRows(harness).find((line) => line.startsWith("→ "));
+  harness.send("a");
+  await settle();
+  const moves: (string | undefined)[] = [];
+  for (const key of [KEY.down, "j", "j", "k", KEY.up, KEY.up]) {
+    harness.send(key);
+    moves.push(selected());
+  }
+  assert.deepEqual(moves, ["→ Two", "→ Three", "→ One", "→ Three", "→ Two", "→ One"]);
+  harness.send("s", "q", KEY.tab, "]", " ", KEY.right, "l", KEY.pageDown);
+  await settle();
+  assert.equal(selected(), "→ One", "the menu kept the keys");
+  assert.ok(harness.screen().some((line) => line.startsWith("  ▾ Subagents")), "s did not hide the sidebar");
+  assert.equal(title(harness).trimEnd(), "O running", "] selected nothing");
+  for (const close of [KEY.escape, KEY.left, "h"]) {
+    harness.send(close);
+    await settle();
+    assert.deepEqual(menu(harness), [], `${JSON.stringify(close)} closed the menu`);
+    assert.equal(title(harness).trimEnd(), "O running", "and moved nothing");
+    harness.send("a");
+    await settle();
+    assert.equal(selected(), "→ One", "the menu opens on the first label again");
+  }
+  harness.send(KEY.ctrlC);
+  await harness.done;
+  assert.equal(harness.exit, undefined, "ctrl+c leaves with no action");
+  assert.deepEqual(harness.parent, ["stop:true", "start", "renderNow:false"]);
+  assert.deepEqual(provider.runs, []);
+});
+
+/** A wheel step up (SGR) at the 0-based screen `column` and `row`. */
+function wheelUp(column: number, row: number): string { return `${ESC}[<64;${String(column + 1)};${String(row + 1)}M`; }
+
+void test("while the menu is open the search key, the page keys, home and end (also as tmux sends them), a paste and the wheel do nothing: no other overlay, the transcript stays where it was", async (t) => {
+  timers(t);
+  const harness = await open([], { nodes: tree(TARGETED()), actions: [new FakeProvider({ "workflow-agent": steps("One", "Two") })], setup: (source) => { source.polls.push(polled(entries(0, 100))); } });
+  harness.screen();
+  const end = harness.alt().viewportTop;
+  assert.ok(end > 0, "the transcript is longer than the pane");
+  harness.send("a");
+  await settle();
+  harness.send(KEY.search, "x", KEY.pageUp, KEY.pageUp, KEY.home, KEY.homeTmux, KEY.endTmux, paste("k"), "é", wheelUp(110, 5), wheelUp(5, 5), KEY.down);
+  await settle();
+  harness.screen();
+  assert.equal(harness.alt().viewportTop, end, "the transcript did not scroll");
+  assert.equal(harness.alt().isFollowingOutput, true);
+  assert.deepEqual(menuRows(harness), ["Agent actions", "  One", "→ Two"], "the menu had the keys");
+  harness.send(KEY.escape);
+  await settle();
+  assert.deepEqual(menu(harness), [], "esc closed the menu");
+  assert.equal(harness.alt().hasOverlay(), false, "and no search box was left under it");
+  assert.equal(harness.left, false);
+  harness.send(KEY.pageUp);
+  harness.screen();
+  assert.ok(harness.alt().viewportTop < end, "the page keys scroll again once it closed");
+  await leave(harness);
+});
+
+void test("Pi's terminal object keeps its own methods before, while and after the workspace has it, and the page keys still do nothing under the menu", async (t) => {
+  timers(t);
+  const prototype = FakeTerminal.prototype;
+  const methods = Object.getOwnPropertyNames(prototype).filter((name) => name !== "constructor" && typeof Object.getOwnPropertyDescriptor(prototype, name)?.value === "function");
+  const start = Object.getOwnPropertyDescriptor(prototype, "start");
+  assert.ok(start);
+  // What the terminal's start is while it runs: the alt screen starts the terminal from inside the workspace's opening.
+  const starting: unknown[] = [];
+  const spy = function (this: FakeTerminal, ...args: Parameters<FakeTerminal["start"]>): void { starting.push(Reflect.get(this, "start")); Reflect.apply(start.value as FakeTerminal["start"], this, args); };
+  Object.defineProperty(prototype, "start", { ...start, value: spy });
+  t.after(() => { Object.defineProperty(prototype, "start", start); });
+  const own = (terminal: FakeTerminal): unknown[] => methods.map((name): unknown => Reflect.get(terminal, name));
+  const expected = methods.map((name): unknown => Object.getOwnPropertyDescriptor(prototype, name)?.value);
+  const harness = await open([], { nodes: tree(TARGETED()), actions: [new FakeProvider({ "workflow-agent": steps("One", "Two") })], setup: (source) => { source.polls.push(polled(entries(0, 100))); } });
+  assert.deepEqual(starting, [spy], "its own start while it started");
+  harness.screen();
+  const end = harness.alt().viewportTop;
+  assert.ok(end > 0, "the transcript is longer than the pane");
+  harness.send("a");
+  await settle();
+  harness.send(KEY.pageUp, KEY.pageUp);
+  harness.screen();
+  assert.equal(harness.alt().viewportTop, end, "the page keys did not scroll under the menu");
+  assert.deepEqual(own(harness.terminal), expected, "its own methods while the menu is open");
+  assert.deepEqual(methods.filter((name) => Object.hasOwn(harness.terminal, name)), [], "none replaced on the object");
+  harness.send(KEY.escape);
+  await settle();
+  harness.send(KEY.pageUp);
+  harness.screen();
+  assert.ok(harness.alt().viewportTop < end, "the page keys scroll once the menu closed");
+  await leave(harness);
+  assert.deepEqual(own(harness.terminal), expected, "and after the workspace closed");
+  assert.deepEqual(methods.filter((name) => Object.hasOwn(harness.terminal, name)), []);
+});
+
+void test("the menu stays clear of the title and the hint at 120, 70 and 40 columns and 10 rows, with the selected row in view", async (t) => {
+  timers(t);
+  const labels = [...Array.from({ length: 11 }, (_, index) => `Label ${String(index + 1)}`), `Label 12 ${"with a very long description ".repeat(6)}`];
+  for (const columns of [120, 70, 40]) {
+    const harness = await open([], { columns, rows: 10, nodes: tree(TARGETED()), initialKey: "O", actions: [new FakeProvider({ run: steps(...labels) })] });
+    const check = (selected: string): void => {
+      const lines = harness.screen();
+      assert.equal(lines.length, 10);
+      const block = menu(harness);
+      const top = lines.findIndex((line) => MENU_HEADING.test(line));
+      assert.ok(top >= 1 && top + block.length <= 9, `at most rows - 2 rows, clear of the title and the hint (${String(columns)} columns):\n${lines.join("\n")}`);
+      assert.ok(block.length <= 8);
+      assert.ok(block.some((line) => line.startsWith(`→ ${selected}`)), `${selected} in view at ${String(columns)} columns:\n${block.join("\n")}`);
+    };
+    harness.send("a");
+    await settle();
+    check("Label 1");
+    assert.equal(menu(harness).length, 8, "six labels between the heading and the closing rule");
+    harness.send(KEY.up);
+    check("Label 12");
+    const long = menu(harness).find((line) => line.startsWith("→ Label 12")) ?? "";
+    assert.ok(long.endsWith("…"), "a long label is cut at the width");
+    harness.send(KEY.down);
+    check("Label 1");
+    for (let step = 0; step < 7; step += 1) harness.send("j");
+    check("Label 8");
+    await leave(harness);
+  }
+});
+
+void test("a refresh reads the labels again only when the node's target or state changed, keeps the selected one, else the last; a late answer is dropped; clicks on the sidebar do nothing while it is open; it closes when its node goes away", async (t) => {
+  timers(t);
+  const provider = new FakeProvider({ run: steps("Pause", "Stop", "Delete") });
+  const harness = await open([], { nodes: tree(TARGETED()), initialKey: "O", actions: [provider] });
+  harness.send("a");
+  await settle();
+  harness.send(KEY.down);
+  assert.deepEqual(menuRows(harness), ["Run actions", "  Pause", "→ Stop", "  Delete"]);
+  const reads = provider.reads;
+  provider.labels = { run: steps("Resume", "Stop") };
+  await advance(t, 2);
+  assert.equal(provider.reads, reads, "refreshes with the same target and state read nothing");
+  assert.deepEqual(menuRows(harness), ["Run actions", "  Pause", "→ Stop", "  Delete"]);
+  harness.nodes = RETARGETED("R2");
+  await advance(t);
+  assert.deepEqual(menuRows(harness), ["Run actions", "  Resume", "→ Stop"], "Stop kept");
+  provider.labels = { run: steps("Resume", "Approve", "Cancel") };
+  harness.nodes = RETARGETED("R3");
+  await advance(t);
+  assert.deepEqual(menuRows(harness), ["Run actions", "  Resume", "  Approve", "→ Cancel"], "the last label once Stop went away");
+  let release = (): void => undefined;
+  provider.hold = new Promise<void>((resolve) => { release = resolve; });
+  harness.nodes = RETARGETED("R4");
+  await advance(t);
+  provider.hold = undefined;
+  provider.labels = { run: steps("Fresh") };
+  harness.nodes = RETARGETED("R5");
+  await advance(t);
+  assert.deepEqual(menuRows(harness), ["Run actions", "→ Fresh"]);
+  provider.labels = { run: steps("Stale") };
+  release();
+  await settle();
+  assert.deepEqual(menuRows(harness), ["Run actions", "→ Fresh"], "the earlier tick's answer came late and was dropped");
+  // The menu covers the middle of the screen; the start of each sidebar row stays in view.
+  const row = rowOf(harness, "    • s · ");
+  assert.ok(row > 0);
+  click(harness, 6, row);
+  click(harness, 2, rowOf(harness, "  ▾ Subagents"));
+  await settle();
+  assert.equal(title(harness).trimEnd(), "O running", "the clicks selected nothing");
+  assert.ok(harness.screen().some((line) => line.startsWith("  ▾ Subagents · ⠦")), "and toggled nothing");
+  assert.deepEqual(harness.opened, []);
+  harness.nodes = tree(TARGETED().filter((spec) => !["O", "a", "b"].includes(spec.key)).map((spec): Spec => spec.target?.kind === "run" ? { ...spec, target: { kind: "run", runId: "R5" } } : spec));
+  await advance(t);
+  assert.deepEqual(menu(harness), [], "the menu closed with its node");
+  assert.match(title(harness), /^#1\/2 c/, "the selection went to the node now at its row");
+  harness.send("s");
+  assert.ok(!harness.screen().some((line) => line.includes("Subagents")), "the workspace has the keys again");
+  assert.deepEqual(provider.runs, []);
+  await leave(harness);
+});
+
+/** A wheel step down (SGR) at the 0-based screen `column` and `row`. */
+function wheelDown(column: number, row: number): string { return `${ESC}[<65;${String(column + 1)};${String(row + 1)}M`; }
+
+void test("the menu is Pi's select list: the wheel on it moves the selection, a click on a label runs it, a click or the wheel off it does nothing", async (t) => {
+  timers(t);
+  const provider = new FakeProvider({ run: steps("Pause", "Stop", "Delete") });
+  const harness = await open([], { nodes: tree(TARGETED()), initialKey: "O", actions: [provider] });
+  harness.send("a");
+  await settle();
+  const at = (label: string): [number, number] => { const lines = harness.screen(); const row = lines.findIndex((line) => line.includes(` ${label}`)); return [lines[row]?.indexOf(label) ?? -1, row]; };
+  harness.send(wheelDown(...at("Pause")));
+  assert.deepEqual(menuRows(harness), ["Run actions", "  Pause", "→ Stop", "  Delete"], "the wheel on the menu moved the selection");
+  harness.send(wheelDown(2, at("Pause")[1]));
+  click(harness, 2, rowOf(harness, "  ▾ Subagents"));
+  await settle();
+  assert.deepEqual(menuRows(harness), ["Run actions", "  Pause", "→ Stop", "  Delete"], "the wheel and a click off the menu did nothing");
+  assert.match(title(harness), /^O running/, "and selected nothing");
+  click(harness, ...at("Delete"));
+  await harness.done;
+  assert.deepEqual(harness.exit && { target: harness.exit.target, label: harness.exit.label }, { target: RUN, label: "Delete" }, "the click ran the label");
+});
+
+void test("a provider's error is a Text under the list, wrapped to the menu's width", async (t) => {
+  timers(t);
+  const first = new FakeProvider({ run: steps("Pause") });
+  const second = new FakeProvider({ run: steps("Model aliases") });
+  second.failure = new Error(`aliases locked${" by another process".repeat(6)}`);
+  const harness = await open([], { columns: 70, nodes: tree(TARGETED()), initialKey: "O", actions: [first, second] });
+  harness.send("a");
+  await settle();
+  const rows = menuRows(harness);
+  assert.deepEqual(rows.slice(0, 2), ["Run actions", "→ Pause"]);
+  assert.ok(rows.length > 3, "the error wraps over more than one row");
+  assert.equal(rows.slice(2).join(" ").replace(/\s+/g, " "), `actions unavailable: aliases locked${" by another process".repeat(6)}`);
+  await leave(harness);
+});
+
+void test("a label that needs Pi's dialogs leaves the workspace as esc does and resolves with the target, the label, its provider and the state once Pi is back", async (t) => {
+  timers(t);
+  const provider = new FakeProvider({ run: steps("Pause", "Stop") });
+  const harness = await open([], { nodes: tree(TARGETED()), actions: [provider] });
+  harness.send(KEY.up, "a");
+  await settle();
+  harness.send(KEY.down, KEY.enter);
+  await harness.done;
+  assert.deepEqual(harness.parentAtExit, ["stop:true", "start", "renderNow:false"], "Pi restarted before the promise resolved");
+  assert.deepEqual(harness.exit && { ...harness.exit, state: { ...harness.exit.state, expansion: Object.fromEntries(harness.exit.state.expansion) } }, {
+    target: RUN, label: "Stop", provider,
+    state: { selectedKey: "O", row: 2, expansion: { "run:R": true, P: true, O: true, subagents: true }, focus: "sidebar", sidebarVisible: true, toolsExpanded: false, detailsShown: false },
+  });
+  assert.deepEqual(provider.runs, [], "the caller runs it with Pi's dialogs");
+  assert.equal(harness.source("a").calls.at(-1), "close");
+  assert.ok(harness.terminal.written.endsWith(`${ESC}[?1049l${ESC}[?25h${ESC}[?2026l`));
+  const lists = harness.listCalls;
+  await advance(t, 2);
+  assert.equal(harness.listCalls, lists, "nothing runs after leaving");
+});
+
+void test("an in-place label runs inside the workspace: other keys are ignored and the ticks pause until it settles, then its notice shows until the next key", async (t) => {
+  timers(t);
+  const escaped = escapes(t);
+  const gates: (() => void)[] = [];
+  const provider = new FakeProvider({ "workflow-agent": inPlace("Copy agent ID") }, async (_label, ui) => {
+    await new Promise<void>((resolve) => { gates.push(resolve); });
+    ui.notify("Copied agent ID.");
+  });
+  const harness = await open([], { nodes: tree(TARGETED()), actions: [provider], setup: (source) => { source.polls.push(polled(entries(0, 100))); } });
+  harness.send("a");
+  await settle();
+  harness.send(KEY.enter);
+  await settle();
+  assert.deepEqual(provider.runs, ["agent:R/a Copy agent ID"]);
+  assert.deepEqual(menu(harness), [], "the menu closed");
+  const before = harness.screen();
+  const end = harness.alt().viewportTop;
+  assert.ok(end > 0, "the transcript is longer than the pane");
+  const lists = harness.listCalls;
+  const pollCount = polls(harness);
+  harness.send(KEY.down, "s", "a", KEY.escape, KEY.tab, "]", KEY.enter, "d", KEY.pageUp, KEY.pageUp, KEY.search, "x", KEY.home, KEY.homeTmux, KEY.endTmux, paste("s"), "é", wheelUp(110, 5), wheelUp(5, 5));
+  await settle();
+  assert.deepEqual(harness.screen(), before, "every key was ignored");
+  assert.equal(harness.alt().viewportTop, end, "the page keys, home and end (also as tmux sends them) and the wheel did not scroll the transcript");
+  assert.equal(harness.alt().hasOverlay(), false, "the search key opened no search box");
+  assert.equal(harness.left, false);
+  await advance(t, 2);
+  assert.equal(harness.listCalls, lists, "no refresh while it runs");
+  assert.equal(polls(harness), pollCount, "no poll while it runs");
+  gates.shift()?.();
+  await settle();
+  assert.equal(harness.listCalls, lists + 1, "once it settled a list shows what it changed at once");
+  assert.equal(status(harness), "Copied agent ID.");
+  assert.equal(harness.alt().hasOverlay(), false, "and none opens once it settled");
+  await advance(t);
+  assert.ok(harness.listCalls > lists && polls(harness) > pollCount, "the ticks go on");
+  assert.equal(status(harness), "Copied agent ID.", "the notice outlasts a refresh");
+  harness.send(KEY.pageUp);
+  assert.equal(status(harness), "", "the next key clears it, also one the alt screen takes");
+  assert.ok(harness.alt().viewportTop < end, "and the page keys scroll again");
+  harness.send("a");
+  await settle();
+  harness.send(KEY.enter);
+  await settle();
+  harness.send(KEY.ctrlC);
+  await harness.done;
+  assert.equal(harness.exit, undefined, "ctrl+c still leaves while it runs");
+  gates.shift()?.();
+  await settle();
+  assert.deepEqual(harness.notified, []);
+  assert.deepEqual(escaped, []);
+});
+
+void test("while nothing runs a change during an in-place action lists nothing, and the action's end lists at once", async (t) => {
+  timers(t);
+  const listeners = new Set<() => void>();
+  const change = async (): Promise<void> => { for (const listener of listeners) listener(); await settle(); };
+  let release = (): void => undefined;
+  const provider = new FakeProvider({ "workflow-agent": inPlace("Copy agent ID") }, () => new Promise<void>((resolve) => { release = resolve; }));
+  const settled = TARGETED().map((spec): Spec => spec.agent ? { ...spec, agent: { ...spec.agent, state: "completed", running: false } } : spec);
+  const harness = await open([], { nodes: tree(settled), actions: [provider], changes: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; } });
+  await advance(t, 6);
+  const lists = harness.listCalls;
+  await change();
+  assert.equal(harness.listCalls, lists + 1, "nothing runs: a change lists at once");
+  harness.send("a");
+  await settle();
+  harness.send(KEY.enter);
+  await settle();
+  assert.deepEqual(provider.runs, ["agent:R/a Copy agent ID"]);
+  await change();
+  assert.equal(harness.listCalls, lists + 1, "a change while the action runs lists nothing");
+  release();
+  await settle();
+  assert.equal(harness.listCalls, lists + 2, "the action's end lists at once");
+  await leave(harness);
+  assert.equal(listeners.size, 0, "leaving stops listening");
+});
+
+void test("an in-place label that asks for one of Pi's dialogs is reported in the status row with its label", async (t) => {
+  timers(t);
+  const escaped = escapes(t);
+  const provider = new FakeProvider({ run: inPlace("Copy run ID", "Open script in editor") }, async (label, ui) => {
+    if (label === "Copy run ID") await ui.confirm("Copy?", "Copy the run ID?");
+    else ui.status("opening");
+  });
+  const harness = await open([], { nodes: tree(TARGETED()), initialKey: "O", actions: [provider] });
+  harness.send("a");
+  await settle();
+  harness.send(KEY.enter);
+  await settle();
+  assert.match(status(harness), /^Copy run ID: confirm needs Pi's dialogs/);
+  harness.send("a");
+  await settle();
+  harness.send(KEY.down, KEY.enter);
+  await settle();
+  assert.match(status(harness), /^Open script in editor: status needs Pi's dialogs/);
+  harness.send(KEY.down);
+  await settle();
+  assert.match(title(harness), /^#1\/4 a/, "the workspace goes on");
+  await leave(harness);
+  assert.deepEqual(escaped, []);
+});
+
 void test("an exit listener restores the terminal while the workspace is open, and is gone once it closes", async (t) => {
   timers(t);
   const known = process.listeners("exit");
@@ -1311,6 +1851,494 @@ void test("an uncaughtExceptionMonitor listener restores the terminal before Pi 
   assert.deepEqual([exits(), monitors()], [[], []]);
 });
 
+const EDITOR_SCRIPT = `import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+const [opened, release, code, file] = process.argv.slice(2);
+writeFileSync(\`\${opened}.part\`, readFileSync(file, "utf8"));
+renameSync(\`\${opened}.part\`, opened);
+const wait = () => { if (existsSync(release)) process.exit(Number(code)); else setTimeout(wait, 10); };
+wait();
+`;
+/** An external editor that notes the artifact in `opened-<round>` and exits with `code` once `release-<round>` exists. */
+function editor(): { readonly dir: string; command(round: number, code: number): string; opened(round: number): string; release(round: number): void } {
+  const dir = temporary("agents-editor");
+  const script = join(dir, "editor.mjs");
+  writeFileSync(script, EDITOR_SCRIPT);
+  return {
+    dir,
+    command: (round, code) => `${process.execPath} ${script} ${join(dir, `opened-${String(round)}`)} ${join(dir, `release-${String(round)}`)} ${String(code)}`,
+    opened: (round) => join(dir, `opened-${String(round)}`),
+    release: (round) => { writeFileSync(join(dir, `release-${String(round)}`), ""); },
+  };
+}
+
+void test("an in-place editor leaves the alternate screen without writing the workspace into Pi's screen, comes back with a full redraw, and never starts Pi's TUI", async (t) => {
+  timers(t);
+  const external = editor();
+  let round = 0;
+  let code = 0;
+  let finished = 0;
+  const provider = new FakeProvider({ run: inPlace("Open script in editor") }, async (_label, ui) => {
+    await ui.openArtifact({ extension: ".js", content: "return 1;" }, "script");
+    finished += 1;
+  });
+  const harness = await open([], { nodes: tree(TARGETED()), initialKey: "O", actions: [provider], editorCommand: () => external.command(round, code) });
+  harness.send("a");
+  await settle();
+  harness.send(KEY.enter);
+  await until(() => existsSync(external.opened(0)), "the editor started");
+  assert.equal(readFileSync(external.opened(0), "utf8"), "return 1;");
+  const stopped = harness.terminal.written;
+  assert.ok(stopped.endsWith(`${ESC}[?1049l${ESC}[?25h${ESC}[?2026l`), "left the alternate screen keeping Pi's screen, with nothing written after it");
+  assert.equal(harness.terminal.input, undefined, "the editor has the terminal");
+  assert.deepEqual(harness.parent, ["stop:true"], "Pi's TUI stays stopped");
+  external.release(0);
+  await until(() => finished === 1, "the editor exited");
+  await settle();
+  const restarted = harness.terminal.written.slice(stopped.length);
+  assert.ok(restarted.includes(`${ESC}[?1049h`), "entered the alternate screen again");
+  assert.ok(stripTerminalSequences(restarted).includes("O running"), "and drew the whole frame");
+  assert.ok(harness.terminal.input, "the workspace reads the terminal again");
+  assert.equal(Object.hasOwn(harness.terminal, "start"), false, "through its own start");
+  assert.deepEqual(harness.parent, ["stop:true"]);
+  assert.equal(status(harness), "", "nothing to report");
+  harness.send("a");
+  await settle();
+  harness.send(KEY.search, "x");
+  await settle();
+  assert.ok(!harness.screen().some((line) => line.includes("Find in transcript")), "the workspace still reads the keys first: the search key opened no box over the menu");
+  assert.deepEqual(menuRows(harness), ["Run actions", "→ Open script in editor"], "the menu kept the keys");
+  harness.send(KEY.escape);
+  await settle();
+  assert.deepEqual(menu(harness), []);
+  assert.equal(harness.alt().hasOverlay(), false);
+  round = 1;
+  code = 3;
+  harness.send("a");
+  await settle();
+  harness.send(KEY.enter);
+  await until(() => existsSync(external.opened(1)), "the editor started again");
+  external.release(1);
+  await until(() => finished === 2, "the editor exited again");
+  await settle();
+  assert.equal(status(harness), "Cannot open script: external editor exited with code 3.");
+  await leave(harness);
+  assert.deepEqual(harness.parent, ["stop:true", "start", "renderNow:false"]);
+});
+
+void test("a resize across 80 columns while the in-place editor has the terminal hides or shows the sidebar, with its focus, when the workspace comes back", async (t) => {
+  timers(t);
+  const external = editor();
+  let round = 0;
+  let finished = 0;
+  const provider = new FakeProvider({ run: inPlace("Open script in editor") }, async (_label, ui) => {
+    await ui.openArtifact({ extension: ".js", content: "return 1;" }, "script");
+    finished += 1;
+  });
+  const harness = await open([], { nodes: tree(TARGETED()), initialKey: "O", actions: [provider], editorCommand: () => external.command(round, 0) });
+  for (const [columns, shown] of [[70, false], [120, true]] as const) {
+    harness.send("a");
+    await settle();
+    harness.send(KEY.enter);
+    await until(() => existsSync(external.opened(round)), "the editor started");
+    assert.equal(harness.terminal.onResize, undefined, "no resize reaches the workspace while the editor has the terminal");
+    harness.terminal.columns = columns;
+    external.release(round);
+    await until(() => finished === round + 1, "the editor exited");
+    await settle();
+    assert.ok(harness.terminal.input, "the workspace is back");
+    assert.equal(sidebarShown(harness), shown, `${String(columns)} columns`);
+    assert.match(harness.screen().at(-1) ?? "", shown ? /^left\/right fold/ : /^up\/down scroll/, shown ? "the sidebar has the focus" : "the transcript has the focus");
+    assert.match(title(harness), /^O running/, "on the same node");
+    round += 1;
+  }
+  await leave(harness);
+});
+
+void test("an in-place editor without a configured editor reports it in the status row", async (t) => {
+  timers(t);
+  for (const editorCommand of [undefined, () => undefined]) {
+    const provider = new FakeProvider({ run: inPlace("Open script in editor") }, (_label, ui) => ui.openArtifact({ extension: ".js", content: "return 1;" }, "script"));
+    const harness = await open([], { nodes: tree(TARGETED()), initialKey: "O", actions: [provider], ...(editorCommand === undefined ? {} : { editorCommand }) });
+    harness.send("a");
+    await settle();
+    harness.send(KEY.enter);
+    await settle();
+    assert.equal(status(harness), "Cannot open script: no external editor is configured.");
+    assert.deepEqual(harness.parent, ["stop:true"]);
+    await leave(harness);
+  }
+});
+
+void test("an abort while the artifact is written starts no editor and gives Pi the terminal back once", async (t) => {
+  timers(t);
+  const escaped = escapes(t);
+  const external = editor();
+  const controller = new AbortController();
+  const provider = new FakeProvider({ run: inPlace("Open script in editor") }, async (_label, ui) => {
+    const opening = ui.openArtifact({ extension: ".js", content: "return 1;" }, "script");
+    controller.abort();
+    await opening;
+  });
+  const harness = await open([], { nodes: tree(TARGETED()), initialKey: "O", actions: [provider], signal: controller.signal, editorCommand: () => external.command(0, 0) });
+  harness.send("a");
+  await settle();
+  harness.send(KEY.enter);
+  await harness.done;
+  await settle();
+  assert.equal(existsSync(external.opened(0)), false, "no editor started");
+  assert.deepEqual(harness.parent, ["stop:true", "start", "renderNow:false"], "Pi was restored once");
+  assert.equal(harness.terminal.stops, 1);
+  assert.deepEqual(escaped, []);
+});
+
+void test("a transcript scrolled up comes back at the same place after a step-aside action; one at the tail stays at the tail", async (t) => {
+  timers(t);
+  const setup = (source: Parameters<NonNullable<Parameters<typeof open>[1]>["setup"] & object>[0]): void => { source.polls.push(polled(entries(0, 100))); };
+  const provider = new FakeProvider({ "workflow-agent": steps("Stop") });
+  const nodes = tree(TARGETED());
+  for (const up of [true, false]) {
+    const first = await open([], { nodes, initialKey: "a", actions: [provider], setup });
+    first.screen();
+    const end = first.alt().viewportTop;
+    assert.equal(end, 100 - 18);
+    if (up) { first.send(KEY.pageUp); first.screen(); }
+    const top = first.alt().viewportTop;
+    assert.equal(top < end, up);
+    first.send("a");
+    await settle();
+    first.send(KEY.enter);
+    await first.done;
+    assert.ok(first.exit);
+    const second = await open([], { nodes, actions: [provider], setup, state: first.exit.state });
+    second.screen();
+    await settle();
+    second.screen();
+    assert.equal(second.alt().viewportTop, top, up ? "the same place" : "the tail");
+    await leave(second);
+  }
+});
+
+void test("a saved place beyond the reopened content is clamped to the top and the view can still scroll", async (t) => {
+  timers(t);
+  const provider = new FakeProvider({ "workflow-agent": steps("Stop") });
+  const nodes = tree(TARGETED());
+  const first = await open([], { nodes, initialKey: "a", actions: [provider], setup: (source) => { source.polls.push(polled(entries(0, 100))); } });
+  first.screen();
+  first.send(KEY.pageUp);
+  first.send(KEY.pageUp);
+  first.screen();
+  first.send("a");
+  await settle();
+  first.send(KEY.enter);
+  await first.done;
+  assert.ok(first.exit);
+  const second = await open([], { nodes, actions: [provider], setup: (source) => { source.polls.push(polled(entries(0, 30))); }, state: first.exit.state });
+  for (let round = 0; round < 3; round += 1) { second.screen(); await settle(); }
+  second.screen();
+  assert.equal(second.alt().viewportTop, 0, "clamped to the top");
+  second.send(KEY.pageDown);
+  second.screen();
+  assert.ok(second.alt().viewportTop > 0, "page down moves the view");
+  second.send(KEY.ctrlEnd);
+  second.screen();
+  assert.equal(second.alt().viewportTop, 30 - 18, "end reaches the tail");
+  await leave(second);
+});
+
+void test("a place above the tail comes back on reopening", async (t) => {
+  timers(t);
+  const setup = (source: Parameters<NonNullable<Parameters<typeof open>[1]>["setup"] & object>[0]): void => {
+    source.polls.push(polled(entries(0, 120)));
+  };
+  const provider = new FakeProvider({ "workflow-agent": steps("Stop") });
+  const nodes = tree(TARGETED());
+  const first = await open([], { nodes, initialKey: "a", actions: [provider], setup });
+  first.screen();
+  await settle();
+  first.screen();
+  first.send(KEY.pageUp);
+  first.screen();
+  const top = first.alt().viewportTop;
+  assert.ok(top > 0, "not at the start");
+  assert.ok(top < 120 - 18, "not at the tail");
+  assert.ok(new RegExp(`record ${String(top)}\\b`).test(first.screen()[1] ?? ""), "the first line in view is the record at the top row");
+  const seen = first.screen().slice(1, 4).join("\n");
+  first.send("a");
+  await settle();
+  first.send(KEY.enter);
+  await first.done;
+  assert.ok(first.exit);
+  const second = await open([], { nodes, actions: [provider], setup, state: first.exit.state });
+  for (let round = 0; round < 4; round += 1) { second.screen(); await settle(); }
+  second.screen();
+  assert.equal(second.alt().viewportTop, top, "the same place");
+  assert.equal(second.screen().slice(1, 4).join("\n"), seen, "the same lines");
+  await leave(second);
+});
+
+type PlaceSource = Parameters<NonNullable<Parameters<typeof open>[1]>["setup"] & object>[0];
+
+/** Opens a long transcript, scrolls up, steps aside, and returns what the reopened workspace needs. */
+async function savedPlace(): Promise<{ provider: FakeProvider; nodes: ReturnType<typeof tree>; state: NonNullable<Awaited<ReturnType<typeof open>>["exit"]>["state"]; top: number }> {
+  const setup = (source: PlaceSource): void => { source.polls.push(polled(entries(0, 120))); };
+  const provider = new FakeProvider({ "workflow-agent": steps("Stop") });
+  const nodes = tree(TARGETED());
+  const first = await open([], { nodes, initialKey: "a", actions: [provider], setup });
+  first.screen();
+  await settle();
+  first.screen();
+  first.send(KEY.pageUp);
+  first.screen();
+  const top = first.alt().viewportTop;
+  assert.ok(top > 0 && top < 120 - 18, "a place above the tail");
+  first.send("a");
+  await settle();
+  first.send(KEY.enter);
+  await first.done;
+  assert.ok(first.exit);
+  return { provider, nodes, state: first.exit.state, top };
+}
+
+void test("a transcript reset while a restore is pending drops the saved place and stays at the tail", async (t) => {
+  timers(t);
+  const saved = await savedPlace();
+  const second = await open([], { nodes: saved.nodes, actions: [saved.provider], state: saved.state, setup: (source) => {
+    source.polls.push(polled(entries(500, 40), { reset: true }));
+  } });
+  for (let round = 0; round < 5; round += 1) { second.screen(); await advance(t); }
+  second.screen();
+  assert.equal(second.alt().viewportTop, 40 - 18, "at the tail of the new content");
+  for (let round = 0; round < 3; round += 1) { second.screen(); await advance(t); }
+  second.screen();
+  assert.equal(second.alt().viewportTop, 40 - 18, "no later layout jumps back to the old offset");
+  await leave(second);
+});
+
+void test("a poll that is not available gives up a pending restore: later content does not bring the saved place back", async (t) => {
+  timers(t);
+  const saved = await savedPlace();
+  const second = await open([], { nodes: saved.nodes, actions: [saved.provider], state: saved.state, setup: (source) => {
+    source.polls.push(polled(entries(100, 20), { status: "unavailable" }), polled(entries(120, 200)));
+  } });
+  for (let round = 0; round < 6; round += 1) { second.screen(); await advance(t); }
+  second.screen();
+  assert.equal(second.alt().viewportTop, 0, "the saved place is not applied once the content is long enough");
+  second.send(KEY.pageDown);
+  second.screen();
+  assert.ok(second.alt().viewportTop > 0, "page down moves the view");
+  await leave(second);
+});
+
+void test("an abort while the editor runs leaves when the editor exits: Pi is started once and the workspace does not come back", async (t) => {
+  timers(t);
+  const escaped = escapes(t);
+  const external = editor();
+  let finished = 0;
+  const provider = new FakeProvider({ run: inPlace("Open script in editor") }, async (_label, ui) => {
+    await ui.openArtifact({ extension: ".js", content: "return 1;" }, "script");
+    finished += 1;
+  });
+  const controller = new AbortController();
+  const harness = await open([], { nodes: tree(TARGETED()), initialKey: "O", actions: [provider], signal: controller.signal, editorCommand: () => external.command(0, 3) });
+  harness.send("a");
+  await settle();
+  harness.send(KEY.enter);
+  await until(() => existsSync(external.opened(0)), "the editor started");
+  const stopped = harness.terminal.written.length;
+  assert.equal(harness.terminal.stops, 1, "the editor stopped the terminal");
+  const cursorShown = harness.terminal.written.split(`${ESC}[?25h`).length;
+  let resolved = false;
+  void harness.done.then(() => { resolved = true; });
+  controller.abort();
+  await settle();
+  assert.equal(harness.terminal.input, undefined, "no key reaches the workspace while the editor runs");
+  assert.deepEqual(harness.parent, ["stop:true"], "Pi stays stopped while the editor has the terminal");
+  assert.equal(resolved, false, "the workspace is not left while the editor runs");
+  external.release(0);
+  await until(() => finished === 1, "the editor exited");
+  await harness.done;
+  assert.equal(harness.exit, undefined);
+  assert.deepEqual(harness.parent, ["stop:true", "start", "renderNow:false"], "Pi is back");
+  assert.equal(harness.terminal.stops, 1, "leaving stops the terminal no second time");
+  assert.equal(harness.terminal.written.split(`${ESC}[?25h`).length, cursorShown, "nor shows the cursor again");
+  await settle();
+  assert.ok(!harness.terminal.written.slice(stopped).includes(`${ESC}[?1049h`), "the alternate screen was not entered again");
+  assert.equal(harness.terminal.input, undefined);
+  assert.deepEqual(harness.parent, ["stop:true", "start", "renderNow:false"], "Pi was started once");
+  assert.equal(harness.terminal.stops, 1, "the terminal was stopped once");
+  assert.deepEqual(harness.notified, [], "the editor's exit code goes nowhere once the workspace is left");
+  assert.deepEqual(escaped, []);
+});
+
+void test("a shutdown while the editor runs closes the workspace at once, writes nothing over the editor and leaves Pi stopped; the editor's exit brings nothing back", async (t) => {
+  timers(t);
+  const escaped = escapes(t);
+  const external = editor();
+  let finished = 0;
+  const provider = new FakeProvider({ run: inPlace("Open script in editor") }, async (_label, ui) => {
+    await ui.openArtifact({ extension: ".js", content: "return 1;" }, "script");
+    finished += 1;
+  });
+  const shutdown = new AbortController();
+  const harness = await open([], { nodes: tree(TARGETED()), initialKey: "O", actions: [provider], shutdown: shutdown.signal, editorCommand: () => external.command(0, 3) });
+  harness.send("a");
+  await settle();
+  harness.send(KEY.enter);
+  await until(() => existsSync(external.opened(0)), "the editor started");
+  const stopped = harness.terminal.written.length;
+  shutdown.abort({ type: "session_shutdown", reason: "quit" });
+  await until(() => harness.left, "the command settled while the editor runs");
+  assert.equal(harness.exit, undefined);
+  assert.equal(harness.terminal.written.length, stopped, "the editor left the alternate screen already: nothing written over it");
+  external.release(0);
+  await until(() => finished === 1, "the editor exited");
+  await settle();
+  assert.equal(harness.terminal.written.length, stopped, "the alternate screen was not entered again");
+  assert.equal(harness.terminal.input, undefined);
+  assert.equal(harness.terminal.stops, 1, "the terminal was stopped once, by the editor");
+  assert.deepEqual(harness.parent, ["stop:true"], "Pi left stopped for its shutdown");
+  assert.deepEqual(harness.notified, [], "the editor's exit code goes nowhere");
+  assert.deepEqual(escaped, []);
+});
+
+/** The state of a workspace that stepped aside with the agent b selected. */
+function stateOf(overrides: Partial<AgentsWorkspaceState> = {}): AgentsWorkspaceState {
+  return { selectedKey: "b", row: 4, expansion: [], focus: "sidebar", sidebarVisible: true, toolsExpanded: false, detailsShown: false, ...overrides };
+}
+
+void test("a state restores the selection by key, the expansion, the focus, the tools and the notices until the next key; the initial key wins over it", async (t) => {
+  timers(t);
+  const harness = await open([], { nodes: tree(TREE()), state: stateOf({ expansion: [["subagents", false], ["O", true]], focus: "transcript", toolsExpanded: true }), notices: ["Paused workflow Workflow.", "Moved to background."] });
+  assert.match(title(harness), /^#2\/4 b/);
+  assert.deepEqual(harness.opened, ["b"]);
+  assert.deepEqual(sidebarRows(harness), ["  ▾ Workflow · ⠦", "    ▾ P · ⠦", "      ▾ O · ⠦", "        • a · ⠦", "→       • b · ✓", "      • c · ⠦", "  ▸ Subagents · ⠦"], "the recorded collapse kept, the keys not recorded as they come");
+  assert.match(harness.screen().at(-1) ?? "", /^up\/down scroll/, "the transcript has the focus");
+  assert.ok(harness.view("b").calls.includes("expanded:true"), "tool output expanded");
+  assert.equal(status(harness), "Paused workflow Workflow. · Moved to background.");
+  await advance(t);
+  assert.equal(status(harness), "Paused workflow Workflow. · Moved to background.", "until the next key");
+  harness.send(KEY.down);
+  assert.equal(status(harness), "");
+  await leave(harness);
+
+  const keyed = await open([], { nodes: tree(TREE()), initialKey: "s", state: stateOf({ expansion: [["subagents", false]] }) });
+  assert.match(title(keyed), /^#4\/4 s/);
+  assert.deepEqual(sidebarRows(keyed).slice(-2), ["  ▾ Subagents · ⠦", "→   • s · ⠦"], "the initial key's ancestors expanded");
+  await leave(keyed);
+});
+
+void test("the notices end at any key: one parseKey does not name (é), home and end as tmux sends them, a paste; a focus report or a query's answer leaves them", async (t) => {
+  timers(t);
+  for (const key of ["é", KEY.homeTmux, KEY.endTmux, paste("x")]) {
+    const harness = await open([], { nodes: tree(TREE()), notices: ["Paused workflow Workflow."] });
+    harness.send(`${ESC}[I`, `${ESC}[O`, `${ESC}[?62;22c`);
+    assert.equal(status(harness), "Paused workflow Workflow.", "not keys");
+    harness.send(key);
+    assert.equal(status(harness), "", JSON.stringify(key));
+    await leave(harness);
+  }
+});
+
+void test("a state whose key went away selects the node now at its row; a recorded collapse holds while new keys take their initial expansion", async (t) => {
+  timers(t);
+  const harness = await open([], { nodes: tree(TREE()), state: stateOf({ selectedKey: "gone", row: 2 }) });
+  assert.equal(title(harness).trimEnd(), "O running");
+  await leave(harness);
+  const collapsed = await open([], { nodes: tree(TREE()), state: stateOf({ selectedKey: "s", row: 0, expansion: [["P", false], ["run:R", true]] }) });
+  assert.deepEqual(sidebarRows(collapsed), ["  ▾ Workflow · ⠦", "    ▸ P · ⠦", "  ▾ Subagents · ⠦", "→   • s · ⠦"]);
+  await leave(collapsed);
+  const beyond = await open([], { nodes: tree(TREE()), state: stateOf({ selectedKey: "gone", row: 30 }) });
+  assert.match(title(beyond), /^#4\/4 s/, "a row past the end gives the last visible node");
+  await leave(beyond);
+});
+
+void test("a state's sidebar stays hidden below 80 columns; its tools and d hold", async (t) => {
+  timers(t);
+  const narrow = await open([], { columns: 70, nodes: tree(TREE()), state: stateOf({ sidebarVisible: true, focus: "sidebar" }) });
+  assert.ok(!narrow.screen().some((line) => line.includes("Subagents")), "sidebar hidden");
+  assert.match(narrow.screen().at(-1) ?? "", /^up\/down scroll · escape\/ctrl\+c back · \[ \] agent · ctrl\+shi/, "the transcript has the focus and tab moves nothing");
+  await leave(narrow);
+  const hidden = await open([], { nodes: tree(TREE()), state: stateOf({ sidebarVisible: false, focus: "sidebar" }) });
+  assert.ok(!hidden.screen().some((line) => line.includes("Subagents")), "a hidden sidebar stays hidden");
+  assert.match(hidden.screen().at(-1) ?? "", /^up\/down scroll/);
+  await leave(hidden);
+  const specs = TREE().map((spec) => spec.key === "b" ? { ...spec, details: ["Model: gpt-5", "Tokens: 1.2k"] } : spec);
+  const details = await open([], { nodes: tree(specs), state: stateOf({ detailsShown: true }) });
+  assert.match(details.screen()[1] ?? "", /│ Model: gpt-5\s*$/, "the agent's details shown");
+  assert.equal(details.source("b").count("poll") > 0, true, "its transcript still opened");
+  await leave(details);
+});
+
+/** Opens TARGETED at `columns`, presses `keys`, then steps aside for the selected agent's Stop: the state its exit keeps. */
+async function steppedAside(columns: number, ...keys: string[]): Promise<AgentsWorkspaceState> {
+  const harness = await open([], { columns, nodes: tree(TARGETED()), actions: [new FakeProvider({ "workflow-agent": steps("Stop") })] });
+  harness.send(...keys, "a");
+  await settle();
+  harness.send(KEY.enter);
+  await harness.done;
+  const exit = harness.exit;
+  assert.ok(exit);
+  assert.equal(exit.label, "Stop");
+  return exit.state;
+}
+
+void test("a sidebar hidden below 80 columns when the workspace stepped aside comes back focused when it opens again on a wide terminal", async (t) => {
+  timers(t);
+  const narrow = await steppedAside(70);
+  for (const columns of [120, 70]) {
+    const again = await open([], { columns, nodes: tree(TARGETED()), state: narrow });
+    if (columns === 70) {
+      assert.equal(sidebarShown(again), false, "still hidden below 80 columns");
+      assert.match(again.screen().at(-1) ?? "", /^up\/down scroll/);
+      again.terminal.resize(120);
+    }
+    assert.equal(sidebarShown(again), true, `opened at ${String(columns)} columns`);
+    assert.match(again.screen().at(-1) ?? "", /^left\/right fold/, "with the sidebar focused");
+    assert.match(title(again), /^#1\/4 a/, "on the same node");
+    await leave(again);
+  }
+});
+
+void test("a sidebar hidden with s while it could show stays hidden when the workspace stepped aside and opens again, also across a resize; s still shows it", async (t) => {
+  timers(t);
+  const hidden = await steppedAside(120, "s");
+  for (const columns of [70, 120]) {
+    const again = await open([], { columns, nodes: tree(TARGETED()), state: hidden });
+    assert.equal(sidebarShown(again), false, `opened at ${String(columns)} columns`);
+    if (columns === 120) again.terminal.resize(70);
+    again.terminal.resize(120);
+    assert.equal(sidebarShown(again), false, `opened at ${String(columns)} columns, then 120`);
+    assert.match(again.screen().at(-1) ?? "", /^up\/down scroll/, "the transcript has the focus");
+    again.send("s");
+    assert.equal(sidebarShown(again), true, "s shows it");
+    assert.match(title(again), /^#1\/4 a/, "on the same node");
+    await leave(again);
+  }
+});
+
+void test("the exit's state is the workspace's at that moment and opens it again as it was", async (t) => {
+  timers(t);
+  const specs = TARGETED().map((spec) => spec.key === "b" ? { ...spec, details: ["Model: gpt-5"] } : spec);
+  const provider = new FakeProvider({ "workflow-agent": steps("Stop") });
+  const harness = await open([], { nodes: tree(specs), actions: [provider] });
+  harness.send(KEY.down, KEY.down, KEY.down, KEY.left, KEY.up, KEY.up, KEY.ctrlO, "d", KEY.tab);
+  await settle();
+  assert.match(title(harness), /^#2\/4 b/);
+  const frame = harness.screen();
+  harness.send("a");
+  await settle();
+  harness.send(KEY.enter);
+  await harness.done;
+  const exit = harness.exit;
+  assert.ok(exit);
+  assert.deepEqual(exit.target, { kind: "workflow-agent", runId: "R", agentId: "b" });
+  assert.deepEqual({ ...exit.state, expansion: Object.fromEntries(exit.state.expansion) }, { selectedKey: "b", row: 4, expansion: { "run:R": true, P: true, O: true, subagents: false }, focus: "transcript", sidebarVisible: true, toolsExpanded: true, detailsShown: true });
+  const again = await open([], { nodes: tree(specs), actions: [provider], state: exit.state });
+  assert.deepEqual(again.screen(), frame, "the same frame");
+  assert.ok(again.view("b").calls.includes("expanded:true"));
+  await leave(again);
+});
+
 void test("with no agent node the first node is selected", async (t) => {
   timers(t);
   const harness = await open([], { nodes: tree([{ key: "run:R", kind: "run", label: "Workflow" }, { key: "P", parent: "run:R" }, { key: "Q", parent: "P", kind: "operation" }]) });
@@ -1318,6 +2346,67 @@ void test("with no agent node the first node is selected", async (t) => {
   assert.deepEqual(sidebarRows(harness), ["→ ▾ Workflow · ⠦", "    ▾ P · ⠦", "        Q · ⠦"]);
   assert.match(harness.screen()[1] ?? "", /│ details of Workflow\s*$/);
   assert.deepEqual(harness.opened, []);
+  await leave(harness);
+});
+
+void test("d shows an agent's details instead of its transcript, which keeps polling; the choice holds while the selection moves between agents", async (t) => {
+  timers(t);
+  const specs = TREE().map((spec) => spec.key === "a" ? { ...spec, details: ["Model: gpt-5", "Tokens: 1.2k"] } : spec.key === "b" ? { ...spec, details: ["Model: b-model"] } : spec);
+  const harness = await open([], { nodes: tree(specs), setup: (source) => { source.polls.push(polled(entries(0, 3))); } });
+  const pane = (): string => (harness.screen()[1] ?? "").replace(/^.*│ /, "").replace(/[\s┃█]+$/, "");
+  assert.equal(pane(), "a record 0");
+  assert.match(harness.screen().at(-1) ?? "", / · d details · /);
+  harness.send("d");
+  assert.equal(pane(), "Model: gpt-5");
+  assert.match(harness.screen()[2] ?? "", /│ Tokens: 1\.2k\s*$/);
+  assert.match(title(harness), /^#1\/4 a running/, "the title stays the agent's");
+  const before = harness.source("a").count("poll");
+  await advance(t, 2);
+  assert.ok(harness.source("a").count("poll") > before, "the transcript keeps polling");
+  harness.send("d");
+  assert.equal(pane(), "a record 0", "d again shows the transcript");
+  harness.send("d", KEY.down);
+  await settle();
+  assert.match(title(harness), /^#2\/4 b/);
+  assert.equal(pane(), "Model: b-model", "the next agent shows its details too");
+  harness.send(KEY.down);
+  await settle();
+  assert.match(title(harness), /^#3\/4 c/);
+  assert.equal(pane(), "c record 0", "an agent without details shows its transcript");
+  assert.doesNotMatch(harness.screen().at(-1) ?? "", /d details/);
+  harness.send("d");
+  assert.equal(pane(), "c record 0", "d does nothing there");
+  harness.send(KEY.up);
+  await settle();
+  assert.equal(pane(), "Model: b-model", "and the choice still holds");
+  harness.send(KEY.up, KEY.up, "d");
+  await settle();
+  assert.equal(title(harness).trimEnd(), "O running");
+  assert.equal(pane(), "details of O", "d does nothing on a node that is not an agent");
+  harness.send("]");
+  await settle();
+  assert.equal(pane(), "Model: gpt-5");
+  await leave(harness);
+});
+
+void test("a refresh that leaves the selected agent without details while d is on shows its transcript, and its details again once they are back", async (t) => {
+  timers(t);
+  const withDetails = (): Spec[] => TREE().map((spec) => spec.key === "a" ? { ...spec, details: ["Model: gpt-5"] } : spec);
+  const harness = await open([], { nodes: tree(withDetails()), setup: (source) => { source.polls.push(polled(entries(0, 3))); } });
+  const pane = (): string => (harness.screen()[1] ?? "").replace(/^.*│ /, "").replace(/[\s┃█]+$/, "");
+  harness.send("d");
+  assert.equal(pane(), "Model: gpt-5");
+  harness.nodes = tree(TREE());
+  await advance(t);
+  assert.equal(pane(), "a record 0", "no details: the transcript");
+  assert.doesNotMatch(harness.screen().at(-1) ?? "", /d details/);
+  assert.match(title(harness), /^#1\/4 a/, "the agent stays selected");
+  assert.equal(harness.opened.filter((key) => key === "a").length, 1, "its transcript was not opened again");
+  harness.nodes = tree(withDetails());
+  await advance(t);
+  assert.equal(pane(), "Model: gpt-5", "d still on: the details are back");
+  harness.send("d");
+  assert.equal(pane(), "a record 0", "d turns them off");
   await leave(harness);
 });
 
@@ -1337,17 +2426,25 @@ void test("j, k, h and l move in the sidebar as the arrows do, and only there", 
   await leave(harness);
 });
 
-void test("the hint names tab focus while the sidebar shows", async (t) => {
+void test("the hint names a menu with providers, d details on an agent with details, and tab focus while the sidebar shows", async (t) => {
   timers(t);
-  const harness = await open([], { columns: 160, nodes: tree(TREE()) });
+  const specs = TARGETED().map((spec) => spec.key === "a" ? { ...spec, details: ["Model: gpt-5"] } : spec);
+  const actions = [new FakeProvider({})];
+  const harness = await open([], { columns: 160, nodes: tree(specs), actions });
   const hint = (): string => (harness.screen().at(-1) ?? "").trimEnd();
-  assert.equal(hint(), "left/right fold · escape/ctrl+c back · [ ] agent · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools");
+  assert.equal(hint(), "left/right fold · escape/ctrl+c back · [ ] agent · a menu · d details · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools");
   harness.send(KEY.tab);
-  assert.equal(hint(), "up/down scroll · escape/ctrl+c back · [ ] agent · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools");
+  assert.equal(hint(), "up/down scroll · escape/ctrl+c back · [ ] agent · a menu · d details · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools");
+  harness.send(KEY.tab, KEY.up);
+  await settle();
+  assert.equal(hint(), "left/right fold · escape/ctrl+c back · [ ] agent · a menu · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools", "no d details on a node that is not an agent");
   harness.send("s");
-  assert.equal(hint(), "up/down scroll · escape/ctrl+c back · [ ] agent · ctrl+shift+f search · s sidebar · ctrl+o tools", "no tab focus without the sidebar");
+  assert.equal(hint(), "up/down scroll · escape/ctrl+c back · [ ] agent · a menu · ctrl+shift+f search · s sidebar · ctrl+o tools", "no tab focus without the sidebar");
   await leave(harness);
 
+  const plain = await open([], { columns: 160, nodes: tree(specs) });
+  assert.equal((plain.screen().at(-1) ?? "").trimEnd(), "left/right fold · escape/ctrl+c back · [ ] agent · d details · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools", "no a menu without providers");
+  await leave(plain);
 });
 
 void test("a live event replayed while an agent opens that throws is reported in the title", async (t) => {
