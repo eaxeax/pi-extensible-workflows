@@ -8,6 +8,7 @@ import type { AgentsAction, AgentsActionTarget } from "../src/agents-actions-con
 import { RunStore } from "../src/persistence.js";
 import type { AgentAttemptAction } from "../src/types.js";
 import { workflowSettingsPath } from "../src/validation.js";
+import type { WorkflowArtifact } from "../src/workflow-artifacts.js";
 import { createWorkflowActionProvider, loadWorkflowRunView, runAgentAction, runWorkflowRunAction, type WorkflowActionDependencies } from "../src/workflow-actions.js";
 import { settleAfterShutdown, agentRecord, createRun, launch, liveRun, recordingUi, SESSION, settle, workflowFixture } from "./agents-workspace-harness.js";
 
@@ -124,8 +125,8 @@ void test("agent labels have no View transcript and no Back; copies and editors 
   const actions = await tui.actions(target);
   assert.equal(journal.mock.callCount(), 0, "the agent's labels decode no full journal");
   assert.deepEqual(replay.mock.calls.map(({ arguments: args }) => args), [["agent/result"]], "they read only the agent's result");
-  assert.deepEqual(labels(actions), ["Inspect attempt", "Copy branch", "Copy worktree path", "Open prompt in editor", "Open system prompt in editor", "Open result in editor", "Copy agent ID"]);
-  assert.deepEqual(inPlace(actions), ["Copy branch", "Copy worktree path", "Open prompt in editor", "Open system prompt in editor", "Open result in editor", "Copy agent ID"]);
+  assert.deepEqual(labels(actions), ["Inspect attempt", "Copy branch", "Copy worktree path", "Open diff in editor", "Open prompt in editor", "Open system prompt in editor", "Open result in editor", "Copy agent ID"]);
+  assert.deepEqual(inPlace(actions), ["Copy branch", "Copy worktree path", "Open diff in editor", "Open prompt in editor", "Open system prompt in editor", "Open result in editor", "Copy agent ID"]);
   assert.deepEqual(labels(await createWorkflowActionProvider(f.deps, f.ctx("rpc")).actions(target)), ["Inspect attempt", "Copy branch", "Copy worktree path", "Copy agent ID"]);
   assert.deepEqual(labels(await tui.actions({ kind: "workflow-agent", runId: "agents", agentId: "plain" })), ["Inspect attempt", "Copy agent ID"]);
   assert.deepEqual(await tui.actions({ kind: "workflow-agent", runId: "agents", agentId: "gone" }), []);
@@ -515,6 +516,54 @@ void test("a label no longer offered is reported and does nothing", async () => 
   ]);
   assert.deepEqual(ui.of("confirm"), []);
   assert.deepEqual(f.calls, []);
+});
+
+void test("Open diff in editor opens the worktree's diff as a .diff artifact, or says there are no changes; it is not offered once the worktree is gone", async () => {
+  const { f, path } = await agentFixture();
+  const provider = createWorkflowActionProvider(f.deps, f.ctx("tui"));
+  const target: AgentsActionTarget = { kind: "workflow-agent", runId: "agents", agentId: "agent-1" };
+  const ui = recordingUi();
+  await provider.run(target, "Open diff in editor", ui);
+  assert.equal(ui.of("openArtifact").length, 0);
+  assert.deepEqual(notices(ui), ["No changes since the worktree was created."]);
+  writeFileSync(join(path, "tracked.txt"), "tracked\nchanged\n");
+  await provider.run(target, "Open diff in editor", ui);
+  assert.equal(ui.of("openArtifact").length, 1);
+  const opened = ui.of("openArtifact")[0]?.[0] as WorkflowArtifact | undefined;
+  assert.equal(opened?.extension, ".diff");
+  assert.match(opened.content, /\+changed/);
+  assert.equal(labels(await provider.actions({ kind: "workflow-agent", runId: "agents", agentId: "plain" })).includes("Open diff in editor"), false);
+  rmSync(path, { recursive: true, force: true });
+  assert.equal(labels(await provider.actions(target)).includes("Open diff in editor"), false);
+});
+
+void test("Open diff in editor says untracked files are not in the diff when the worktree holds only those", async () => {
+  const { f, path } = await agentFixture();
+  const provider = createWorkflowActionProvider(f.deps, f.ctx("tui"));
+  const ui = recordingUi();
+  writeFileSync(join(path, "fresh.txt"), "new\n");
+  await provider.run({ kind: "workflow-agent", runId: "agents", agentId: "agent-1" }, "Open diff in editor", ui);
+  assert.equal(ui.of("openArtifact").length, 0);
+  assert.deepEqual(notices(ui), ["No tracked changes since the worktree was created; untracked files are not in the diff."]);
+});
+
+void test("Open diff in editor on a menu built earlier says when its diff cannot be read", async () => {
+  const { f, store, path } = await agentFixture();
+  const view = await loadWorkflowRunView(f.deps, f.ctx("tui"), store);
+  const agent = view.run.agents.find((candidate) => candidate.id === "agent-1");
+  assert.ok(agent);
+  const reference = view.worktrees[0];
+  assert.ok(reference);
+  const broken = recordingUi();
+  await runAgentAction(f.deps, broken, { ...view, worktrees: [{ ...reference, base: "0".repeat(40) }] }, agent, "Open diff in editor");
+  assert.equal(broken.of("openArtifact").length, 0);
+  assert.equal(notices(broken).length, 1);
+  assert.match(String(notices(broken)[0]), /^Cannot read the worktree diff: /);
+  rmSync(path, { recursive: true, force: true });
+  const gone = recordingUi();
+  await runAgentAction(f.deps, gone, view, agent, "Open diff in editor");
+  assert.equal(gone.of("openArtifact").length, 0);
+  assert.match(String(notices(gone)[0]), /^Cannot read the worktree diff: /);
 });
 
 for (const reason of ["reload", "new"] as const) for (const outcome of ["resolves", "throws"]) {
