@@ -351,7 +351,7 @@ void test("TUI /workflow opens the workspace, whose content is a run node", asyn
   assert.deepEqual(shown.dialogs, []);
   assert.ok(loop);
   assert.equal(loop.providers.length, 1);
-  const node = (kind: SessionTreeNode["kind"]): SessionTreeNode => ({ key: kind, parentKey: undefined, depth: 0, kind, initiallyExpanded: true, line: () => kind, details: () => [], title: () => kind, agent: undefined });
+  const node = (kind: SessionTreeNode["kind"]): SessionTreeNode => ({ key: kind, parentKey: undefined, depth: 0, kind, label: kind, state: "running", initiallyExpanded: true, line: () => kind, details: () => [], title: () => kind, agent: undefined });
   assert.equal(loop.hasContent([node("run")]), true);
   assert.equal(loop.hasContent([node("group")]), false);
   assert.equal(loop.hasContent([]), false);
