@@ -6,7 +6,6 @@ import { syncBuiltinESMExports } from "node:module";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { visibleWidth } from "@earendil-works/pi-tui";
 import { Value } from "typebox/value";
 import { WORKFLOW_AGENT_STALL_THRESHOLD_MS, WorkflowError, prepareAgentSetupForInspection, registerWorkflowExtension, resetWorkflowRegistry } from "pi-extensible-workflows";
 import extension, {
@@ -223,7 +222,7 @@ test("renders subagent calls and background or foreground progress consistently"
   assert.match(inspection, /value:.*"answer": 42/s);
 });
 
-test("pins live background subagents below the editor in the workflow frame and leaves one receipt each", async () => {
+test("leaves one receipt for each background subagent and draws no frame of its own", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagents-widget-"));
   await mkdir(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
   await writeFile(join(cwd, ".pi", "pi-extensible-workflows", "settings.json"), JSON.stringify({ concurrency: 16 }));
@@ -235,8 +234,6 @@ test("pins live background subagents below the editor in the workflow frame and 
   const tools = [];
   const handlers = new Map();
   const widgetCalls = [];
-  let widgetComponent;
-  let renders = 0;
   const theme = { fg: (_color, text) => text, bold: (text) => text };
   const receipts = [];
   const entryRenderers = new Map();
@@ -276,10 +273,7 @@ test("pins live background subagents below the editor in the workflow frame and 
     mode: "tui",
     hasUI: true,
     ui: {
-      setWidget(key, value, options) {
-        widgetCalls.push({ key, value, options });
-        widgetComponent = typeof value === "function" ? value({ requestRender() { renders += 1; } }, theme) : undefined;
-      },
+      setWidget(key) { widgetCalls.push(key); },
     },
   };
 
@@ -289,44 +283,18 @@ test("pins live background subagents below the editor in the workflow frame and 
     const launch = await run.execute("widget-call", { prompt: "watch", label: "scout", mode: "background", worktree: "widget" }, undefined, undefined, context);
     await started.promise;
     assert.equal(launch.details.state, "running");
-    assert.deepEqual(widgetCalls[0].options, { placement: "belowEditor" });
-    assert.match(widgetComponent.render(80).join("\n"), /^╭ Subagent ─+╮\n│ \S scout +00:00 │\n╰─+╯$/);
     for (let index = 1; index < 16; index += 1) {
       const additional = await run.execute(`widget-call-${String(index)}`, { prompt: `watch ${String(index)}`, label: `scout-${String(index)}`, mode: "background" }, undefined, undefined, context);
       assert.equal(additional.details.state, "running");
     }
-    for (const [index, options] of executionOptions.entries()) {
-      await options.onProgress({ accounting: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0 }, toolCalls: [], activity: { kind: "tool", text: `read-${String(index)}` }, lastEventAt: Date.now(), persist: false });
-    }
-    const freshFrame = widgetComponent.render(80).join("\n");
-    assert.doesNotMatch(freshFrame, /quiet|stalled/);
-    await executionOptions[1].onProgress({ accounting: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0 }, toolCalls: [], lastEventAt: Date.now() - 3 * 60 * 1000 - 1, persist: false });
-    await executionOptions[0].onProgress({ accounting: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0 }, toolCalls: [], activity: { kind: "tool", text: "read-0" }, lastEventAt: Date.now() - WORKFLOW_AGENT_STALL_THRESHOLD_MS - 1, persist: false });
-    const frame = widgetComponent.render(80);
-    assert.equal(frame.length, 10);
-    assert.ok(frame.every((line) => visibleWidth(line) === 80), frame.join("\n"));
-    assert.match(frame[0], /^╭ Subagents · 16 runs ─+╮$/);
-    assert.match(frame[1], /^│ ⚠ scout {2}stalled 10:00 +3t · 00:0\d │$/);
-    assert.match(frame[2], /^│ ⚠ scout-1 {2}quiet 03:00 +3t · 00:0\d │$/);
-    assert.match(frame[3], /^│ \S scout-2 +3t · 00:0\d │$/);
-    assert.match(frame[7], /^│ \S scout-6 +3t · 00:0\d │$/);
-    assert.match(frame[8], /^│ … 9 more +│$/);
-    assert.match(frame[9], /^╰─+╯$/);
-    const narrowFrame = widgetComponent.render(24);
-    assert.equal(narrowFrame.length, 10);
-    assert.ok(narrowFrame.every((line) => visibleWidth(line) <= 24), narrowFrame.join("\n"));
-    assert.match(narrowFrame[1], /…/);
-
-    assert.ok(renders > 0);
-
+    for (const options of executionOptions) await options.onProgress({ accounting: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0 }, toolCalls: [], lastEventAt: Date.now(), persist: false });
     pending.resolve({ value: "done", attempts: [], cwd });
     await cleanupStarted.promise;
     releaseCleanup.resolve();
-    await waitFor(() => widgetCalls.at(-1)?.value === undefined);
-    assert.equal(widgetCalls.at(-1)?.value, undefined);
     // The worktree run reports completed twice (before and after cleanup) but leaves one receipt.
     await waitFor(() => receipts.length === 16);
     assert.equal(new Set(receipts.map(({ data }) => data.id)).size, 16);
+    assert.deepEqual(widgetCalls, [], "the core workflow widget draws background subagents");
     assert.ok(receipts.every(({ customType }) => customType === "piewf-subagent-receipt"));
     const renderer = entryRenderers.get("piewf-subagent-receipt");
     assert.ok(renderer);
