@@ -6,11 +6,14 @@ import test from "node:test";
 import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager, stripTerminalSequences, TUI_KEYBINDINGS, visibleWidth } from "@earendil-works/pi-tui";
 import type { ActionUi, AgentsAction, AgentsActionProvider, AgentsActionTarget } from "../src/agents-actions-contract.js";
-import { formatWorkflowPhaseDashboard, type AgentRecord, type PersistedRun, type RunState } from "../src/index.js";
+import { formatWorkflowPhaseDashboard, PLAIN_WORKFLOW_PROGRESS_STYLES, type AgentRecord, type PersistedRun, type RunState } from "../src/index.js";
+import { registerSpeedTracker, SpeedTracker } from "../src/agent-speed.js";
+import type { WorkflowAgentSession } from "../src/types.js";
 import { openAgentsWorkspace, type AgentsWorkspaceState } from "../src/agents-workspace.js";
 import { FakeTerminal } from "./agents-workspace-harness.js";
 import { navigatorSidebarWidth } from "../src/host-view.js";
 import { createSessionAgentsSource, type SessionTreeNode } from "../src/session-agents.js";
+import type { SubagentManager } from "../subagents/src/contracts.js";
 import { advance, agent, createRun, KEYBINDINGS, launch, click, entries, entry, ESC, escapes, FakeLive, KEY, leave, menu, MENU_HEADING, menuRows, nodesOf, open, opened, paste, polled, polls, rowOf, rule, settle, sidebarColumn, sidebarRows, statusRow as status, timers, title as titleRow, topRow, project, temporary, tree, until, type FakePi, type Listed, type Spec } from "./agents-workspace-harness.js";
 
 const AGENTS = (): Listed[] => [agent("alpha"), agent("beta", { depth: 1, state: "completed", running: false }), agent("scout", { group: "Subagents", state: "failed", running: false })];
@@ -59,6 +62,30 @@ void test("the workspace opens over Pi on the alternate screen and restores Pi o
     await advance(t, 2);
     assert.equal(harness.source("alpha").count("poll"), polls, "no poll after leaving");
     assert.equal(harness.listCalls, lists, "no refresh after leaving");
+  }
+});
+
+void test("the title shows the live rate of a running agent in this process, then the persisted average, else nothing", async (t) => {
+  timers(t);
+  const live = {} as WorkflowAgentSession;
+  const tracker = new SpeedTracker(() => 2_100);
+  registerSpeedTracker(live, tracker);
+  const partial = { role: "assistant", content: [] } as const;
+  tracker.observe({ type: "message_start", message: partial }, 0);
+  tracker.observe({ type: "message_update", message: partial, assistantMessageEvent: { type: "text_start" } }, 100);
+  tracker.observe({ type: "message_update", message: partial, assistantMessageEvent: { type: "text_delta", delta: "x".repeat(400) } }, 1_100);
+  tracker.observe({ type: "message_update", message: partial, assistantMessageEvent: { type: "text_delta", delta: "x".repeat(400) } }, 2_100);
+  const speed = { messages: 2, outputTokens: 100, generationMs: 4_000, firstTokenMs: 600 };
+  const cases: readonly [Listed, RegExp][] = [
+    [agent("alpha", { live, speed }), /^#1\/1 alpha running gpt-5 1\.2k tok 200\.0 tok\/s now \[est\]/],
+    [agent("alpha", { speed }), /^#1\/1 alpha running gpt-5 1\.2k tok 25\.0 tok\/s avg/],
+    [agent("alpha", { live, speed, state: "completed", running: false }), /^#1\/1 alpha completed gpt-5 1\.2k tok 25\.0 tok\/s avg/],
+    [agent("alpha"), /^#1\/1 alpha running gpt-5 1\.2k tok\s*$/],
+  ];
+  for (const [listed, expected] of cases) {
+    const harness = await open([listed], { columns: 120, setup: (source) => { source.polls.push(polled(entries(0, 1))); } });
+    assert.match(title(harness).replace(/\s+\d+\/\d+ running.*$/, ""), expected);
+    await leave(harness);
   }
 });
 
@@ -1276,6 +1303,44 @@ void test("a run's sidebar rows are its /workflow tree rows, its nodes show the 
   assert.equal(title(narrow).trimEnd(), "review flow run running");
   assert.ok(narrow.screen().some((line) => line.includes("Selected workflow: review")), "the details wrap beside the sidebar");
   await leave(narrow);
+});
+
+void test("the run's, a phase's and the Subagents group's timelines are laid out at the pane's width: at 48 and 120 columns no timeline row wraps", async (t) => {
+  timers(t);
+  const { home, cwd } = project("agents-workspace");
+  const now = Date.now();
+  const model = { provider: "openai", model: "gpt" };
+  const record = (id: string, state: AgentRecord["state"], extra: Partial<AgentRecord> = {}): AgentRecord => ({ id, name: id, path: id, state, model, tools: [], attempts: 1, ...extra });
+  await createRun({ home, cwd }, "run", "running", { workflowName: "wide", phase: "review", phaseHistory: [{ phase: "plan", afterAgent: 0 }, { phase: "review", afterAgent: 1 }], agents: [
+    record("planner-with-a-long-name", "completed", { startedAt: now - 60_000, durationMs: 20_000 }),
+    record("reviewer", "running", { startedAt: now - 30_000 }),
+    record("helper", "queued"),
+  ] }, launch({ phases: ["plan", "review"] }));
+  const statuses = [{ id: "sub-a", sessionId: "session", state: "completed", startedAt: now - 50_000, finishedAt: now - 10_000 }, { id: "sub-b", sessionId: "session", state: "running", startedAt: now - 20_000 }];
+  const manager: SubagentManager = {
+    inspect: async (request) => request.id === undefined ? statuses : statuses.find(({ id }) => id === request.id),
+    run: async () => { throw new Error("unexpected"); }, steer: async () => { throw new Error("unexpected"); }, stop: async () => { throw new Error("unexpected"); }, retry: async () => { throw new Error("unexpected"); },
+  };
+  const context = { cwd, sessionManager: { getSessionId: () => "session" } } as unknown as ExtensionCommandContext;
+  const source = createSessionAgentsSource(context, { home, overlayRun: (run) => run, liveAgent: () => undefined, subagents: () => manager });
+  const phase = (await source.list()).find((node) => node.kind === "phase" && node.title(PLAIN_WORKFLOW_PROGRESS_STYLES).startsWith("review"))?.key;
+  assert.ok(phase);
+  // Each timeline row ends with its glyph or "queued"; a row laid out wider than the pane would wrap into a part without one.
+  const timelineRows = (screen: readonly string[], count: number): string[] => {
+    const pane = screen.map((line) => (line.includes(" │ ") ? line.slice(line.indexOf(" │ ") + 3) : line).replace(/[\s┃█]+$/, ""));
+    const start = pane.findIndex((line) => line.startsWith("Timeline"));
+    assert.ok(start >= 0, screen.join("\n"));
+    return pane.slice(start + 1, start + 1 + count);
+  };
+  for (const [columns, rows] of [[48, 70], [120, 40]] as const) {
+    for (const [key, count] of [["run:run", 3], [phase, 2], ["subagents", 2]] as const) {
+      const harness = await open([], { source, columns, rows, initialKey: key });
+      for (let tries = 0; !harness.screen().some((line) => line.includes("Timeline")) && tries < 200; tries++) await new Promise((resolve) => setTimeout(resolve, 25));
+      const screen = harness.screen();
+      for (const row of timelineRows(screen, count)) assert.match(row, /(?:[✓⠦]|queued)$/, `${key} at ${String(columns)}: ${screen.join("\n")}`);
+      await leave(harness);
+    }
+  }
 });
 
 function describeTarget(target: AgentsActionTarget): string {
