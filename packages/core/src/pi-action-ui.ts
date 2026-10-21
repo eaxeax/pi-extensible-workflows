@@ -145,7 +145,7 @@ export function createPiActionUi(ctx: ExtensionContext, options: PiActionUiOptio
     confirm: (title, message) => confirmWithBlocked({ confirm: (dialogTitle, dialogMessage) => ctx.ui.confirm(dialogTitle, dialogMessage) }, options.reportBlocked, title, message),
     select,
     input,
-    editText: async (title) => (await ctx.ui.editor(title))?.trim() || undefined,
+    editText: async (title, prefill) => (await ctx.ui.editor(title, prefill))?.trim() || undefined,
     async reviewCheckpoint(checkpoint) {
       if (ctx.mode === "tui") return reviewCheckpointOverlay(ctx, checkpoint);
       const choice = await select(formatCheckpointReview(checkpoint), ["Approve", "Reject", "Cancel"]);

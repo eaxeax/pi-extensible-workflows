@@ -17,6 +17,7 @@
 - `/agents` marks what needs a person: `⚠ quiet` or `⚠ stalled` on a running agent or subagent without a sign of life for 3 or 10 minutes, and `◆ waiting` on a run awaiting input. `n`/`N` select the next or previous such node, failed agents and runs that have used up their budget included. The title shows the session totals (running, tokens, cost). `f` follows a running agent with its transcript at the tail, and `/` filters the sidebar by name, ID, or `state:<state>` (#334).
 - In `/agents`, the menu of a workflow agent that owns a worktree offers `Open diff in editor` (#335).
 - The workflow widget shows this session's running background subagents as a "Subagents" group after the runs, and when its tree does not fit it keeps the rows that need attention. In scroll mode Alt+O leaves scroll mode and `enter` opens `/agents` on the row's run, phase, agent, or subagent. The widget draws nothing while an agents workspace is open (#336).
+- In `/agents` and the `/subagents` picker, a failed or stopped subagent offers `Edit and retry` beside `Retry` when its request is readable: it opens the prompt in Pi's editor, then asks for a model and a retries count, and the new run keeps the edited request and model; cancelling any prompt retries nothing. `Retry` itself is unchanged (#341).
 
 ### CLI
 
