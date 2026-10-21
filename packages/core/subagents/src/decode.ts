@@ -1,5 +1,6 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { finiteNumber, jsonValue, parseThinking } from "../../src/utils.js";
+import { validAgentSpeed } from "../../src/agent-speed.js";
 import type { AgentAttemptSummary } from "../../src/types.js";
 import { SUBAGENT_ATTEMPT_DETAILS_LIMIT, type SubagentManagerContext, type SubagentProgress, type SubagentStatus } from "./contracts.js";
 
@@ -43,7 +44,9 @@ export function accountingValue(value: unknown): SubagentProgress["accounting"] 
   const cacheWrite = record.cacheWrite;
   const cost = record.cost;
   if (!finiteNumber(input) || !finiteNumber(output) || !finiteNumber(cacheRead) || !finiteNumber(cacheWrite) || !finiteNumber(cost)) return undefined;
-  return { input, output, cacheRead, cacheWrite, cost };
+  const speed = record.speed === undefined ? undefined : validAgentSpeed(record.speed);
+  if (record.speed !== undefined && speed === undefined) return undefined;
+  return { input, output, cacheRead, cacheWrite, cost, ...(speed === undefined ? {} : { speed }) };
 }
 export function legacyAccountingValue(record: Record<string, unknown>): SubagentProgress["accounting"] | undefined {
   const accounting = accountingValue(record.accounting);
