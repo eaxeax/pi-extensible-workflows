@@ -2,6 +2,7 @@ import { copyToClipboard, type ExtensionCommandContext, getAgentDir, getSelectLi
 import { getKeybindings, HStack, Input, isKeyRelease, matchesKey, parseKey, ScrollView, SelectList, Text, TUI_KEYBINDINGS, truncateToWidth, TuiAltScreen, visibleWidth, VStack, wrapTextWithAnsi, type Component, type Keybinding, type OverlayHandle, type OverlayOptions, type ScrollViewOptions, type SelectItem, type TuiInputListenerResult, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import type { ActionUi, AgentsAction, AgentsActionProvider, AgentsActionTarget } from "./agents-actions-contract.js";
 import { formatCost, formatTokens } from "./background-widget.js";
+import { speedTps } from "./agent-speed.js";
 import { workflowKeyMatches } from "./pi-action-ui.js";
 import { navigateWorkflowPhaseTree, workflowPhaseTreeVisibleNodes, type WorkflowPhaseTree, type WorkflowPhaseTreeDirection, type WorkflowPhaseTreeNode } from "./host-phases.js";
 import { navigatorSidebarWidth, progressStyleForState, themeWorkflowProgressStyles, type WorkflowProgressStyles } from "./host-view.js";
@@ -1068,7 +1069,12 @@ class Workspace {
     const position = `#${String(agents.findIndex((candidate) => candidate.key === this.selectedKey) + 1)}/${String(agents.length)}`;
     // An agent a crash left active in a run that is not live is not running: no state, as the widget's mark draws none.
     const state = agent.leftover ? "" : clean(agent.state);
-    return [position, this.styles.bold(clean(agent.name)), state && progressStyleForState(state, this.styles)(state), this.styles.muted(clean(agent.summary))].filter((part) => part).join(" ") + failure;
+    return [position, this.styles.bold(clean(agent.name)), state && progressStyleForState(state, this.styles)(state), this.styles.muted(clean(agent.summary)), this.speedTitle(agent)].filter((part) => part).join(" ") + failure;
+  }
+  /** The persisted average rate, else nothing. */
+  private speedTitle(agent: SessionAgent): string {
+    const average = agent.speed === undefined ? undefined : speedTps(agent.speed);
+    return average === undefined ? "" : this.styles.muted(`${average.toFixed(1)} tok/s avg`);
   }
   /** The session's totals over the listed agents: "running/total agents · tokens · cost"; parts without data are left out. */
   private totalsText(): string {
@@ -1086,10 +1092,10 @@ class Workspace {
     if (!totals || gap < 2) return truncateToWidth(title, width, "…");
     return `${title}${" ".repeat(gap)}${this.styles.muted(totals)}`;
   }
-  /** The selected node's details as /workflow shows them, wrapped to the pane. */
+  /** The selected node's details as /workflow shows them, laid out at the pane's width and wrapped to it. */
   private detailsLines(width: number): string[] {
     const cell = Math.max(1, width);
-    return (this.selectedNode()?.details(this.styles, Date.now()) ?? []).flatMap((line) => wrapTextWithAnsi(line, cell).map((part) => truncateToWidth(part, cell, "")));
+    return (this.selectedNode()?.details(this.styles, Date.now(), cell) ?? []).flatMap((line) => wrapTextWithAnsi(line, cell).map((part) => truncateToWidth(part, cell, "")));
   }
   private hintText(): string {
     // Pi's keyHint over the keybindings Pi handed the workspace (Pi's own reads the keybindings of its own pi-tui).
