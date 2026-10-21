@@ -293,6 +293,85 @@ for (const state of ["interrupted", "paused", "budget_exhausted"]) {
   });
 }
 
+for (const state of ["interrupted", "paused", "budget_exhausted"]) {
+  void test(`a running agent in a ${state} run is not quiet and uses its recorded elapsed time`, (t) => {
+    const root = mkdtempSync(join(tmpdir(), "widget-agent-recorded-"));
+    const now = 10_000_000;
+    t.mock.timers.enable({ apis: ["Date", "setInterval"], now });
+    const baseAgent = runState().agents[0];
+    const directory = writeRun(join(root, "run-1"), runState({
+      state,
+      agents: [{ ...baseAgent, state: "running", startedAt: now - 600_000, durationMs: 12_345, lastEventAt: now - 20 * 60_000, attemptDetails: [] }],
+      usage: { tokens: 44_700, costUsd: 0.056, durationMs: 82_529 },
+    }));
+    const host = harness();
+    host.start();
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+
+    const frame = host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
+    assert.doesNotMatch(frame[0], /quiet|stalled/, `${state} title has no quiet count`);
+    assert.doesNotMatch(frame.join("\n"), /quiet|stalled/, `${state} agent has no silence mark`);
+    const agentLine = frame.find((line) => line.includes("scout"));
+    assert.ok(agentLine, `${state} agent row is shown`);
+    assert.match(agentLine, /00:12/, `${state} agent uses durationMs`);
+    assert.doesNotMatch(agentLine, /10:00/, `${state} agent does not use now-startedAt`);
+
+    host.shutdown();
+    rmSync(root, { recursive: true, force: true });
+  });
+}
+
+for (const state of ["interrupted", "paused", "budget_exhausted"]) {
+  void test(`a running agent in a ${state} run without an agent duration uses the recorded run duration`, (t) => {
+    const root = mkdtempSync(join(tmpdir(), "widget-agent-run-duration-"));
+    const now = 10_000_000;
+    t.mock.timers.enable({ apis: ["Date", "setInterval"], now });
+    const agentWithoutDuration = { ...runState().agents[0] };
+    delete agentWithoutDuration.durationMs;
+    const directory = writeRun(join(root, "run-1"), runState({
+      state,
+      agents: [{ ...agentWithoutDuration, state: "running", startedAt: now - 600_000, lastEventAt: now - 20 * 60_000, attemptDetails: [] }],
+      usage: { tokens: 44_700, costUsd: 0.056, durationMs: 82_529 },
+    }));
+    const host = harness();
+    host.start();
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+
+    const agentLine = () => drawAt(host, WIDTH).find((line) => line.includes("scout"));
+    const firstAgentLine = agentLine();
+    assert.ok(firstAgentLine, `${state} agent row is shown`);
+    assert.match(firstAgentLine, /01:22/, `${state} agent uses run usage duration`);
+    assert.doesNotMatch(firstAgentLine, /10:00/, `${state} agent does not use now-startedAt`);
+    t.mock.timers.tick(5000);
+    assert.equal(agentLine(), firstAgentLine, `${state} agent keeps its recorded duration on later renders`);
+
+    host.shutdown();
+    rmSync(root, { recursive: true, force: true });
+  });
+}
+
+void test("a running agent in a running run keeps its live silence mark and elapsed time", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "widget-agent-live-"));
+  const now = 10_000_000;
+  t.mock.timers.enable({ apis: ["Date", "setInterval"], now });
+  const baseAgent = runState().agents[0];
+  const directory = writeRun(join(root, "run-1"), runState({
+    agents: [{ ...baseAgent, state: "running", startedAt: now - 600_000, durationMs: 12_345, lastEventAt: now - 4 * 60_000, attemptDetails: [] }],
+  }));
+  const host = harness();
+  host.start();
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+
+  const frame = host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
+  assert.match(frame[0], /⚠ 1 quiet/, "a live run keeps its quiet title count");
+  const agentLine = frame.find((line) => line.includes("scout"));
+  assert.ok(agentLine);
+  assert.match(agentLine, /quiet 04:00/);
+  assert.match(agentLine, /10:00/);
+
+  host.shutdown();
+  rmSync(root, { recursive: true, force: true });
+});
 /** Three runs of three phases, each with twelve running agents writing their own transcripts. */
 function largeRuns(root) {
   return [0, 1, 2].map((runIndex) => {

@@ -724,7 +724,7 @@ function renderFrame(runs: readonly Run[], now: number, width: number, startOffs
           formatTokens(agentTokens(agent)),
           formatCost(agent.accounting?.cost),
           formatElapsed(
-            agentLive && agent.startedAt ? now - agent.startedAt : (agent.durationMs ?? 0),
+            run.state === "running" && agentLive && agent.startedAt ? now - agent.startedAt : (agent.durationMs ?? run.usage?.durationMs ?? 0),
           ),
           // A retry doubles what the agent costs, and only the latest attempt
           // shows in the numbers beside it.
@@ -733,7 +733,7 @@ function renderFrame(runs: readonly Run[], now: number, width: number, startOffs
           .filter(Boolean)
           .join(" · ");
 
-        const silence = agent.state === "running" ? agentSilence(agentLastActivity(agent, mtimes), now) : undefined;
+        const silence = run.state === "running" && agent.state === "running" ? agentSilence(agentLastActivity(agent, mtimes), now) : undefined;
         const role = silence?.kind === "stalled" ? ROLE.failed : ROLE.warn;
         const kids = children.get(agent.id) ?? [];
         const agentKey = `${parentKey}/agent:${agent.id}`;
