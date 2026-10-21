@@ -2,11 +2,11 @@ import { randomUUID } from "node:crypto";
 import { chmod, link, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { addAccounting, errorCode, errorText, finiteNumber, isNodeError, isThinkingLevel, jsonValue, object, loadingRegistry, localAgentTransport, resolveAgentResourcePolicy, resolveWorkflowSettings, sanitizeDisplayText, sumAccounting, structuralPath, validateModelAliasAvailability, WorkflowAgentExecutor, WorkflowError, workflowSettingsPath, type AgentAccounting, type AgentAttempt, type AgentAttemptSummary, type PreparedAgentConfiguration, type AgentExecutionOptions, type AgentExecutionRoot, type AgentProgress, type AgentToolCallProgress, type JsonSchema, type JsonValue, type ModelSpec, type WorkflowAgentSessionState, type WorkflowRunContext, SerialLane } from "../../src/index.js";
+import { addAccounting, errorCode, errorText, finiteNumber, isNodeError, isThinkingLevel, jsonValue, object, loadingRegistry, resolveModelReference, localAgentTransport, modelCapability, resolveAgentResourcePolicy, resolveWorkflowSettings, sanitizeDisplayText, sumAccounting, structuralPath, validateModelAliasAvailability, WorkflowAgentExecutor, WorkflowError, workflowSettingsPath, type AgentAccounting, type AgentAttempt, type AgentAttemptSummary, type PreparedAgentConfiguration, type AgentExecutionOptions, type AgentExecutionRoot, type AgentProgress, type AgentToolCallProgress, type JsonSchema, type JsonValue, type ModelSpec, type WorkflowAgentSessionState, type WorkflowRunContext, SerialLane } from "../../src/index.js";
 import { decodePreparedAgentConfiguration } from "../../src/decoders.js";
 import { atomicJson, json as readJson, processAlive } from "../../src/persistence.js";
 import { accountingValue, activityValue, legacyAccountingValue, worktreeValue } from "./decode.js";
-import { SUBAGENT_ATTEMPT_DETAILS_LIMIT, SUBAGENT_MAX_RETRIES, SUBAGENT_SYSTEM_PROMPT_LIMIT, SUBAGENTS_TOOL_NAMES, normalizeSubagentRunRequest, type SubagentInspectRequest, type SubagentLiveness, type SubagentAttemptActionData, type SubagentManager, type SubagentManagerContext, type SubagentManagerDependencies, type SubagentNotification, type SubagentOwnerMarker, type SubagentProgress, type SubagentRunRequest, type SubagentStatus } from "./contracts.js";
+import { SUBAGENT_ATTEMPT_DETAILS_LIMIT, SUBAGENT_MAX_RETRIES, SUBAGENT_SYSTEM_PROMPT_LIMIT, SUBAGENTS_TOOL_NAMES, normalizeSubagentRunRequest, type SubagentRetryEdits, type SubagentInspectRequest, type SubagentLiveness, type SubagentAttemptActionData, type SubagentManager, type SubagentManagerContext, type SubagentManagerDependencies, type SubagentNotification, type SubagentOwnerMarker, type SubagentProgress, type SubagentRunRequest, type SubagentStatus } from "./contracts.js";
 import { createRunStoreWorktreeAdapter, defaultWorktreeHome, type SubagentWorktreeContext, type SubagentWorktreeHandle } from "./worktree.js";
 
 const WORKFLOW_NAME = "subagents";
@@ -1126,16 +1126,27 @@ class PersistentSubagentManager implements SubagentManager {
     return this.disposePromise;
   }
 
-  async retry(request: Readonly<{ id: string }>, context: Readonly<SubagentManagerContext>): Promise<unknown> {
+  async retry(request: Readonly<{ id: string }>, context: Readonly<SubagentManagerContext>, edits?: SubagentRetryEdits): Promise<unknown> {
     const id = checkedId(request);
     await this.ensureInitialized();
     const active = this.activeRuns.get(id);
     const status = active ? persistedStatus(active) : this.terminalSummaries.get(id) ?? await loadPersistedStatus(storageDirectory(this.dependencies), id);
     if (status.state !== "failed" && status.state !== "stopped") throw new WorkflowError("AGENT_FAILED", `Subagent ${id} is not retryable`);
-    const requestSnapshot = await loadPersistedRequest(storageDirectory(this.dependencies), id);
+    const persisted = await loadPersistedRequest(storageDirectory(this.dependencies), id);
+    // A plain retry repeats the persisted request as it is; edits are checked as subagents_run checks a request.
+    const requestSnapshot = edits === undefined ? persisted : checkedRequest({ ...persisted, ...edits });
     const frozenExternal = await loadPersistedStandaloneExternalConfiguration(storageDirectory(this.dependencies), id);
+    if (edits?.model !== undefined) {
+      // An edited model is prepared like a fresh run (hooks and aliases included), not spliced into the frozen configuration; it is checked here so a bad one creates no run directory.
+      const signal = context.signal ?? new AbortController().signal;
+      let root = executionRoot(context, this.dependencies, signal, id, undefined);
+      if (loadingRegistry().modelAliases().length > 0) root = await addDynamicAliases(context, signal, root);
+      const model = resolveModelReference(edits.model, root.modelAliases, root.knownModels, root.settingsPath);
+      // The error a fresh run gets (agent-execution.ts), here before a run directory exists. A hook may change the model, so with hooks registered the run checks the prepared model, as a fresh run does.
+      if (!root.agentPreparationHooks?.length && root.availableModels?.has(modelCapability(model)) === false) throw new WorkflowError("UNKNOWN_MODEL", `Required model is unavailable: ${modelCapability(model)}`);
+    }
     const retryRequest = context.waitForForeground === false && requestSnapshot.mode === "foreground" ? { ...requestSnapshot, mode: "background" as const } : requestSnapshot;
-    const run = await this.start(retryRequest, context, frozenExternal);
+    const run = await this.start(retryRequest, context, edits?.model === undefined ? frozenExternal : undefined);
     emitUpdate(run);
     if (run.request.mode !== "foreground") return { id: run.id, state: "running" };
     return run.terminal;
@@ -1507,7 +1518,7 @@ export function createSubagentManager(dependencies: SubagentManagerDependencies 
     getAttemptActionData: (id) => manager.getAttemptActionData(id),
     steer: (request) => manager.steer(request),
     stop: (request) => manager.stop(request),
-    retry: (request, context) => manager.retry(request, context),
+    retry: (request, context, edits) => manager.retry(request, context, edits),
     delete: (request) => manager.delete(request),
     dispose: async () => { await manager.dispose(); },
   };

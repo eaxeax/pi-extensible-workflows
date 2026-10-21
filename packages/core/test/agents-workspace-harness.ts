@@ -557,7 +557,7 @@ export function recordingUi(answers: {
   readonly confirm?: (title: string, message: string) => boolean;
   readonly select?: (title: string, options: readonly string[]) => string | undefined;
   readonly input?: (title: string, placeholder: string | undefined) => string | undefined;
-  readonly editText?: (title: string) => string | undefined;
+  readonly editText?: (title: string, prefill?: string) => string | undefined;
   readonly review?: (checkpoint: AwaitingCheckpoint) => "Approve" | "Reject" | undefined;
 } = {}): ActionUi & { readonly calls: (readonly [string, ...unknown[]])[]; of(method: string): unknown[][] } {
   const calls: (readonly [string, ...unknown[]])[] = [];
@@ -568,7 +568,7 @@ export function recordingUi(answers: {
     async confirm(title, message) { calls.push(["confirm", title, message]); return answers.confirm?.(title, message) ?? false; },
     async select(title, options) { calls.push(["select", title, options]); return answers.select?.(title, options); },
     async input(title, placeholder) { calls.push(["input", title, placeholder]); return answers.input?.(title, placeholder); },
-    async editText(title) { calls.push(["editText", title]); return answers.editText?.(title); },
+    async editText(title, prefill) { calls.push(prefill === undefined ? ["editText", title] : ["editText", title, prefill]); return answers.editText?.(title, prefill); },
     async reviewCheckpoint(checkpoint) { calls.push(["reviewCheckpoint", checkpoint.name]); return answers.review?.(checkpoint); },
     async openArtifact(artifact, label) { calls.push(["openArtifact", artifact, label]); },
     status(text) { calls.push(["status", text]); },
@@ -689,7 +689,7 @@ export function subagentFixture(options: { readonly delete?: boolean; readonly r
     ["run-other", { id: "run-other", sessionId: "session-2", state: "completed", startedAt: 1_000, finishedAt: 2_000 }],
   ]);
   for (const id of options.unreadable ?? []) if (!statuses.has(id)) statuses.set(id, { id, sessionId: SESSION, state: "completed", startedAt: 1_000, finishedAt: 1_500 });
-  const calls: (readonly [string, unknown, SubagentManagerContext])[] = [];
+  const calls: (readonly [string, unknown, SubagentManagerContext, unknown?])[] = [];
   const copied: string[] = [];
   const known = (id: string): Record<string, unknown> => {
     const status = statuses.get(id);
@@ -705,8 +705,8 @@ export function subagentFixture(options: { readonly delete?: boolean; readonly r
     },
     async steer(request, context) { calls.push(["steer", request, context]); return { id: request.id, accepted: true }; },
     async stop(request, context) { calls.push(["stop", request, context]); statuses.set(request.id, { ...known(request.id), state: "stopped", finishedAt: 4_000 }); return {}; },
-    async retry(request, context) {
-      calls.push(["retry", request, context]);
+    async retry(request, context, edits) {
+      calls.push(["retry", request, context, edits]);
       if (options.retry !== undefined) return options.retry;
       statuses.set("run-d", { id: "run-d", sessionId: SESSION, state: "running", startedAt: 5_000, attempts: 1 });
       return { id: "run-d", state: "running" };
