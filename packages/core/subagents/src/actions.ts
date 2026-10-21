@@ -5,7 +5,7 @@ import { agentsAction, type ActionUi, type AgentsActionProvider, type AgentsActi
 import { agentActionLabels, deepFreeze, errorText, formatAgentDetail, formatAgentError, jsonValue, loadingRegistry, navigatorAttentionSortByState, sanitizeDisplayText, visibleStandaloneAgentAttemptActions, workflowPromptArtifact, workflowResultArtifact, type AgentAttemptActionUi, type AgentDetailPresentation, type StandaloneAgentAttemptActionContext, type WorkflowProgressStyles } from "../../src/index.js";
 import { attemptActionUi, copyArtifact, detachedAttemptActionUi, VISIBILITY_UI } from "../../src/workflow-actions.js";
 import { isNodeError, object } from "../../src/utils.js";
-import { normalizeSubagentRunRequest, type SubagentManager, type SubagentProgress, type SubagentRunRequest, type SubagentStatus } from "./contracts.js";
+import { normalizeSubagentRunRequest, SUBAGENT_MAX_RETRIES, type SubagentManager, type SubagentProgress, type SubagentRunRequest, type SubagentStatus } from "./contracts.js";
 import { attemptValue, latestAttempt, managerContext, safeSubagentId, shortSubagentId, statusValue, SUBAGENT_ATTENTION_ORDER } from "./decode.js";
 
 /**
@@ -174,6 +174,9 @@ export function actionOptions(manager: SubagentManager, inspection: Inspection, 
   });
   const runActions = [...(manager.delete !== undefined && inspection.entry.status.state !== "running" ? ["Delete"] : []), ...bulk, ...(context.mode === "tui" ? ["Copy run path"] : [])];
   labels.splice(labels.indexOf("Copy agent ID"), 0, ...runActions);
+  // Edit and retry needs the request it edits; it follows Retry.
+  const retry = labels.indexOf("Retry");
+  if (retry >= 0 && inspection.entry.request !== undefined) labels.splice(retry + 1, 0, "Edit and retry");
   return labels;
 }
 export async function deleteAll(manager: SubagentManager, storageDirectory: string, context: ExtensionCommandContext, state: BulkDeleteState, ui: Pick<ActionUi, "confirm" | "notify">): Promise<boolean> {
@@ -251,10 +254,24 @@ export async function performAction(manager: SubagentManager, storageDirectory: 
     ui.notify(`Stopped subagent ${id}.`, "info");
     return "stay";
   }
-  if (action === "Retry") {
+  const request = fresh.entry.request;
+  if (action === "Retry" || (action === "Edit and retry" && request !== undefined)) {
+    const edits: { prompt?: string; model?: string; retries?: number } = {};
+    // Edit and retry: the prompt, then the model and the retries count; an empty answer keeps the value, a cancel retries nothing.
+    if (action === "Edit and retry" && request !== undefined) {
+      const prompt = await ui.editText("Edit and retry: prompt", request.prompt);
+      if (prompt === undefined) return "stay";
+      const model = (await ui.input(`Model, empty keeps ${request.model ?? "the current one"}`, "provider/model:thinking or alias[:thinking]"))?.trim();
+      if (model === undefined) return "stay";
+      const retries = (await ui.input(`Retries from 0 to ${String(SUBAGENT_MAX_RETRIES)}, empty keeps ${request.retries === undefined ? "the current count" : String(request.retries)}`))?.trim();
+      if (retries === undefined) return "stay";
+      if (prompt !== request.prompt) edits.prompt = prompt;
+      if (model !== "") edits.model = model;
+      if (retries !== "") edits.retries = Number(retries);
+    }
     const current = await inspectEntry(manager, storageDirectory, id, context);
     if (current.entry.status.state !== "failed" && current.entry.status.state !== "stopped") throw new Error(`Subagent ${id} is no longer retryable`);
-    const result = retryResult(await manager.retry({ id }, managerContext("subagents-command", context, false, false)));
+    const result = retryResult(await manager.retry({ id }, managerContext("subagents-command", context, false, false), action === "Edit and retry" ? edits : undefined));
     if (!result) throw new Error("Retry returned an invalid subagent result");
     ui.notify(`Retried subagent ${id} as ${result.id}.`, "info");
     return { retryId: result.id };
