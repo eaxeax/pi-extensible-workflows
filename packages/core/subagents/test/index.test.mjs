@@ -1,7 +1,7 @@
 /* global setTimeout, clearTimeout, setImmediate, structuredClone */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import fsPromises, { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import fsPromises, { mkdtemp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -736,6 +736,7 @@ async function executionContext(cwd, signal) {
     { provider: "fixture", id: "model" },
     { provider: "fixture", id: "cheap" },
     { provider: "fixture", id: "role-model" },
+    { provider: "fixture", id: "other" },
   ];
   return {
     cwd,
@@ -2069,6 +2070,166 @@ test("retries a failed subagent from its persisted request with a new ID", async
     assert.deepEqual(JSON.parse(await readFile(join(cwd, "storage", retried.id, "request.json"), "utf8")), { prompt: "retry me", mode: "background", label: "retryable" });
   } finally {
     await manager.dispose();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+test("an edited retry persists the merged request and model, and a later plain retry repeats them", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-retry-edits-"));
+  const storage = join(cwd, "storage");
+  const seen = [];
+  const manager = createSubagentManager({
+    storageDir: storage,
+    createExecutor() {
+      return { async execute(prompt, options) { seen.push({ prompt, retries: options.retries, model: options.configuration.model }); throw new Error("failed"); } };
+    },
+  });
+  const context = await managerContext(cwd);
+  const failed = async (id) => { await waitFor(async () => (await manager.inspect({ id }, context)).state === "failed"); };
+  try {
+    const original = await manager.run({ prompt: "first", mode: "background" }, context);
+    await failed(original.id);
+    const edited = await manager.retry({ id: original.id }, context, { prompt: "edited", model: "fixture/other:high", retries: 3 });
+    await failed(edited.id);
+    assert.deepEqual(JSON.parse(await readFile(join(storage, edited.id, "request.json"), "utf8")), { prompt: "edited", mode: "background", model: "fixture/other:high", retries: 3 });
+    assert.deepEqual(JSON.parse(await readFile(join(storage, edited.id, "configuration.json"), "utf8")).configuration.model, { provider: "fixture", model: "other", thinking: "high" });
+    assert.deepEqual(seen.at(-1), { prompt: "edited", retries: 3, model: { provider: "fixture", model: "other", thinking: "high" } });
+    const plain = await manager.retry({ id: edited.id }, context);
+    await failed(plain.id);
+    assert.deepEqual(seen.at(-1), seen.at(-2));
+    assert.equal(seen.at(-1).prompt, "edited");
+  } finally {
+    await manager.dispose();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+test("an edited retry is prepared by the agent preparation hooks like a fresh run", async () => {
+  resetWorkflowRegistry();
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-retry-hooks-"));
+  const seen = [];
+  registerWorkflowExtension({ version: "1.0.0", headline: "Retry model hook", agentPreparationHooks: { swap: { prepare(configuration) {
+    if (configuration.model === "fixture/other:high") configuration.model = "fixture/cheap:low";
+  } } } });
+  const manager = createSubagentManager({
+    storageDir: join(cwd, "storage"),
+    createExecutor() {
+      return { async execute(_prompt, options) { seen.push(options.configuration.model); throw new Error("failed"); } };
+    },
+  });
+  const context = await managerContext(cwd);
+  try {
+    const original = await manager.run({ prompt: "first", mode: "background" }, context);
+    await waitFor(async () => (await manager.inspect({ id: original.id }, context)).state === "failed");
+    const edited = await manager.retry({ id: original.id }, context, { model: "fixture/other:high" });
+    await waitFor(async () => (await manager.inspect({ id: edited.id }, context)).state === "failed");
+    assert.deepEqual(seen.at(-1), { provider: "fixture", model: "cheap", thinking: "low" });
+  } finally {
+    await manager.dispose();
+    resetWorkflowRegistry();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+test("an edited retry rejects an invalid model or retries before any run directory exists", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-retry-invalid-edits-"));
+  const storage = join(cwd, "storage");
+  const manager = createSubagentManager({ storageDir: storage, createExecutor() { return { async execute() { throw new Error("failed"); } }; } });
+  const context = await managerContext(cwd);
+  try {
+    const original = await manager.run({ prompt: "first", mode: "background" }, context);
+    await waitFor(async () => (await manager.inspect({ id: original.id }, context)).state === "failed");
+    const before = await readdir(storage);
+    const code = (expected) => (error) => error instanceof WorkflowError && error.code === expected;
+    await assert.rejects(manager.retry({ id: original.id }, context, { model: "fixture/other" }), code("INVALID_METADATA"));
+    await assert.rejects(manager.retry({ id: original.id }, context, { model: "nope" }), code("UNKNOWN_MODEL"));
+    for (const retries of [256, -1, 1.5]) await assert.rejects(manager.retry({ id: original.id }, context, { retries }), code("INVALID_METADATA"));
+    assert.deepEqual(await readdir(storage), before);
+  } finally {
+    await manager.dispose();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+test("an edited retry rejects a dynamic alias that resolves to an unavailable model before any run directory exists", async () => {
+  resetWorkflowRegistry();
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-retry-unavailable-alias-"));
+  const storage = join(cwd, "storage");
+  const manager = createSubagentManager({ storageDir: storage, createExecutor() { return { async execute() { throw new Error("failed"); } }; } });
+  const context = await managerContext(cwd);
+  // fixture/locked is listed but not available.
+  const { modelRegistry } = context.extensionContext;
+  const restricted = { ...context, extensionContext: { ...context.extensionContext, modelRegistry: { getAll: () => [...modelRegistry.getAll(), { provider: "fixture", id: "locked" }], getAvailable: () => modelRegistry.getAvailable() } } };
+  try {
+    const original = await manager.run({ prompt: "first", mode: "background" }, context);
+    await waitFor(async () => (await manager.inspect({ id: original.id }, context)).state === "failed");
+    registerWorkflowExtension({ version: "1.0.0", headline: "Unavailable alias", modelAliases: { locked: { resolve: () => "fixture/locked" } } });
+    const before = await readdir(storage);
+    await assert.rejects(manager.retry({ id: original.id }, restricted, { model: "locked" }), (error) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL" && /alias locked resolved to fixture\/locked/.test(error.message));
+    assert.deepEqual(await readdir(storage), before);
+  } finally {
+    await manager.dispose();
+    resetWorkflowRegistry();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+for (const [name, model, aliases] of [["a concrete model", "fixture/locked:low", undefined], ["a settings alias", "locked", { locked: "fixture/locked" }]]) {
+  test(`an edited retry rejects ${name} that is not available before any run directory exists, and accepts an available one`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "subagents-retry-unavailable-model-"));
+    const storage = join(cwd, "storage");
+    const agentDir = join(cwd, "agent");
+    await mkdir(join(agentDir, "pi-extensible-workflows"), { recursive: true });
+    if (aliases) await writeFile(join(agentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ modelAliases: aliases }));
+    const manager = createSubagentManager({ agentDir, storageDir: storage, createExecutor() { return { async execute() { throw new Error("failed"); } }; } });
+    const context = await managerContext(cwd);
+    // fixture/locked is listed but not available.
+    const { modelRegistry } = context.extensionContext;
+    const restricted = { ...context, extensionContext: { ...context.extensionContext, modelRegistry: { getAll: () => [...modelRegistry.getAll(), { provider: "fixture", id: "locked" }], getAvailable: () => modelRegistry.getAvailable() } } };
+    try {
+      const original = await manager.run({ prompt: "first", mode: "background" }, context);
+      await waitFor(async () => (await manager.inspect({ id: original.id }, context)).state === "failed");
+      const before = await readdir(storage);
+      await assert.rejects(manager.retry({ id: original.id }, restricted, { model }), (error) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL" && error.message === "Required model is unavailable: fixture/locked");
+      assert.deepEqual(await readdir(storage), before);
+      const edited = await manager.retry({ id: original.id }, restricted, { model: "fixture/cheap:low" });
+      assert.notEqual(edited.id, original.id);
+      assert.equal((await readdir(storage)).length, before.length + 1);
+    } finally {
+      await manager.dispose();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
+test("with a preparation hook registered, an edited retry accepts an unavailable model the hook rewrites, as a fresh run does", async () => {
+  resetWorkflowRegistry();
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-retry-hook-unavailable-"));
+  const storage = join(cwd, "storage");
+  const seen = [];
+  registerWorkflowExtension({ version: "1.0.0", headline: "Unlock hook", agentPreparationHooks: { unlock: { prepare(configuration) {
+    if (configuration.model === "fixture/locked:low") configuration.model = "fixture/cheap:low";
+  } } } });
+  const manager = createSubagentManager({ storageDir: storage, createExecutor() { return { async execute(prompt, options) { seen.push({ prompt, model: options.configuration.model }); throw new Error("failed"); } }; } });
+  const context = await managerContext(cwd);
+  // fixture/locked is listed but not available.
+  const { modelRegistry } = context.extensionContext;
+  const restricted = { ...context, extensionContext: { ...context.extensionContext, modelRegistry: { getAll: () => [...modelRegistry.getAll(), { provider: "fixture", id: "locked" }], getAvailable: () => modelRegistry.getAvailable() } } };
+  try {
+    const original = await manager.run({ prompt: "first", mode: "background" }, restricted);
+    await waitFor(async () => (await manager.inspect({ id: original.id }, restricted)).state === "failed");
+    const beforeFresh = await readdir(storage);
+    const fresh = await manager.run({ prompt: "fresh", mode: "background", model: "fixture/locked:low" }, restricted);
+    await waitFor(async () => (await manager.inspect({ id: fresh.id }, restricted)).state === "failed");
+    const before = await readdir(storage);
+    assert.equal(before.length, beforeFresh.length + 1);
+    assert.ok(before.includes(fresh.id));
+    const edited = await manager.retry({ id: original.id }, restricted, { model: "fixture/locked:low" });
+    await waitFor(async () => (await manager.inspect({ id: edited.id }, restricted)).state === "failed");
+    assert.equal((await readdir(storage)).length, before.length + 1);
+    assert.notEqual(edited.id, original.id);
+    assert.ok((await readdir(storage)).includes(edited.id));
+    const cheap = { provider: "fixture", model: "cheap", thinking: "low" };
+    assert.deepEqual(seen.filter(({ prompt }) => prompt === "fresh"), [{ prompt: "fresh", model: cheap }]);
+    assert.deepEqual(seen.filter(({ prompt }) => prompt === "first").at(-1), { prompt: "first", model: cheap });
+    assert.equal(seen.filter(({ prompt }) => prompt === "first").length, 2);
+  } finally {
+    await manager.dispose();
+    resetWorkflowRegistry();
     await rm(cwd, { recursive: true, force: true });
   }
 });
