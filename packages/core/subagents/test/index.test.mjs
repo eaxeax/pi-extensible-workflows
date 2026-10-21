@@ -1,7 +1,7 @@
 /* global setTimeout, clearTimeout, setImmediate, structuredClone */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import fsPromises, { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import fsPromises, { mkdtemp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -736,6 +736,7 @@ async function executionContext(cwd, signal) {
     { provider: "fixture", id: "model" },
     { provider: "fixture", id: "cheap" },
     { provider: "fixture", id: "role-model" },
+    { provider: "fixture", id: "other" },
   ];
   return {
     cwd,
@@ -2067,6 +2068,54 @@ test("retries a failed subagent from its persisted request with a new ID", async
     assert.deepEqual((await manager.inspect({ id: retried.id }, context)).value, { retry: true });
     assert.equal(launches, 2);
     assert.deepEqual(JSON.parse(await readFile(join(cwd, "storage", retried.id, "request.json"), "utf8")), { prompt: "retry me", mode: "background", label: "retryable" });
+  } finally {
+    await manager.dispose();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+test("an edited retry persists the merged request and model, and a later plain retry repeats them", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-retry-edits-"));
+  const storage = join(cwd, "storage");
+  const seen = [];
+  const manager = createSubagentManager({
+    storageDir: storage,
+    createExecutor() {
+      return { async execute(prompt, options) { seen.push({ prompt, retries: options.retries, model: options.configuration.model }); throw new Error("failed"); } };
+    },
+  });
+  const context = await managerContext(cwd);
+  const failed = async (id) => { await waitFor(async () => (await manager.inspect({ id }, context)).state === "failed"); };
+  try {
+    const original = await manager.run({ prompt: "first", mode: "background" }, context);
+    await failed(original.id);
+    const edited = await manager.retry({ id: original.id }, context, { prompt: "edited", model: "fixture/other:high", retries: 3 });
+    await failed(edited.id);
+    assert.deepEqual(JSON.parse(await readFile(join(storage, edited.id, "request.json"), "utf8")), { prompt: "edited", mode: "background", model: "fixture/other:high", retries: 3 });
+    assert.deepEqual(JSON.parse(await readFile(join(storage, edited.id, "configuration.json"), "utf8")).configuration.model, { provider: "fixture", model: "other", thinking: "high" });
+    assert.deepEqual(seen.at(-1), { prompt: "edited", retries: 3, model: { provider: "fixture", model: "other", thinking: "high" } });
+    const plain = await manager.retry({ id: edited.id }, context);
+    await failed(plain.id);
+    assert.deepEqual(seen.at(-1), seen.at(-2));
+    assert.equal(seen.at(-1).prompt, "edited");
+  } finally {
+    await manager.dispose();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+test("an edited retry rejects an invalid model or retries before any run directory exists", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-retry-invalid-edits-"));
+  const storage = join(cwd, "storage");
+  const manager = createSubagentManager({ storageDir: storage, createExecutor() { return { async execute() { throw new Error("failed"); } }; } });
+  const context = await managerContext(cwd);
+  try {
+    const original = await manager.run({ prompt: "first", mode: "background" }, context);
+    await waitFor(async () => (await manager.inspect({ id: original.id }, context)).state === "failed");
+    const before = await readdir(storage);
+    const code = (expected) => (error) => error instanceof WorkflowError && error.code === expected;
+    await assert.rejects(manager.retry({ id: original.id }, context, { model: "fixture/other" }), code("INVALID_METADATA"));
+    await assert.rejects(manager.retry({ id: original.id }, context, { model: "nope" }), code("UNKNOWN_MODEL"));
+    for (const retries of [256, -1, 1.5]) await assert.rejects(manager.retry({ id: original.id }, context, { retries }), code("INVALID_METADATA"));
+    assert.deepEqual(await readdir(storage), before);
   } finally {
     await manager.dispose();
     await rm(cwd, { recursive: true, force: true });

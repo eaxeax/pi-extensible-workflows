@@ -44,8 +44,8 @@ export interface ActionUi {
   confirm(title: string, message: string): Promise<boolean>;
   select(title: string, options: readonly string[]): Promise<string | undefined>;
   input(title: string, placeholder?: string): Promise<string | undefined>;
-  /** Free text of several lines (Steer); undefined when cancelled. */
-  editText(title: string): Promise<string | undefined>;
+  /** Free text of several lines (Steer, the prompt of Edit and retry), prefilled with `prefill` when given; undefined when cancelled. */
+  editText(title: string, prefill?: string): Promise<string | undefined>;
   /** The checkpoint shown in full, then Approve or Reject; undefined when cancelled. */
   reviewCheckpoint(checkpoint: AwaitingCheckpoint): Promise<"Approve" | "Reject" | undefined>;
   /** Opens the artifact in the configured external editor and returns after it exits; reports a missing editor or a failed exit itself. */
@@ -63,7 +63,7 @@ export interface AgentsActionProvider {
   /**
    * Runs a label this provider offers now: it re-checks first, and a label no longer offered is reported through
    * `ui.notify` and does nothing. Failures are reported through `ui.notify` as the dashboards report them, not thrown.
-   * `select` is the node key to select afterwards (the new run after a subagent Retry).
+   * `select` is the node key to select afterwards (the new run after a subagent Retry or Edit and retry).
    */
   run(target: AgentsActionTarget, label: string, ui: ActionUi): Promise<{ readonly select?: string }>;
 }
