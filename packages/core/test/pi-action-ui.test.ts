@@ -157,13 +157,16 @@ void test("outside the TUI the checkpoint review is Pi's select", async () => {
 void test("editText is Pi's editor dialog in every mode: the text trimmed, a blank text or a cancel is undefined", async () => {
   for (const mode of ["tui", "rpc"] as const) {
     const titles: string[] = [];
-    const answers = ["  hi there\n", " \n", undefined];
-    const { ctx, recorded } = piContext(mode, undefined, { editor: async (title: string) => { titles.push(title); return answers.shift(); } });
+    const prefills: (string | undefined)[] = [];
+    const answers = ["  hi there\n", " \n", undefined, "edited"];
+    const { ctx, recorded } = piContext(mode, undefined, { editor: async (title: string, prefill?: string) => { titles.push(title); prefills.push(prefill); return answers.shift(); } });
     const ui = createPiActionUi(ctx, {});
     assert.equal(await ui.editText("Steer subagent"), "hi there");
     assert.equal(await ui.editText("Steer subagent"), undefined);
     assert.equal(await ui.editText("Steer subagent"), undefined);
-    assert.deepEqual(titles, ["Steer subagent", "Steer subagent", "Steer subagent"]);
+    assert.equal(await ui.editText("Retry prompt", "old prompt"), "edited");
+    assert.deepEqual(titles, ["Steer subagent", "Steer subagent", "Steer subagent", "Retry prompt"]);
+    assert.deepEqual(prefills, [undefined, undefined, undefined, "old prompt"]);
     assert.deepEqual(recorded.customs, [], "no component of its own");
     assert.deepEqual(recorded.inputs, []);
   }

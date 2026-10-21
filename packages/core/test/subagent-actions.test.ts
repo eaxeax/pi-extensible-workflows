@@ -114,7 +114,7 @@ void test("stops a running subagent only after ui.confirm accepts today's questi
   assert.deepEqual(await accepted.provider.run(subagent("run-a"), "Stop", yes), {});
   assert.deepEqual(yes.calls, [["confirm", "Stop subagent?", "Stop subagent scout (run-a)? This cannot be undone."], ["notify", "Stopped subagent run-a.", "info"]]);
   assert.deepEqual(accepted.calls.map(([name, request]) => [name, request]), [["stop", { id: "run-a" }]]);
-  assert.deepEqual(await accepted.provider.actions(subagent("run-a")), marked(["Copy branch", "Copy worktree path", "Open prompt in editor", "Retry", "Delete", "Copy run path", "Copy agent ID"]), "a stopped run is offered Retry and Delete");
+  assert.deepEqual(await accepted.provider.actions(subagent("run-a")), marked(["Copy branch", "Copy worktree path", "Open prompt in editor", "Retry", "Edit and retry", "Delete", "Copy run path", "Copy agent ID"]), "a stopped run with a request is offered Retry, Edit and retry and Delete");
 });
 
 void test("Stop inspects again after the confirm and refuses a run that settled meanwhile", async () => {
@@ -152,11 +152,54 @@ void test("Retry selects the new run, and an invalid retry result is reported, n
   assert.deepEqual(ui.calls, [["notify", "Retried subagent run-c as run-d.", "info"]]);
   assert.deepEqual(calls.map(([name, request]) => [name, request]), [["retry", { id: "run-c" }]]);
   assert.equal(calls[0]?.[2].waitForForeground, false, "a foreground run is retried in the background");
+  assert.deepEqual(calls.map(([, , , edits]) => edits), [undefined], "a plain Retry asks nothing and passes no edits");
 
   const invalid = fixture({ retry: { id: "run-c", state: "failed" } });
   const warned = recordingUi();
   assert.deepEqual(await invalid.provider.run(subagent("run-c"), "Retry", warned), {});
   assert.deepEqual(warned.calls, [["notify", "Cannot retry: Retry returned an invalid subagent result", "warning"]]);
+});
+
+void test("Edit and retry edits the prompt, model and retries, and an empty answer keeps the model and the count", async () => {
+  const { provider, calls, directory } = fixture();
+  mkdirSync(join(directory, "run-c"), { recursive: true });
+  writeFileSync(join(directory, "run-c", "request.json"), JSON.stringify({ prompt: "OLD", mode: "background", model: "fixture/old:low", retries: 1 }));
+  assert.deepEqual(await provider.actions(subagent("run-c")), marked(["Open prompt in editor", "Retry", "Edit and retry", "Delete", "Copy run path", "Copy agent ID"]));
+  const inputs = ["fixture/other:high", "3"];
+  const ui = recordingUi({ editText: () => "NEW", input: () => inputs.shift() });
+  assert.deepEqual(await provider.run(subagent("run-c"), "Edit and retry", ui), { select: "subagent:run-d" });
+  assert.deepEqual(ui.of("editText"), [["Edit and retry: prompt", "OLD"]]);
+  assert.deepEqual(ui.of("input").map(([title]) => title), ["Model, empty keeps fixture/old:low", "Retries from 0 to 255, empty keeps 1"]);
+  assert.deepEqual(calls.map(([name, request, , edits]) => [name, request, edits]), [["retry", { id: "run-c" }, { prompt: "NEW", model: "fixture/other:high", retries: 3 }]]);
+
+  const kept = fixture();
+  mkdirSync(join(kept.directory, "run-c"), { recursive: true });
+  writeFileSync(join(kept.directory, "run-c", "request.json"), JSON.stringify({ prompt: "OLD", mode: "background" }));
+  const keep = recordingUi({ editText: () => "OLD", input: () => "" });
+  await kept.provider.run(subagent("run-c"), "Edit and retry", keep);
+  assert.deepEqual(keep.of("input").map(([title]) => title), ["Model, empty keeps the current one", "Retries from 0 to 255, empty keeps the current count"]);
+  assert.deepEqual(kept.calls.map(([, , , edits]) => edits), [{}], "nothing changed: the persisted request is retried as edited, with no field replaced");
+});
+
+void test("Edit and retry cancels at each step without a retry call", async () => {
+  for (const cancelAt of ["prompt", "model", "retries"] as const) {
+    const { provider, calls, directory } = fixture();
+    mkdirSync(join(directory, "run-c"), { recursive: true });
+    writeFileSync(join(directory, "run-c", "request.json"), JSON.stringify({ prompt: "OLD", mode: "background" }));
+    const ui = recordingUi({ editText: () => cancelAt === "prompt" ? undefined : "NEW", input: (title) => title.startsWith("Model") ? (cancelAt === "model" ? undefined : "") : (cancelAt === "retries" ? undefined : "") });
+    assert.deepEqual(await provider.run(subagent("run-c"), "Edit and retry", ui), {}, cancelAt);
+    assert.deepEqual(ui.of("notify"), [], cancelAt);
+    assert.deepEqual(calls, [], cancelAt);
+  }
+});
+
+void test("Edit and retry is not offered without a readable request", async () => {
+  const { provider, calls } = fixture();
+  assert.deepEqual(await provider.actions(subagent("run-c")), marked(["Retry", "Delete", "Copy run path", "Copy agent ID"]));
+  const ui = recordingUi();
+  assert.deepEqual(await provider.run(subagent("run-c"), "Edit and retry", ui), {});
+  assert.deepEqual(ui.of("notify"), [["Cannot edit and retry: Action Edit and retry is no longer available", "warning"]]);
+  assert.deepEqual(calls, []);
 });
 
 void test("Retry inspects again and refuses a run that is running again", async () => {
