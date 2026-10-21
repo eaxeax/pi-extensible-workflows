@@ -8,7 +8,7 @@ import { KeybindingsManager, stripTerminalSequences, TUI_KEYBINDINGS, visibleWid
 import type { ActionUi, AgentsAction, AgentsActionProvider, AgentsActionTarget } from "../src/agents-actions-contract.js";
 import { formatWorkflowPhaseDashboard, type AgentRecord, type PersistedRun, type RunState } from "../src/index.js";
 import { openAgentsWorkspace, type AgentsWorkspaceState } from "../src/agents-workspace.js";
-import { FakeTerminal } from "./agents-workspace-harness.js";
+import { diag, FakeTerminal } from "./agents-workspace-harness.js";
 import { navigatorSidebarWidth } from "../src/host-view.js";
 import { createSessionAgentsSource, type SessionTreeNode } from "../src/session-agents.js";
 import { advance, agent, createRun, KEYBINDINGS, launch, click, entries, entry, ESC, escapes, FakeLive, KEY, leave, menu, MENU_HEADING, menuRows, nodesOf, open, opened, paste, polled, polls, rowOf, rule, settle, sidebarColumn, sidebarRows, statusRow as status, timers, title as titleRow, topRow, project, temporary, tree, until, type FakePi, type Listed, type Spec } from "./agents-workspace-harness.js";
@@ -437,6 +437,7 @@ void test("moves in separate turns while the first read is held start no read; t
 
 void test("polling appends and resets while the agent runs, shows waiting, and stops one poll after the agent stops", async (t) => {
   timers(t);
+  const start = diag.__mark?.() ?? 0;
   const harness = await open([agent("alpha")], { columns: 70, setup: (source) => { source.polls.push(polled([], { status: "waiting" }), polled(entries(0, 3)), polled(entries(3, 2)), polled(entries(100, 4), { reset: true })); } });
   const source = harness.source("alpha");
   const view = harness.view("alpha");
@@ -453,8 +454,9 @@ void test("polling appends and resets while the agent runs, shows waiting, and s
   // The tick that learns the agent stopped has started its poll before the list came back.
   await advance(t);
   const running = source.count("poll");
+  diag.__log?.(`BASELINE polls=${String(running)}`, false);
   await advance(t, 3);
-  assert.equal(source.count("poll"), running + 1, "one more poll after the agent stopped");
+  assert.equal(source.count("poll"), running + 1, "one more poll after the agent stopped\n" + String(diag.__dump?.(start)));
   assert.match(title(harness), /^#1\/1 alpha completed/);
   assert.equal(harness.listCalls >= 6, true, "the agents are listed on every tick");
   assert.equal(source.overlapped, false);
@@ -703,13 +705,15 @@ function frames(pi: FakePi): { count: number } {
 
 void test("a tick with nothing new draws no frame: neither the list of a finished agent nor an empty poll of a running one", async (t) => {
   timers(t);
+  const start = diag.__mark?.() ?? 0;
   const finished = await open([agent("alpha", { state: "completed", running: false })]);
   await advance(t);
+  diag.__log?.("BASELINE idle", false);
   const idle = frames(finished);
   // The first tick read the finished agent to its end: from then on the ticks are five seconds apart.
   await advance(t, 10);
   assert.equal(finished.listCalls, 4, "the ticks listed");
-  assert.equal(idle.count, 0, "two ticks on a finished agent drew nothing");
+  assert.equal(idle.count, 0, "two ticks on a finished agent drew nothing\n" + String(diag.__dump?.(start)));
   await leave(finished);
   // Below 80 columns the sidebar hides: the running agent's polls are what could change the screen.
   const running = await open([agent("alpha")], { columns: 60 });

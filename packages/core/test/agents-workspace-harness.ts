@@ -22,6 +22,21 @@ import type { WorkflowActionDependencies } from "../src/workflow-actions.js";
 import type { SubagentAttemptActionData, SubagentManager, SubagentManagerContext } from "../subagents/src/contracts.js";
 import { testExtensionApi } from "./support.js";
 
+// Fork-only CI diagnostics (not for upstream): records renders, lists and polls with stacks.
+export const diag = globalThis as unknown as { __log?: (what: string, withStack?: boolean) => void; __mark?: () => number; __dump?: (from?: number) => string };
+const diagEvents: Array<{ t: string; what: string; stack: string }> = [];
+const diagStart = performance.now();
+const diagStack = (): string => (new Error().stack ?? "").split("\n").slice(2, 14).map((line) => line.trim()).join("\n      ");
+diag.__log = (what, withStack = true): void => { diagEvents.push({ t: (performance.now() - diagStart).toFixed(2), what, stack: withStack ? diagStack() : "" }); };
+diag.__dump = (from = 0): string => diagEvents.slice(from).map((event) => `${event.t} ${event.what}${event.stack ? `\n      ${event.stack}` : ""}`).join("\n");
+diag.__mark = (): number => diagEvents.length;
+const diagProto = TuiAltScreen.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
+for (const name of ["requestRender", "renderNow", "doRender"]) {
+  const original = diagProto[name];
+  if (original) diagProto[name] = function (this: unknown, ...args: unknown[]): unknown { diag.__log?.(`${name}(${args.map(String).join(",")})`, name !== "doRender"); return original.apply(this, args); };
+}
+
+
 /**
  * The fake Pi and terminal the /agents workspace tests open it on (test/agents-workspace.test.ts), shared with the tests that
  * drive it through the action loop with the real providers (test/agents-workspace-actions.test.ts), the fixtures of those
@@ -106,7 +121,7 @@ export class FakeSource implements TranscriptSource {
   overlapped = false;
   private active = 0;
   constructor(readonly key: string) {}
-  async poll(): Promise<TranscriptPoll> { return await this.run("poll", async () => { if (this.pollGate) await this.pollGate; const next = this.polls.shift(); if (next instanceof Error) throw next; return next ?? polled([]); }); }
+  async poll(): Promise<TranscriptPoll> { diag.__log?.(`poll start ${this.key}`); try { return await this.run("poll", async () => { if (this.pollGate) await this.pollGate; const next = this.polls.shift(); if (next instanceof Error) throw next; return next ?? polled([]); }); } finally { diag.__log?.(`poll settle ${this.key}`, false); } }
   close(): Promise<void> { return this.run("close", () => undefined); }
   count(name: string): number { return this.calls.filter((call) => call === name).length; }
   /** Every call settles a turn of the event loop later, so overlapping calls would be seen. */
@@ -413,9 +428,10 @@ export async function open(agents: Listed[], options: OpenOptions = {}): Promise
     // Not async: a listThrow leaves list() synchronously, as a plain function's throw would.
     agents: { list: () => {
       harness.listCalls += 1;
+      diag.__log?.(`list start #${String(harness.listCalls)}`);
       if (harness.listThrow) throw harness.listThrow;
       if (options.source) return options.source.list();
-      return (options.listGate ?? Promise.resolve()).then(() => { if (harness.listError) throw harness.listError; return harness.nodes ?? nodesOf(harness.agents); });
+      return (options.listGate ?? Promise.resolve()).then(() => { diag.__log?.(`list settle #${String(harness.listCalls)}`, false); if (harness.listError) throw harness.listError; return harness.nodes ?? nodesOf(harness.agents); });
     } },
     ...(options.changes === undefined ? {} : { changes: options.changes }),
     openSource: (selected) => {
@@ -463,8 +479,10 @@ export function escapes(t: TestContext): unknown[] {
 export function polls(harness: Harness): number { return harness.sources.reduce((total, source) => total + source.count("poll"), 0); }
 export async function advance(t: TestContext, times = 1): Promise<void> {
   for (let round = 0; round < times; round += 1) {
+    diag.__log?.("tick 1000", false);
     t.mock.timers.tick(1000);
     await settle();
+    diag.__log?.("settled", false);
   }
 }
 export function title(pi: FakePi): string { return pi.screen()[0] ?? ""; }
