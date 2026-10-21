@@ -4,13 +4,14 @@ import type { ExtensionCommandContext, ExtensionContext } from "@earendil-works/
 import type { SubagentManager, SubagentStatus } from "../subagents/src/contracts.js";
 import { attemptValue, latestAttempt, managerContext, safeSubagentId, shortSubagentId, statusValue, SUBAGENT_ATTENTION_ORDER } from "../subagents/src/decode.js";
 import type { AgentsActionTarget, SubagentPresentation, SubagentPresenter } from "./agents-actions-contract.js";
+import { formatAgentsTimeline, type AgentsTimelineEntry } from "./agents-timeline.js";
 import { agentIsLeftover, agentIsLive, agentLastActivity, agentSilence, type Silence } from "./agent-activity.js";
 import { formatCost, formatTokens } from "./background-widget.js";
 import { buildWorkflowPhaseModel, buildWorkflowPhaseTree, workflowPhaseTreeInitialExpanded, workflowPhaseTreeVisibleNodes, type WorkflowPhaseTreeNode } from "./host-phases.js";
 import { agentActivityLabel, formatWorkflowNodeDetails, formatWorkflowRuntime, formatWorkflowTreeLine, navigatorAttentionSort, navigatorAttentionSortByState, progressStyleForState, runStateGlyph, type WorkflowProgressStyles } from "./host-view.js";
 import { sameFilesystemPath } from "./paths.js";
 import { listRunIds, RunStore, type PersistedRun } from "./persistence.js";
-import { isHardTerminalRunState, SETTLED_AGENT_STATES, type AgentAccounting, type AgentAttemptError, type AgentAttemptSummary, type AgentRecord, type LaunchSnapshot, type ModelSpec, type WorkflowAgentSession, type WorkflowAgentSessionReference } from "./types.js";
+import { isHardTerminalRunState, SETTLED_AGENT_STATES, type AgentAccounting, type AgentSpeed, type AgentAttemptError, type AgentAttemptSummary, type AgentRecord, type LaunchSnapshot, type ModelSpec, type RunState, type WorkflowAgentSession, type WorkflowAgentSessionReference } from "./types.js";
 import { budgetUsage } from "./budget.js";
 import { errorText, isObject, sanitizeDisplayText } from "./utils.js";
 
@@ -39,6 +40,8 @@ export interface SessionAgent {
   /** Input plus output tokens and the cost of its accounting, for the session totals in the title; undefined when not known. */
   readonly tokens?: number;
   readonly cost?: number;
+  /** Its persisted speed counters, for the title's average. */
+  readonly speed?: AgentSpeed;
   /** Its newest sign of life in ms (src/agent-activity.ts agentLastActivity for a running workflow agent, the progress's last event for a subagent), for follow mode. */
   readonly lastActivityAt?: number;
 }
@@ -77,9 +80,9 @@ export interface SessionTreeNode {
   /**
    * What the right pane shows for a node that is not an agent, as /workflow details it without its enter hints. For an
    * agent, what `d` shows instead of its transcript (/workflow's agent details, the /subagents detail rows); empty when
-   * there is nothing to show.
+   * there is nothing to show. `width` is the pane's: the timelines of a run, a phase and the group are laid out at it, and left out without one.
    */
-  details(styles: WorkflowProgressStyles, now: number): readonly string[];
+  details(styles: WorkflowProgressStyles, now: number, width?: number): readonly string[];
   /** The title row of a node that is not an agent: its label and state. */
   title(styles: WorkflowProgressStyles): string;
   /** Set only for kind "agent". */
@@ -133,6 +136,18 @@ function lastActivity(at: number | undefined): { readonly lastActivityAt?: numbe
 function agentKeyPart(id: string): string { return id.startsWith("node:") || id.startsWith("~") ? `~${id}` : id; }
 /** The tree kind of each /workflow tree node kind. */
 const RUN_NODE_KIND: Readonly<Record<WorkflowPhaseTreeNode["kind"], SessionTreeNode["kind"]>> = { workflow: "run", phase: "phase", operation: "operation", shell: "shell", agent: "agent" };
+/** The timeline rows of workflow agents under their phase names, `width` columns wide; none without a width. An agent a crash left active in a run that is not running, pausing or awaiting input (agentIsLeftover) is drawn interrupted, up to its last recorded event, not growing to now. */
+function agentTimeline(agents: readonly { readonly group?: string; readonly agent: AgentRecord }[], runState: RunState, styles: WorkflowProgressStyles, now: number, width: number | undefined): string[] {
+  const entries: AgentsTimelineEntry[] = agents.map(({ group, agent }) => ({
+    label: agent.label ?? agent.name, ...(group === undefined ? {} : { group }),
+    startedAt: agent.startedAt,
+    // A leftover is drawn up to its last recorded event.
+    endedAt: agent.startedAt === undefined ? undefined : agentIsLeftover(agent.state, runState) ? agent.lastEventAt !== undefined && Number.isFinite(agent.lastEventAt) && agent.lastEventAt >= agent.startedAt ? agent.lastEventAt : undefined : agent.durationMs === undefined || !SETTLED_AGENT_STATES.has(agent.state) ? undefined : agent.startedAt + agent.durationMs,
+    state: agentIsLeftover(agent.state, runState) ? "interrupted" : agent.state,
+    speed: agent.accounting?.speed,
+  }));
+  return entries.length === 0 || width === undefined ? [] : formatAgentsTimeline(entries, now, width, styles);
+}
 /** The title row of a node: its label and state. */
 function nodeTitle(label: string, state: string, styles: WorkflowProgressStyles): string {
   return `${styles.bold(label)} ${progressStyleForState(state, styles)(state)}`;
@@ -246,7 +261,7 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
       live: attemptLiveSession(deps.liveAgent(run.id, agent.id), attempt),
       activity: activityLabel(running, agent),
       running,
-      ...(agent.accounting === undefined ? {} : { tokens: agent.accounting.input + agent.accounting.output, cost: agent.accounting.cost }),
+      ...(agent.accounting === undefined ? {} : { tokens: agent.accounting.input + agent.accounting.output, cost: agent.accounting.cost, ...(agent.accounting.speed === undefined ? {} : { speed: agent.accounting.speed }) }),
       // Only a running agent is followed: a settled one is not asked, so list() does not stat its transcripts.
       ...(running ? lastActivity(agentLastActivity(agent, cache)) : {}),
       ...(agentIsLeftover(agent.state, run.state) ? { leftover: true } : {}),
@@ -293,7 +308,14 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
         initiallyExpanded: root ? !isHardTerminalRunState(run.state) : expanded.has(node.id),
         line: (styles, selected, open) => root ? headerLine(shown.label, runSummary(run, styles), selected, open, node.children.length > 0, styles) : formatWorkflowTreeLine({ ...shown, quiet: leftover }, selected, open, styles),
         mark: (styles) => root ? waiting && styles.warning(waiting) : silenceMark(silence, styles),
-        details: (styles, now) => formatWorkflowNodeDetails(shownRun, quietTree, leftover && shown.agent ? { ...shown, agent: withoutTimes(shown.agent) } : shown.kind === "shell" && state !== node.state ? withoutShellActivity(shown) : shown, styles, now, false, leftovers),
+        details: (styles, now, width) => {
+          const base = formatWorkflowNodeDetails(shownRun, quietTree, leftover && shown.agent ? { ...shown, agent: withoutTimes(shown.agent) } : shown.kind === "shell" && state !== node.state ? withoutShellActivity(shown) : shown, styles, now, false, leftovers);
+          const unassigned = (root || node.kind === "phase" ? model.unassignedAgents ?? [] : []).map((member) => ({ group: "Unassigned", agent: displayAgent(member) }));
+          const timeline = !root && node.kind !== "phase" ? [] : root
+            ? agentTimeline([...model.phases.flatMap((phase) => phase.agents.map((member) => ({ group: sanitizeDisplayText(`${phase.name}${phase.occurrence > 1 ? ` #${String(phase.occurrence)}` : ""}`), agent: displayAgent(member) }))), ...unassigned], run.state, styles, now, width)
+            : agentTimeline(node.phase === undefined ? unassigned.map(({ agent }) => ({ agent })) : node.phase.agents.map((member) => ({ agent: displayAgent(member) })), run.state, styles, now, width);
+          return timeline.length === 0 ? base : [...base, "", ...timeline];
+        },
         title: (styles) => nodeTitle(shown.label, state, styles),
         agent: agent && runAgent(run, agent, cache),
         target: agent ? { kind: "workflow-agent", runId: run.id, agentId: agent.id } : runTarget,
@@ -359,7 +381,7 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
       live: owned ? attemptLiveSession(liveData?.liveSession, attempt) : undefined,
       activity: activityLabel(running, status.progress),
       running,
-      ...(status.progress === undefined ? {} : { tokens: status.progress.accounting.input + status.progress.accounting.output, cost: status.progress.accounting.cost, ...lastActivity(status.progress.lastEventAt) }),
+      ...(status.progress === undefined ? {} : { tokens: status.progress.accounting.input + status.progress.accounting.output, cost: status.progress.accounting.cost, ...(status.progress.accounting.speed === undefined ? {} : { speed: status.progress.accounting.speed }), ...lastActivity(status.progress.lastEventAt) }),
     };
     return {
       key: agent.key,
@@ -425,6 +447,7 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
     // The group summarizes its subagents: running while one runs, else failed if one failed, else done.
     const states = sorted.map(({ status }) => status.state);
     const state = states.includes("running") ? "running" : states.includes("failed") ? "failed" : states.every((value) => value === "stopped") ? "stopped" : "completed";
+    const childNames = children.map((child) => child.agent?.name);
     const counts = subagentsCounts(sorted.map(({ status }) => status));
     const group: SessionTreeNode = {
       key: "subagents",
@@ -436,7 +459,9 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
       // An idle group starts collapsed.
       initiallyExpanded: sorted.some(({ status }) => status.state === "running"),
       line: (styles, selected, expanded) => headerLine("Subagents", counts, selected, expanded, true, styles),
-      details: (styles) => [styles.bold(styles.accent("Subagents")), counts],
+      details: (styles, now, width) => [styles.bold(styles.accent("Subagents")), counts, ...(width === undefined ? [] : ["", ...formatAgentsTimeline(
+        sorted.map(({ id, status }, index): AgentsTimelineEntry => ({ label: childNames[index] ?? id, startedAt: status.startedAt, endedAt: status.finishedAt, state: status.state, speed: status.progress?.accounting.speed })),
+        now, width, styles)])],
       title: (styles) => nodeTitle("Subagents", state, styles),
       agent: undefined,
       target: { kind: "subagents" },

@@ -1543,6 +1543,45 @@ test("persists progress under one snapshot without duplicate accounting fields",
     await rm(cwd, { recursive: true, force: true });
   }
 });
+test("sums speed counters across retried attempts live, in status.json and after a restart", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-speed-"));
+  const storageDir = join(cwd, "subagents-storage");
+  const base = { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0 };
+  const one = { messages: 1, outputTokens: 120, generationMs: 3_000, firstTokenMs: 800 };
+  const two = { messages: 1, outputTokens: 80, generationMs: 2_000, firstTokenMs: 200 };
+  const setup = { hookNames: [], model: { provider: "fixture", model: "model" }, tools: [], cwd };
+  const pending = deferred();
+  const manager = createSubagentManager({
+    storageDir,
+    createExecutor() {
+      return {
+        async execute(_prompt, options) {
+          await options.onAttempt?.({ attempt: 1, transport: "fixture", setup, accounting: { ...base, speed: one }, error: { code: "AGENT_FAILED", message: "first" } });
+          await options.onAttempt?.({ attempt: 2, transport: "fixture", setup, accounting: base });
+          await options.onProgress?.({ accounting: { ...base, speed: two }, toolCalls: [], lastEventAt: 1, persist: true });
+          return pending.promise;
+        },
+      };
+    },
+  });
+  const context = await managerContext(cwd);
+  try {
+    const run = await manager.run({ prompt: "speed" }, context);
+    await waitFor(async () => (await manager.inspect({ id: run.id }, context)).progress?.accounting.speed?.messages === 2);
+    assert.deepEqual((await manager.inspect({ id: run.id }, context)).progress?.accounting.speed, { messages: 2, outputTokens: 200, generationMs: 5_000, firstTokenMs: 1_000 });
+    pending.resolve({ value: "done", attempts: [], cwd });
+    await waitFor(async () => (await manager.inspect({ id: run.id }, context)).state === "completed");
+    const status = JSON.parse(await readFile(join(storageDir, run.id, "status.json"), "utf8"));
+    assert.deepEqual(status.progress.accounting.speed, { messages: 2, outputTokens: 200, generationMs: 5_000, firstTokenMs: 1_000 });
+    const restarted = createSubagentManager({ storageDir });
+    assert.deepEqual((await restarted.inspect({ id: run.id }, context)).progress?.accounting.speed, { messages: 2, outputTokens: 200, generationMs: 5_000, firstTokenMs: 1_000 });
+    await restarted.dispose();
+  } finally {
+    pending.resolve({ value: "cleanup", attempts: [], cwd });
+    await manager.dispose();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
 test("keeps retry accounting cumulative while live and at success or failure settlement", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagents-retry-accounting-"));
   const storageDir = join(cwd, "subagents-storage");
