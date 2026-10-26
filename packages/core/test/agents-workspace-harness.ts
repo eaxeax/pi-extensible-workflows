@@ -9,7 +9,7 @@ import type { ActionUi, AgentsActionProvider, AgentsActionTarget } from "../src/
 import { runAgentsWorkspace } from "../src/agents-command.js";
 import { createPiActionUi } from "../src/pi-action-ui.js";
 import type { SessionAgent, SessionAgentsSource, SessionTreeNode } from "../src/session-agents.js";
-import type { TranscriptView } from "../src/transcript-components.js";
+import type { CreateTranscriptView, TranscriptView } from "../src/transcript-components.js";
 import { openAgentsWorkspace, type AgentsWorkspaceExit, type AgentsWorkspaceOptions, type AgentsWorkspaceState } from "../src/agents-workspace.js";
 import type { AwaitingCheckpoint } from "../src/decoders.js";
 import type { WorkflowRunRecord } from "../src/host-runtime.js";
@@ -126,8 +126,10 @@ export class FakeView implements TranscriptView {
   readonly component: Component;
   /** append and live throw while set; render throws once. */
   readonly fail: { append?: Error | undefined; live?: Error | undefined; render?: Error | undefined } = {};
-  /** The Pi settings the workspace gave createView. */
+  /** The Pi settings, theme and session renderers the workspace gave createView. */
   settings: SettingsManager | undefined;
+  theme: Parameters<CreateTranscriptView>[0]["theme"];
+  presentation: Parameters<CreateTranscriptView>[0]["presentation"];
   /** `wrap` gives each record a line of `wrap` columns broken at the width, so its height depends on the width. */
   constructor(readonly key: string, readonly ui: TUI, readonly cwd: string, wrap?: number) {
     this.component = { render: (width) => {
@@ -363,6 +365,8 @@ export interface Harness extends FakePi {
 }
 
 export interface OpenOptions {
+  /** The viewer's renderers (AgentsWorkspaceOptions.presentation). */
+  presentation?: AgentsWorkspaceOptions["presentation"];
   columns?: number;
   rows?: number;
   initialKey?: string;
@@ -425,11 +429,13 @@ export async function open(agents: Listed[], options: OpenOptions = {}): Promise
       harness.sources.push(source);
       return source;
     },
-    createView: ({ ui: viewUi, cwd, settings }) => {
+    createView: ({ ui: viewUi, cwd, settings, theme, presentation }) => {
       const key = harness.opened.at(-1) ?? "";
       if (key === options.failView) throw new Error("no view");
       const view = new FakeView(key, viewUi, cwd, options.wrap);
       view.settings = settings;
+      view.theme = theme;
+      view.presentation = presentation;
       if (key === options.failRender) view.fail.render = new Error("render failed");
       if (key === options.failLive) view.fail.live = new Error("live failed");
       harness.views.push(view);
@@ -441,6 +447,7 @@ export async function open(agents: Listed[], options: OpenOptions = {}): Promise
     ...(options.state === undefined ? {} : { state: options.state }),
     ...(options.notices === undefined ? {} : { notices: options.notices }),
     ...(options.editorCommand === undefined ? {} : { editorCommand: options.editorCommand }),
+    ...(options.presentation === undefined ? {} : { presentation: options.presentation }),
   });
   Object.assign(harness, { done: done.then((exit) => { harness.exit = exit; harness.parentAtExit = [...pi.parent]; harness.left = true; }) });
   await settle();
@@ -601,7 +608,7 @@ export type Opened = { readonly ctx: ExtensionCommandContext; readonly options: 
  * The workflow extension over `home` with a fake workspace opener that records each open and resolves it with the next of `exits`
  * (a function is awaited first); its /agents command and its session_shutdown handler.
  */
-export function host(home: string, exits: (AgentsWorkspaceExit | undefined | (() => Promise<AgentsWorkspaceExit | undefined>))[] = []): { agents: Command | undefined; shutdown: (() => Promise<void>) | undefined; opened: Opened[] } {
+export function host(home: string, exits: (AgentsWorkspaceExit | undefined | (() => Promise<AgentsWorkspaceExit | undefined>))[] = []): { agents: Command | undefined; workflow: Command | undefined; shutdown: (() => Promise<void>) | undefined; opened: Opened[] } {
   const commands = new Map<string, Command>();
   let shutdown: (() => Promise<void>) | undefined;
   const opened: Opened[] = [];
@@ -616,7 +623,7 @@ export function host(home: string, exits: (AgentsWorkspaceExit | undefined | (()
     const next = exits.shift();
     return typeof next === "function" ? next() : next;
   });
-  return { agents: commands.get("agents"), shutdown, opened };
+  return { agents: commands.get("agents"), workflow: commands.get("workflow"), shutdown, opened };
 }
 
 /** The workflow provider's dependencies over a fresh home: `copied` records the clipboard, `calls` the host calls. */

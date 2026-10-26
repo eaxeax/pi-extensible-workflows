@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### Fixes
+
+- `/agents`, `/workflow` and `/subagents` draw agent transcripts with the renderers of the Pi session they open in, as its chat does: tool renderers that extensions register (such as a replacement of `read` or `bash` with its own `renderCall`/`renderResult`, or `pi.registerToolRenderer()`), custom entry and custom message renderers, and Markdown transformers, for running and finished agents. Agents do not need to load those extensions. A tool or entry the viewing session has no renderer for keeps Pi's built-in drawing. Pi offers extensions no read access to these renderers yet, so they are found through an internal of Pi's (its extension runner); a Pi without it keeps the built-in drawing.
+
 ## [6.3.0] - 2026-10-25
 
 **This minor version contains breaking changes.** Shipping them as 6.3.0 is an explicit operator choice, not a SemVer-compliant version. Read the breaking changes before upgrading.

@@ -31,6 +31,7 @@ import { openAgentsWorkspace, type OpenAgentsWorkspace } from "./agents-workspac
 import { createSessionAgentsSource, type SessionAgentsScope } from "./session-agents.js";
 import { openSessionTranscript } from "./session-transcript.js";
 import { createTranscriptView } from "./transcript-components.js";
+import { installViewerPresentation, viewerPresentation } from "./viewer-presentation.js";
 import { HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BLOCKED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WorkflowError, type WorkflowFunction, isContextFileScope, isExternallyEndedRunState, isHardTerminalRunState, type AgentAccounting, type AgentIdentity, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type HardTerminalRunState, type ModelSpec, type PreparedAgentSession, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type ToolIdentity, type WorkflowAgentSession, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowScriptCall, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
 import type { SubagentManagerContext } from "../subagents/src/contracts.js";
 import { SETTLED_AGENT_STATES, catalogResultValue, formatWorkflowCatalog, styledTextBlock, textBlock, workflowCatalogBlock, workflowControlCall, workflowControlResult, workflowProgressBlock, type WorkflowProgressRenderState } from "./host-view.js";
@@ -314,6 +315,7 @@ export function widgetAgentsOpener(open: (ctx: ExtensionContext, key: string) =>
 
 export default function workflowExtension(pi: WorkflowExtensionAPI, home?: string, clipboard = copyToClipboard, transport: AgentTransport = localAgentTransport, agentDir?: string, additionalSkillPaths: readonly string[] = [], openWorkspace: OpenAgentsWorkspace = openAgentsWorkspace) {
   beginWorkflowExtensionLoading();
+  installViewerPresentation();
   const registry = loadingRegistry();
   const extensionAgentDir = agentDir ?? getAgentDir();
   const registerEntryRenderer = piHostCapabilities(pi).registerEntryRenderer;
@@ -1571,12 +1573,13 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
    */
   const runAgents = async (ctx: ExtensionContext, scope: SessionAgentsScope, loop: Pick<AgentsWorkspaceLoop, "providers" | "initialKey" | "hasContent" | "onEmpty">): Promise<void> => {
     const editorCommand = (): string | undefined => SettingsManager.create(ctx.cwd, extensionAgentDir, { projectTrusted: projectTrusted(ctx) }).getExternalEditorCommand();
+    const presentation = viewerPresentation(ctx);
     // The subagents handle types its context as a command's (here and in openAgents) but reads only the session context's members.
     const agents = createSessionAgentsSource(ctx, { home, overlayRun: withLiveActivities, liveAgent: (runId, agentId) => liveAgents.get(runId, agentId)?.session, subagents: getSubagentManager, subagentPresenter: () => getSubagentsHandle()?.presenter(ctx as ExtensionCommandContext) }, scope);
     // The widget shows the same runs: it is quiet while the loop's flag is set (background-widget.ts), as under /subagents.
     await runAgentsWorkspace(ctx, {
       open: openWorkspace,
-      options: { agents, openSource: (agent) => openSessionTranscript(agent.session), createView: createTranscriptView, editorCommand, changes: workspaceChanges, shutdown: workspaceShutdown.signal },
+      options: { agents, openSource: (agent) => openSessionTranscript(agent.session), createView: createTranscriptView, ...(presentation ? { presentation } : {}), editorCommand, changes: workspaceChanges, shutdown: workspaceShutdown.signal },
       actionUi: (onNotify) => createPiActionUi(ctx, { reportBlocked: reportWorkflowBlocked, onNotify }),
       ...loop,
     });

@@ -5,6 +5,7 @@ import { WorkflowError, loadCodemodeToolsSetting, loadingRegistry, reachableTool
 import type { SubagentsHandle } from "../../src/agents-actions-contract.js";
 import { clearSubagentsHandle, setSubagentsHandle } from "../../src/subagent-actions-handle.js";
 import { clearSubagentManager, setSubagentManager } from "../../src/subagent-manager-handle.js";
+import { installViewerPresentation } from "../../src/viewer-presentation.js";
 import { createSubagentActionProvider, createSubagentPresenter } from "./actions.js";
 import type { SubagentIdRequest, SubagentInspectRequest, SubagentManager, SubagentManagerContext, SubagentNotification, SubagentsExtension, SubagentsExtensionOptions, SubagentRunRequest, SubagentStatus, SubagentSteerRequest } from "./contracts.js";
 import { createSubagentManager } from "./manager.js";
@@ -171,6 +172,7 @@ export function createSubagentsExtension(options: SubagentsExtensionOptions = {}
 }
 
 export function registerSubagentsExtension(pi: SubagentsExtensionAPI, options: SubagentsExtensionOptions = {}): SubagentsExtension {
+  installViewerPresentation();
   const getActiveTools = pi.getActiveTools;
   const getAllTools = pi.getAllTools;
   const activeTools = getActiveTools === undefined ? undefined : () => reachableTools({ getActiveTools: () => getActiveTools.call(pi), ...(getAllTools === undefined ? {} : { getAllTools: () => getAllTools.call(pi) }) });

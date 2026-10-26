@@ -5,11 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
-import { initTheme, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { Type } from "@earendil-works/pi-ai";
+import { createReadToolDefinition, initTheme, SettingsManager, type Theme, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type Container, getCapabilities, setCapabilities, stripTerminalSequences, type Terminal, TuiAltScreen, visibleWidth } from "@earendil-works/pi-tui";
 import type * as PiTui from "@earendil-works/pi-tui";
 import type { WorkflowProgressStyles } from "../src/host-view.js";
-import { createTranscriptView, type TranscriptView } from "../src/transcript-components.js";
+import { createTranscriptView, type TranscriptPresentation, type TranscriptView } from "../src/transcript-components.js";
 import type { TranscriptRecord } from "../src/session-transcript.js";
 
 initTheme("dark", false);
@@ -55,10 +56,10 @@ const THEME_COLOURS: Readonly<Record<keyof WorkflowProgressStyles, string>> = { 
 const paintWith = (key: keyof WorkflowProgressStyles) => (text: string): string => `${THEME_COLOURS[key]}${text}${ESC}[39m`;
 const STYLES: WorkflowProgressStyles = { accent: paintWith("accent"), success: paintWith("success"), error: paintWith("error"), warning: paintWith("warning"), muted: paintWith("muted"), dim: paintWith("dim"), bold: paintWith("bold") };
 
-function setup(cwd = tmpdir(), settings = SettingsManager.inMemory()): { readonly view: TranscriptView; readonly ui: TuiAltScreen; readonly terminal: FakeTerminal; readonly raw: (width?: number) => string[]; readonly text: (width?: number) => string } {
+function setup(cwd = tmpdir(), settings = SettingsManager.inMemory(), extra: Pick<Parameters<typeof createTranscriptView>[0], "presentation" | "theme"> = {}): { readonly view: TranscriptView; readonly ui: TuiAltScreen; readonly terminal: FakeTerminal; readonly raw: (width?: number) => string[]; readonly text: (width?: number) => string } {
   const terminal = new FakeTerminal();
   const ui = new TuiAltScreen(terminal);
-  const view = createTranscriptView({ ui, cwd, styles: STYLES, settings });
+  const view = createTranscriptView({ ui, cwd, styles: STYLES, settings, ...extra });
   const raw = (width = 80): string[] => {
     const lines = view.component.render(width);
     for (const line of lines) assert.ok(visibleWidth(line) <= width, `wider than ${String(width)}: ${JSON.stringify(stripTerminalSequences(line))}`);
@@ -530,4 +531,69 @@ void test("the records Pi has no component for show as the transcript describes 
   assert.deepEqual(rows.slice(0, 11), ["system prompt", ...Array.from({ length: 10 }, (_, index) => `rule ${String(index)}`)]);
   assert.match(rows.at(-1) ?? "", /^\.\.\. \+5 lines \(.* to expand\)$/);
   assert.equal(rows.length, 12);
+});
+
+function line(text: string): { render: () => string[]; invalidate: () => void } { return { render: () => [text], invalidate() {} }; }
+const PLAIN_THEME = { fg: (_role: string, text: string) => text } as unknown as Theme;
+const NO_RENDERERS = { label: "tool", description: "", parameters: Type.Object({}), execute: () => Promise.resolve({ content: [], details: {} }) };
+/** A viewing session whose extensions replace read's renderers, define bash without any, and draw custom entries, messages and Markdown. */
+const OWN: TranscriptPresentation = {
+  toolDefinition: (name) => name === "read"
+    ? { ...createReadToolDefinition(tmpdir()), renderCall: (args: { path?: string }) => line(`OWN-CALL ${args.path ?? ""}`), renderResult: () => line("OWN-RESULT") } as ToolDefinition
+    : name === "bash" ? { ...NO_RENDERERS, name: "bash" } as ToolDefinition : undefined,
+  entryRenderer: (customType) => customType === "card" ? (entry, { expanded }) => line(`CARD ${String((entry.data as { title?: string }).title)} ${expanded ? "open" : "shut"}`)
+    : customType === "broken" ? () => { throw new Error("boom"); }
+    : customType === "undrawn" ? () => undefined
+    // Timing entries stay hidden whatever an extension registers for them.
+    : customType === "pi-workflows:tool-timing" ? () => line("TIMING-DRAWN") : undefined,
+  messageRenderer: (customType) => customType === "note" ? (message) => line(`OWN-NOTE ${typeof message.content === "string" ? message.content : ""}`) : undefined,
+  markdownTransformers: () => [(markdown) => markdown.replace("PLAIN", "TRANSFORMED")],
+};
+const OWN_RECORDS = [
+  call("c1", "read", { path: "FILE-PATH" }), result("c1", "read", "READ-BODY"),
+  call("c2", "bash", { command: "echo BASH-CALL" }),
+  entry({ type: "custom", customType: "card", data: { title: "CARD-TITLE" } }),
+  entry({ type: "custom", customType: "broken", data: {} }),
+  entry({ type: "custom", customType: "undrawn", data: {} }),
+  entry({ type: "custom", customType: "pi-workflows:tool-timing", data: { toolCallId: "c1" } }),
+  message({ role: "custom", customType: "note", content: "NOTE-BODY", display: true }),
+  user("PLAIN user text"),
+];
+
+void test("records draw with the session's renderers, as Pi's chat does: tool calls and results, custom entries and messages, Markdown", () => {
+  const { view, text } = setup(tmpdir(), SettingsManager.inMemory(), { presentation: OWN, theme: PLAIN_THEME });
+  view.append(OWN_RECORDS);
+  const rendered = text();
+  assertOrder(rendered, ["OWN-CALL FILE-PATH", "OWN-RESULT", "$ echo BASH-CALL", "CARD CARD-TITLE shut", "[broken] renderer failed: boom", "OWN-NOTE NOTE-BODY", "TRANSFORMED user text"]);
+  for (const part of ["TIMING-DRAWN", "custom undrawn", "custom card", "custom pi-workflows", "PLAIN user"]) assert.ok(!rendered.includes(part), part);
+  view.setExpanded(true);
+  const opened = text();
+  assert.ok(opened.includes("CARD CARD-TITLE open"), "an entry renderer opens with the tool output");
+  assert.ok(!opened.includes("READ-BODY"), "the session's renderResult draws the result, not Pi's read renderer");
+});
+
+void test("without the session's renderers (none given, lookups that throw) records draw with Pi's built-in ones", () => {
+  const broken: TranscriptPresentation = { toolDefinition: () => { throw new Error("gone"); }, entryRenderer: () => { throw new Error("gone"); }, messageRenderer: () => { throw new Error("gone"); }, markdownTransformers: () => { throw new Error("gone"); } };
+  for (const presentation of [undefined, broken]) {
+    const { view, text } = setup(tmpdir(), SettingsManager.inMemory(), { ...(presentation ? { presentation } : {}), theme: PLAIN_THEME });
+    view.append(OWN_RECORDS);
+    const rendered = text();
+    assertOrder(rendered, ["read FILE-PATH", "$ echo BASH-CALL", "custom card", "custom broken", "custom undrawn", "[note]", "NOTE-BODY", "PLAIN user text"]);
+    for (const part of ["OWN-", "CARD CARD-TITLE", "TRANSFORMED", "TIMING-DRAWN", "custom pi-workflows"]) assert.ok(!rendered.includes(part), part);
+    view.setExpanded(true);
+    assert.ok(text().includes("READ-BODY"), "Pi's read renderer shows the result once expanded");
+  }
+});
+
+void test("a tool call streamed live draws with the session's renderer, and its record takes its place once appended", () => {
+  const { view, text } = setup(tmpdir(), SettingsManager.inMemory(), { presentation: OWN, theme: PLAIN_THEME });
+  const streamed = { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "read", arguments: { path: "LIVE-PATH" } }] };
+  view.live({ type: "message_start", message: { role: "assistant", content: [] } });
+  view.live({ type: "message_update", message: streamed });
+  assert.ok(text().includes("OWN-CALL LIVE-PATH"), "the streamed call's block uses the session's renderCall");
+  view.live({ type: "message_end", message: streamed });
+  view.append([call("c1", "read", { path: "LIVE-PATH" }), result("c1", "read", "READ-BODY")]);
+  const rendered = text();
+  assert.equal(count(rendered, "OWN-CALL LIVE-PATH"), 1, "the record replaces the finished live message");
+  assertOrder(rendered, ["OWN-CALL LIVE-PATH", "OWN-RESULT"]);
 });

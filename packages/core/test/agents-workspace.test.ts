@@ -539,6 +539,21 @@ void test("a live stream registered after the agent was opened is subscribed wit
   await leave(harness);
 });
 
+void test("every view gets Pi's theme and the viewer's renderers when the workspace has them, also a finished agent's", async (t) => {
+  timers(t);
+  const plain = await open([agent("alpha")]);
+  assert.ok(plain.view("alpha").theme, "Pi's theme, for entry renderers");
+  assert.equal(plain.view("alpha").presentation, undefined, "no renderers given: Pi's built-in drawing");
+  await leave(plain);
+  const viewer = { toolDefinition: () => undefined, entryRenderer: () => undefined, messageRenderer: () => undefined, markdownTransformers: () => [] };
+  const harness = await open([agent("alpha"), agent("beta", { running: false, state: "completed" })], { presentation: viewer });
+  assert.equal(harness.view("alpha").presentation, viewer);
+  harness.send(KEY.down);
+  await settle();
+  assert.equal(harness.view("beta").presentation, viewer, "a finished agent draws with the viewer's renderers");
+  await leave(harness);
+});
+
 void test("the sidebar keeps the selected row in view, and clicks select rows after it scrolled", async (t) => {
   timers(t);
   const many = Array.from({ length: 30 }, (_, index) => agent(`a${String(index).padStart(2, "0")}`, { group: index < 15 ? "g1" : "g2" }));

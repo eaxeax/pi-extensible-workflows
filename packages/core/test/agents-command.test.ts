@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import test from "node:test";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { createExtensionRuntime, ExtensionRunner, ModelRegistry, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AgentsActionProvider, SubagentPresenter, SubagentsHandle } from "../src/agents-actions-contract.js";
 import type { AgentsWorkspaceState } from "../src/agents-workspace.js";
 import { acquireSessionLease, type AgentAttemptSummary } from "../src/index.js";
@@ -73,6 +73,29 @@ void test("/agents needs the TUI, says when the session has no agents, and opens
     assert.equal(poll.status, "available");
     assert.match(JSON.stringify(poll.appended), /ALPHA PROMPT/, "openSource reads the agent's session file");
   } finally { await source.close(); }
+});
+
+void test("/agents and /workflow give the workspace the renderers of the Pi session they run in, none for a context no runner made", async () => {
+  const { home, cwd } = project("agents-presentation");
+  await createRun({ home, cwd }, "run", "completed", { agents: [agentRecord("alpha-id", { attemptDetails: [piSession(home, "ALPHA PROMPT")] })] });
+  const { agents, workflow, opened } = host(home);
+  assert.ok(agents && workflow);
+  const notices: string[] = [];
+  await executeCommand(agents, "", context(cwd, "tui", notices));
+  assert.equal(opened.at(-1)?.options.presentation, undefined, "Pi's built-in drawing");
+  // The viewing session: its runner made a context for the session manager the command's context reads.
+  const viewing = context(cwd, "tui", notices) as { readonly sessionManager: SessionManager };
+  const runner = new ExtensionRunner([], createExtensionRuntime(), cwd, viewing.sessionManager, new ModelRegistry(await ModelRuntime.create({ modelsPath: null })));
+  const marker = (markdown: string): string => markdown;
+  Object.assign(runner, { getMarkdownTransformers: () => [marker] });
+  runner.createContext();
+  for (const [name, command] of [["/agents", agents], ["/workflow", workflow]] as const) {
+    const before = opened.length;
+    await executeCommand(command, "", viewing);
+    assert.equal(opened.length, before + 1, `${name} opens the workspace`);
+    assert.deepEqual(opened.at(-1)?.options.presentation?.markdownTransformers(), [marker], `${name} passes this runner's renderers`);
+  }
+  assert.deepEqual(notices, []);
 });
 
 void test("/agents rejects arguments with a usage notice and opens nothing", async () => {

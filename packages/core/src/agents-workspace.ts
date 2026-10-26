@@ -7,7 +7,7 @@ import { workflowKeyMatches } from "./pi-action-ui.js";
 import { navigateWorkflowPhaseTree, workflowPhaseTreeVisibleNodes, type WorkflowPhaseTree, type WorkflowPhaseTreeDirection, type WorkflowPhaseTreeNode } from "./host-phases.js";
 import { navigatorSidebarWidth, progressStyleForState, themeWorkflowProgressStyles, type WorkflowProgressStyles } from "./host-view.js";
 import type { SessionAgent, SessionAgentsSource, SessionTreeNode } from "./session-agents.js";
-import type { CreateTranscriptView, TranscriptView } from "./transcript-components.js";
+import type { CreateTranscriptView, TranscriptPresentation, TranscriptView } from "./transcript-components.js";
 import type { TranscriptPoll, TranscriptSource, TranscriptSourceStatus } from "./session-transcript.js";
 import { errorText, sanitizeDisplayText } from "./utils.js";
 import { openArtifactInEditor, type WorkflowTui } from "./workflow-artifacts.js";
@@ -17,6 +17,8 @@ export interface AgentsWorkspaceOptions {
   /** Opens the reader for an owned agent (openSessionTranscript); not called for an agent that is not owned. */
   readonly openSource: (agent: SessionAgent) => TranscriptSource;
   readonly createView: CreateTranscriptView;
+  /** The renderers of the Pi session the workspace opens in (viewerPresentation): transcripts draw with them, as its chat does. */
+  readonly presentation?: TranscriptPresentation;
   /** Node selected when the workspace opens, its ancestors expanded; wins over state.selectedKey. The first agent node in sidebar order otherwise, or the first node when there is no agent. */
   readonly initialKey?: string;
   /** Calls `listener` when something may have started to run; returns what stops the calls. While nothing runs a call lists at once, not at the slow tick. */
@@ -315,7 +317,7 @@ class Workspace {
   /** The selected node's details, read at every frame, wrapped to the width. */
   private readonly details: Component = { render: (width) => this.detailsLines(width), invalidate() {} };
 
-  constructor(private readonly alt: TuiAltScreen, theme: Theme, private readonly keybindings: KeybindingsManager, private readonly options: AgentsWorkspaceOptions, private readonly leave: (exit?: AgentsWorkspaceExit, cause?: unknown) => void, toolsExpanded: boolean, private readonly scrollbar: Scrollbar, private readonly settings: SettingsManager) {
+  constructor(private readonly alt: TuiAltScreen, private readonly theme: Theme, private readonly keybindings: KeybindingsManager, private readonly options: AgentsWorkspaceOptions, private readonly leave: (exit?: AgentsWorkspaceExit, cause?: unknown) => void, toolsExpanded: boolean, private readonly scrollbar: Scrollbar, private readonly settings: SettingsManager) {
     this.styles = themeWorkflowProgressStyles(theme);
     this.placeholder = new TranscriptScroll(row(() => this.listed ? "no agents in this Pi session" : "loading agents…"), scrollbar);
     this.initialKey = options.initialKey;
@@ -935,7 +937,8 @@ class Workspace {
     let unsubscribe: (() => void) | undefined;
     try {
       source = this.options.openSource(agent);
-      view = this.options.createView({ ui: this.alt, cwd: agent.cwd, styles: this.styles, settings: this.settings });
+      const presentation = this.options.presentation;
+      view = this.options.createView({ ui: this.alt, cwd: agent.cwd, styles: this.styles, settings: this.settings, theme: this.theme, ...(presentation ? { presentation } : {}) });
       view.setExpanded(this.expanded);
       unsubscribe = this.subscribe(agent, view);
       const shown: Shown = { ...base, source, view, unsubscribe, scroll: new TranscriptScroll(view.component, this.scrollbar) };

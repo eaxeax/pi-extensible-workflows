@@ -6,6 +6,7 @@ import { createPiActionUi } from "../../src/pi-action-ui.js";
 import { createSessionAgentsSource } from "../../src/session-agents.js";
 import { openSessionTranscript } from "../../src/session-transcript.js";
 import { createTranscriptView } from "../../src/transcript-components.js";
+import { viewerPresentation } from "../../src/viewer-presentation.js";
 import { actionOptions, boundedText, BULK_DELETE, bulkDeleteLabels, createSubagentActionProvider, createSubagentPresenter, deleteAll, detailRows, inspectEntry, listNames, loadEntries, performAction, type NavigatorEntry } from "./actions.js";
 import type { SubagentManager } from "./contracts.js";
 
@@ -45,11 +46,12 @@ async function showDetail(manager: SubagentManager, storageDirectory: string, en
  */
 function openSubagentsWorkspace(manager: SubagentManager, storageDirectory: string, context: ExtensionCommandContext, clipboard: (value: string) => Promise<void>, open: OpenAgentsWorkspace, shutdown: AbortSignal | undefined): Promise<void> {
   const editorCommand = (): string | undefined => SettingsManager.create(context.cwd, getAgentDir(), { projectTrusted: context.isProjectTrusted() }).getExternalEditorCommand();
+  const presentation = viewerPresentation(context);
   const presenter = createSubagentPresenter({ manager, storageDirectory }, context);
   const agents = createSessionAgentsSource(context, { home: undefined, overlayRun: (run) => run, liveAgent: () => undefined, subagents: () => manager, subagentPresenter: () => presenter }, "subagents");
   return runAgentsWorkspace(context, {
     open,
-    options: { agents, openSource: (agent) => openSessionTranscript(agent.session), createView: createTranscriptView, editorCommand, ...(shutdown === undefined ? {} : { shutdown }) },
+    options: { agents, openSource: (agent) => openSessionTranscript(agent.session), createView: createTranscriptView, ...(presentation ? { presentation } : {}), editorCommand, ...(shutdown === undefined ? {} : { shutdown }) },
     providers: [createSubagentActionProvider({ manager, storageDirectory, clipboard }, context)],
     actionUi: (onNotify) => createPiActionUi(context, { onNotify }),
     hasContent: (nodes) => nodes.some((node) => node.target?.kind === "subagent"),

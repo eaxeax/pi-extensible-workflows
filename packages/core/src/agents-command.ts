@@ -15,7 +15,7 @@ const globalDetached = globalThis as typeof globalThis & Record<symbol, Detached
 export interface AgentsWorkspaceLoop {
   readonly open: OpenAgentsWorkspace;
   /** What every open of the workspace gets as it is. */
-  readonly options: Pick<AgentsWorkspaceOptions, "agents" | "openSource" | "createView" | "pollIntervalMs" | "editorCommand" | "changes" | "shutdown">;
+  readonly options: Pick<AgentsWorkspaceOptions, "agents" | "openSource" | "createView" | "presentation" | "pollIntervalMs" | "editorCommand" | "changes" | "shutdown">;
   /** The menus' providers, in menu order; none: the workspace gets no actions, so it has no menu and never steps aside. */
   readonly providers: readonly AgentsActionProvider[];
   /** The node selected at the first open. */

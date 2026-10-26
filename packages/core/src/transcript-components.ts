@@ -1,5 +1,5 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { AssistantMessageComponent, BashExecutionComponent, BranchSummaryMessageComponent, CompactionSummaryMessageComponent, createBashToolDefinition, createEditToolDefinition, createFindToolDefinition, createGrepToolDefinition, createLsToolDefinition, createReadToolDefinition, createWriteToolDefinition, CustomMessageComponent, formatSize, getMarkdownTheme, keyText, parseSkillBlock, type SessionEntry, sessionEntryToContextMessages, type SettingsManager, SkillInvocationMessageComponent, ToolExecutionComponent, truncateTail, UserMessageComponent } from "@earendil-works/pi-coding-agent";
+import { AssistantMessageComponent, BashExecutionComponent, BranchSummaryMessageComponent, CompactionSummaryMessageComponent, createBashToolDefinition, createEditToolDefinition, createFindToolDefinition, createGrepToolDefinition, createLsToolDefinition, createReadToolDefinition, createWriteToolDefinition, CustomMessageComponent, type EntryRenderer, formatSize, getMarkdownTheme, keyText, type MarkdownTransformer, type MessageRenderer, parseSkillBlock, type SessionEntry, sessionEntryToContextMessages, type SettingsManager, SkillInvocationMessageComponent, type Theme, ToolExecutionComponent, truncateTail, UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, type MarkdownTheme, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
 import type { WorkflowProgressStyles } from "./host-view.js";
 import { isTimingTranscriptEntry } from "./trajectory.js";
@@ -31,10 +31,21 @@ export interface TranscriptView {
 
 /** `ui` is the workspace's TuiAltScreen; `cwd` is the agent's attempt directory. */
 /** `styles` are the theme's colours for the lines Pi has no component for; `settings` are Pi's display settings, read as Pi's chat reads them. */
-export type CreateTranscriptView = (options: { readonly ui: TUI; readonly cwd: string; readonly styles: WorkflowProgressStyles; readonly settings: SettingsManager }) => TranscriptView;
+/** `presentation` is the renderers of the Pi session the view is drawn in (viewer-presentation.ts), Pi's built-in ones without it; `theme` is what its entry renderers draw with. */
+export type CreateTranscriptView = (options: { readonly ui: TUI; readonly cwd: string; readonly styles: WorkflowProgressStyles; readonly settings: SettingsManager; readonly theme?: Theme; readonly presentation?: TranscriptPresentation }) => TranscriptView;
+
+/** How a tool's calls are drawn: what ToolExecutionComponent takes (a tool definition or its renderers). */
+export type ToolRendering = ConstructorParameters<typeof ToolExecutionComponent>[4];
+/** What a Pi session's extensions draw transcript records with, as its chat takes them; display only. */
+export interface TranscriptPresentation {
+  /** `fallback` is what the caller would draw `name` with otherwise (Pi's built-in renderers of a built-in tool). */
+  toolDefinition(name: string, fallback?: ToolRendering): ToolRendering;
+  entryRenderer(customType: string): EntryRenderer | undefined;
+  messageRenderer(customType: string): MessageRenderer | undefined;
+  markdownTransformers(): readonly MarkdownTransformer[];
+}
 
 type Fields = Readonly<Record<string, unknown>>;
-type ToolRendering = ConstructorParameters<typeof ToolExecutionComponent>[4];
 type ToolResult = Parameters<ToolExecutionComponent["updateResult"]>[0];
 /** A piece of a record Pi does not draw, before wrapping; `folded` marks a body folded like a tool result. */
 type Block = { readonly text: string; readonly style?: keyof WorkflowProgressStyles; readonly folded?: true };
@@ -164,7 +175,24 @@ class RecordText extends Container {
   setExpanded(expanded: boolean): void { this.body.setText(blocksText(this.blocks, expanded, this.styles)); }
 }
 
-export const createTranscriptView: CreateTranscriptView = ({ ui, cwd, styles, settings }) => {
+/** A custom entry drawn by its extension's entry renderer, as Pi's CustomEntryComponent does (which Pi does not export): nothing when it draws nothing. */
+class EntryView extends Container {
+  private expanded = false;
+  constructor(private readonly entry: Parameters<EntryRenderer>[0], private readonly renderer: EntryRenderer, private readonly theme: Theme) {
+    super();
+    this.rebuild();
+  }
+  setExpanded(expanded: boolean): void { if (expanded !== this.expanded) { this.expanded = expanded; this.rebuild(); } }
+  private rebuild(): void {
+    this.clear();
+    let component: Component | undefined;
+    try { component = this.renderer(this.entry, { expanded: this.expanded }, this.theme); }
+    catch (error) { component = new Text(this.theme.fg("error", sanitizeDisplayText(`[${this.entry.customType}] renderer failed: ${error instanceof Error ? error.message : String(error)}`)), 1, 0); }
+    if (component) this.children.push(new Spacer(1), component);
+  }
+}
+
+export const createTranscriptView: CreateTranscriptView = ({ ui, cwd, styles, settings, theme, presentation }) => {
   const root = new Container();
   const pad = settings.getOutputPad();
   const hideThinking = settings.getHideThinkingBlock();
@@ -172,6 +200,20 @@ export const createTranscriptView: CreateTranscriptView = ({ ui, cwd, styles, se
   const codeBlockIndent = settings.getCodeBlockIndent();
   const markdown = (): MarkdownTheme => ({ ...getMarkdownTheme(), codeBlockIndent });
   const definitions = new Map([...BUILT_IN_TOOLS].map(([name, create]) => [name, create(cwd)] as const));
+  /** What the presentation gives; undefined without one or when a renderer lookup throws, so Pi's built-in drawing stays. */
+  function own<T>(read: (shown: TranscriptPresentation) => T | undefined): T | undefined {
+    try { return presentation ? read(presentation) : undefined; } catch { return undefined; }
+  }
+  /** The session's definition of `name` with Pi's built-in renderers for what it leaves out, as Pi's chat merges them (withBuiltInRenderers). */
+  function rendering(name: string): ToolRendering {
+    const builtIn = definitions.get(name);
+    const registered = own((shown) => shown.toolDefinition(name, builtIn));
+    if (!registered) return builtIn;
+    const renderCall = registered.renderCall ?? builtIn?.renderCall;
+    const renderResult = registered.renderResult ?? builtIn?.renderResult;
+    return { ...registered, ...(renderCall ? { renderCall } : {}), ...(renderResult ? { renderResult } : {}) };
+  }
+  const transformers = () => own((shown) => shown.markdownTransformers()) ?? [];
   let items: Item[] = [];
   let streaming: { readonly component: AssistantMessageComponent; readonly box: Container; message: AssistantMessage; tools: { readonly id: string; readonly name: string; readonly tool: ToolExecutionComponent }[] } | undefined;
   /**
@@ -200,7 +242,7 @@ export const createTranscriptView: CreateTranscriptView = ({ ui, cwd, styles, se
     accepted = false;
   }
   /** Pi's renderers print the arguments and details they get without removing terminal sequences: they reach them cleaned. */
-  function tool(name: string, id: string, args: Fields): ToolExecutionComponent { return new ToolExecutionComponent(sanitizeDisplayText(name), id, args, toolOptions, definitions.get(name), ui, cwd); }
+  function tool(name: string, id: string, args: Fields): ToolExecutionComponent { return new ToolExecutionComponent(sanitizeDisplayText(name), id, args, toolOptions, rendering(name), ui, cwd); }
   /** A tool block made after its record was built: completed with `result` when there is one, and opened as the others are. */
   function block(name: string, id: string, args: Fields, result: ToolResult | undefined): ToolExecutionComponent {
     const component = tool(name, id, args);
@@ -240,13 +282,13 @@ export const createTranscriptView: CreateTranscriptView = ({ ui, cwd, styles, se
       if (message.role === "user") {
         const said = userText(message.content);
         const skill = parseSkillBlock(said);
-        if (!skill) child.children.push(new Spacer(1), new UserMessageComponent(said, markdown(), pad));
+        if (!skill) child.children.push(new Spacer(1), new UserMessageComponent(said, markdown(), pad, transformers()));
         else {
           child.children.push(new Spacer(1), new SkillInvocationMessageComponent(skill, markdown()));
-          if (skill.userMessage) child.children.push(new Spacer(1), new UserMessageComponent(skill.userMessage, markdown(), pad));
+          if (skill.userMessage) child.children.push(new Spacer(1), new UserMessageComponent(skill.userMessage, markdown(), pad, transformers()));
         }
       } else if (message.role === "assistant") {
-        child.addChild(new AssistantMessageComponent(assistantMessage(message), hideThinking, markdown(), undefined, pad));
+        child.addChild(new AssistantMessageComponent(assistantMessage(message), hideThinking, markdown(), undefined, pad, transformers()));
         const stopped = stopResult(message);
         for (const part of list(message.content)) {
           if (!object(part) || part.type !== "toolCall") continue;
@@ -264,12 +306,18 @@ export const createTranscriptView: CreateTranscriptView = ({ ui, cwd, styles, se
         pending.delete(id);
       }
       else if (message.role === "bashExecution") child.addChild(bashExecution(message));
-      else if (message.role === "custom" && message.display === true) child.addChild(new CustomMessageComponent({ role: "custom", customType: clean(text(message.customType)), content: contentText(message.content), display: true, timestamp: 0 }, undefined, markdown(), pad));
+      else if (message.role === "custom" && message.display === true) {
+        const customType = clean(text(message.customType));
+        child.addChild(new CustomMessageComponent({ role: "custom", customType, content: contentText(message.content), display: true, ...(message.details === undefined ? {} : { details: cleanValue(message.details) }), timestamp: 0 }, own((shown) => shown.messageRenderer(customType)), markdown(), pad));
+      }
       else if (message.role === "compactionSummary") child.children.push(new Spacer(1), new CompactionSummaryMessageComponent({ role: "compactionSummary", summary: clean(text(message.summary)), tokensBefore: finiteNumber(message.tokensBefore) ? message.tokensBefore : 0, timestamp: 0 }, markdown()));
       else if (message.role === "branchSummary") child.children.push(new Spacer(1), new BranchSummaryMessageComponent({ role: "branchSummary", summary: clean(text(message.summary)), fromId: null, timestamp: 0 }, markdown()));
       else child.addChild(new RecordText(messageBlocks(message), styles));
     }
-    const blocks = messages.length === 0 ? recordBlocks(record) : [];
+    // A custom entry its extension draws is drawn as Pi's chat draws it; timing entries stay hidden.
+    const entryRenderer = value?.type === "custom" && !isTimingTranscriptEntry(value) && theme ? own((shown) => shown.entryRenderer(text(value.customType))) : undefined;
+    if (entryRenderer && theme) child.addChild(new EntryView(cleanValue(value) as Parameters<EntryRenderer>[0], entryRenderer, theme));
+    const blocks = messages.length === 0 && !entryRenderer ? recordBlocks(record) : [];
     if (blocks.length > 0) child.addChild(new RecordText(blocks, styles));
     if (expanded) for (const component of child.children) if (expandable(component)) component.setExpanded(true);
     return { record, child };
@@ -307,7 +355,7 @@ export const createTranscriptView: CreateTranscriptView = ({ ui, cwd, styles, se
       if (event.type === "message_start") {
         if (event.message?.role !== "assistant") return;
         const message = assistantMessage({ ...event.message });
-        const component = new AssistantMessageComponent(undefined, hideThinking, markdown(), undefined, pad);
+        const component = new AssistantMessageComponent(undefined, hideThinking, markdown(), undefined, pad, transformers());
         component.updateContent(message, true);
         streaming = { component, box: new Container(), message, tools: [] };
         streamTools(streaming);
