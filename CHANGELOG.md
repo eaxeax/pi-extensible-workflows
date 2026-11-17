@@ -4,6 +4,7 @@
 ### Fixes
 
 - Workflows no longer exit with code 1 at start (`Workflow child exited with code 1`) when the host Node process was started with a loader: `--import`, `--require`, `--loader` or `--experimental-loader`, on the command line as PiG's extension host does or in `NODE_OPTIONS`. The worker may read only its own directory, so a loader read from a file could never load there; loaders are now left out of the worker's flags and of its `NODE_OPTIONS` (a `data:` loader too), and every other option is kept.
+- A foreground workflow moved to the background now shows in the workflow widget: at once, or within a second of closing `/workflow` or `/agents` when it was moved from there. Before, the widget stayed hidden until some agent, phase, or subagent changed state.
 
 ## [6.4.0] - 2026-11-16
 
