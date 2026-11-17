@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### New capabilities
+
+- Workflow agent and `subagents_run` child sessions are now listed in a process-wide `Symbol.for("pi.sessionParents")` map from the child's Pi session id to the owning root Pi session id while they exist, so a provider can tell which sessions are sub-agents of which. The extension reads it only to resolve a nested run to its root session, and nothing changes for the child.
+
 ### Fixes
 
 - Workflows no longer exit with code 1 at start (`Workflow child exited with code 1`) when the host Node process was started with a loader: `--import`, `--require`, `--loader` or `--experimental-loader`, on the command line as PiG's extension host does or in `NODE_OPTIONS`. The worker may read only its own directory, so a loader read from a file could never load there; loaders are now left out of the worker's flags and of its `NODE_OPTIONS` (a `data:` loader too), and every other option is kept.
